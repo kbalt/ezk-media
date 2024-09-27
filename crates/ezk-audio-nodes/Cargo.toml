@@ -1,6 +1,6 @@
 [package]
 name = "ezk-audio-nodes"
-version = "0.1.0"
+version = "0.1.1"
 description = "audio processing tools which are nice to have in media streaming applications"
 edition.workspace = true
 authors.workspace = true
