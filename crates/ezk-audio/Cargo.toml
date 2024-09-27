@@ -1,0 +1,12 @@
+[package]
+name = "ezk-audio"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+ezk = { path = "../ezk" }
+byte-slice-cast = "1.2.2"
+bitflags = "2.6"
