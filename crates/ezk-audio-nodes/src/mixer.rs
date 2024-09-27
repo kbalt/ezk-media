@@ -31,6 +31,14 @@ impl AudioMixer {
         }
     }
 
+    pub fn empty() -> Self {
+        Self {
+            sources: vec![],
+            config: None,
+            eos_on_empty_sources: false,
+        }
+    }
+
     pub fn eos_on_empty_sources(mut self, eos_on_empty_sources: bool) -> Self {
         self.eos_on_empty_sources = eos_on_empty_sources;
         self
@@ -148,21 +156,7 @@ impl Source for AudioMixer {
             if self.eos_on_empty_sources {
                 return Ok(SourceEvent::EndOfData);
             } else {
-                // Generate frame of silence
-                let frame = Frame::new(
-                    RawAudioFrame {
-                        sample_rate: config.sample_rate,
-                        channels: config.channels.clone(),
-                        samples: Samples::equilibrium(
-                            config.format,
-                            (config.sample_rate.0 / 50) as usize,
-                        ),
-                    },
-                    // TODO: correct timestamp
-                    0,
-                );
-
-                return Ok(SourceEvent::Frame(frame));
+                return Ok(SourceEvent::Frame(make_silence_frame(config)));
             }
         }
 
@@ -199,18 +193,30 @@ impl Source for AudioMixer {
             }
         }
 
+        let frame = if let Some(frame) = frame {
+            frame
+        } else {
+            make_silence_frame(config)
+        };
+
         if need_renegotiation {
             self.config = None;
         }
 
-        if let Some(frame) = frame {
-            Ok(SourceEvent::Frame(frame))
-        } else if need_renegotiation {
-            Ok(SourceEvent::RenegotiationNeeded)
-        } else {
-            Ok(SourceEvent::EndOfData)
-        }
+        Ok(SourceEvent::Frame(frame))
     }
+}
+
+fn make_silence_frame(config: &RawAudioConfig) -> Frame<RawAudio> {
+    Frame::new(
+        RawAudioFrame {
+            sample_rate: config.sample_rate,
+            channels: config.channels.clone(),
+            samples: Samples::equilibrium(config.format, (config.sample_rate.0 / 50) as usize),
+        },
+        // TODO: correct timestamp
+        0,
+    )
 }
 
 fn add(mut a: Frame<RawAudio>, b: Frame<RawAudio>) -> Frame<RawAudio> {
