@@ -5,5 +5,5 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 authors = ["kbalt"]
-license = "MIT License"
+license = "MIT"
 repository = "https://github.com/kbalt/ezk-media"

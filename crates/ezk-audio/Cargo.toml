@@ -1,12 +1,13 @@
 [package]
 name = "ezk-audio"
 version = "0.1.0"
+description = "Types to build reusable audio streaming components"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
 [dependencies]
-ezk = { path = "../ezk" }
+ezk = { version = "0.1", path = "../ezk" }
 byte-slice-cast = "1.2.2"
 bitflags = "2.6"
