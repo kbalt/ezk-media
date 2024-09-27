@@ -1,0 +1,18 @@
+[package]
+name = "ezk"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+slotmap = "1"
+futures-core = { version = "0.3", default-features = false, features = [] }
+futures-util = { version = "0.3" }
+tokio = { version = "1", features = ["rt", "macros"] }
+tokio-stream = { version = "0.1" }
+log = "0.4"
+parking_lot = "0.12"
+reusable-box = { path = "../reusable-box" }
+downcast-rs = "1.2"

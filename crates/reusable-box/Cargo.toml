@@ -1,0 +1,12 @@
+[package]
+name = "reusable-box"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
