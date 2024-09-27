@@ -1,6 +1,7 @@
 [package]
 name = "reusable-box"
 version = "0.1.0"
+description = "A reusable box which allows for Layout changes without reallocation"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true

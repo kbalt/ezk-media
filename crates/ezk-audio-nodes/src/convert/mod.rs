@@ -99,8 +99,6 @@ impl<S: Source<MediaType = RawAudio>> Source for AudioConvert<S> {
         } else {
             None
         };
-        println!("rate: {}", rate_converter.is_some());
-        println!("channel: {}", channel_mixer.is_some());
 
         self.stream = Some(Stream {
             config: best_config.clone(),
