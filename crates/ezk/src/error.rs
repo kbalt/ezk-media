@@ -7,7 +7,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct Error {
     kind: ErrorKind,
-    source: Box<dyn StdError + Send>,
+    source: Box<dyn StdError + Send + Sync>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -17,7 +17,7 @@ pub enum ErrorKind {
 }
 
 impl Error {
-    pub fn new<E: StdError + Send + 'static>(kind: ErrorKind, error: E) -> Self {
+    pub fn new<E: StdError + Send + Sync + 'static>(kind: ErrorKind, error: E) -> Self {
         Self {
             kind,
             source: Box::new(error),
@@ -38,7 +38,7 @@ impl Error {
         }
     }
 
-    pub fn other<E: StdError + Send + 'static>(error: E) -> Self {
+    pub fn other<E: StdError + Send + Sync + 'static>(error: E) -> Self {
         Self {
             kind: ErrorKind::Other,
             source: Box::new(error),
