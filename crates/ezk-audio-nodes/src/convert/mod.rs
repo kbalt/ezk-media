@@ -74,11 +74,11 @@ impl<S: Source<MediaType = RawAudio>> Source for AudioConvert<S> {
         // TODO: find a config requiring the least amount of conversion
         let best_config = original.remove(0);
 
-        let best_config = dbg!(RawAudioConfig {
+        let best_config = RawAudioConfig {
             sample_rate: best_config.sample_rate.first_value(),
             channels: best_config.channels.first_value(),
             format: best_config.format.first_value(),
-        });
+        };
 
         let channel_mixer = if negotiated_config.channels != best_config.channels {
             Some(ChannelMixer::new(
