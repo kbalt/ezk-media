@@ -1,6 +1,6 @@
 [package]
 name = "ezk-audio-nodes"
-version = "0.1.1"
+version = "0.1.2"
 description = "audio processing tools which are nice to have in media streaming applications"
 edition.workspace = true
 authors.workspace = true
@@ -10,7 +10,7 @@ license.workspace = true
 [dependencies]
 ezk = { version = "0.1", path = "../ezk" }
 ezk-audio = { version = "0.1", path = "../ezk-audio" }
-rubato = "0.15"
+rubato = "0.16"
 futures-util = "0.3"
 tokio = { version = "1", features = ["time", "sync"] }
 
