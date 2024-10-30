@@ -1,6 +1,6 @@
 [package]
 name = "ezk"
-version = "0.1.1"
+version = "0.1.2"
 description = "Types to build reusable media streaming components"
 edition.workspace = true
 authors.workspace = true
