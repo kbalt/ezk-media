@@ -3,7 +3,12 @@ use downcast_rs::Downcast;
 use reusable_box::{ReusableBox, ReusedBoxFuture};
 use std::future::Future;
 
-#[diagnostic::on_unimplemented(message = "Try wrapping the source in ezk::Tasked")]
+/// Types that implement [`Source`] and are allowed to prematurely drop the [`next_event`](Source::next_event) future.
+///
+/// Code that uses something like tokio's [`select!`] macro may cancel the call to `next_event`.
+/// This cancellation is only "safe" if the `Source` is marked by this trait.
+///
+/// When using [`BoxedSource`] try using [`BoxedSourceCancelSafe`] instead if this trait is required. See [`Source::boxed_cancel_safe`].
 pub trait NextEventIsCancelSafe {}
 
 pub enum SourceEvent<M: MediaType> {
@@ -46,17 +51,23 @@ pub trait Source: Send + Sized + 'static {
     ///
     /// # Cancel safety
     ///
-    /// The cancel safety of this method depends on the implementor but usually isn't.
-    ///
-    /// Wrap sources in [`Tasked`](crate::ng_nodes::Tasked) to guarantee cancel safety.
+    /// The cancel safety of this method is marked using the [`NextEventIsCancelSafe`] trait
     fn next_event(&mut self) -> impl Future<Output = Result<SourceEvent<Self::MediaType>>> + Send;
 
-    /// Erase the type of this node
+    /// Erase the type of this source
     fn boxed(self) -> BoxedSource<Self::MediaType> {
         BoxedSource {
             source: Box::new(self),
             reusable_box: ReusableBox::new(),
         }
+    }
+
+    /// Erase the type of this source, keeping the information that the `next_event` future is cancel safe
+    fn boxed_cancel_safe(self) -> BoxedSourceCancelSafe<Self::MediaType>
+    where
+        Self: NextEventIsCancelSafe,
+    {
+        BoxedSourceCancelSafe::new(self)
     }
 }
 
@@ -120,6 +131,13 @@ impl<M: MediaType> Source for BoxedSource<M> {
     fn boxed(self) -> BoxedSource<Self::MediaType> {
         self
     }
+
+    fn boxed_cancel_safe(self) -> BoxedSourceCancelSafe<Self::MediaType>
+    where
+        Self: NextEventIsCancelSafe,
+    {
+        BoxedSourceCancelSafe(self)
+    }
 }
 
 // Type erased object safe source, only used in BoxedSource
@@ -168,5 +186,62 @@ impl<S: Source> DynSource for S {
         bx: &'a mut ReusableBox,
     ) -> ReusedBoxFuture<'a, Result<SourceEvent<Self::MediaType>>> {
         bx.store_future(Source::next_event(self))
+    }
+}
+
+/// [`BoxedSource`] with NextEventIsCancelSafe implemented
+pub struct BoxedSourceCancelSafe<M: MediaType>(BoxedSource<M>);
+
+impl<M: MediaType> NextEventIsCancelSafe for BoxedSourceCancelSafe<M> {}
+
+impl<M: MediaType> BoxedSourceCancelSafe<M> {
+    #[inline]
+    pub fn new(source: impl Source<MediaType = M> + NextEventIsCancelSafe) -> Self {
+        Self(source.boxed())
+    }
+
+    #[inline]
+    pub fn downcast<T: Source<MediaType = M>>(self) -> Result<Box<T>, Self> {
+        self.0.downcast().map_err(Self)
+    }
+
+    #[inline]
+    pub fn downcast_ref<T: Source<MediaType = M>>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+
+    #[inline]
+    pub fn downcast_mut<T: Source<MediaType = M>>(&mut self) -> Option<&mut T> {
+        self.0.downcast_mut()
+    }
+}
+
+impl<M: MediaType> Source for BoxedSourceCancelSafe<M> {
+    type MediaType = M;
+
+    async fn capabilities(&mut self) -> Result<Vec<<Self::MediaType as MediaType>::ConfigRange>> {
+        Source::capabilities(&mut self.0).await
+    }
+
+    async fn negotiate_config(
+        &mut self,
+        available: Vec<<Self::MediaType as MediaType>::ConfigRange>,
+    ) -> Result<<Self::MediaType as MediaType>::Config> {
+        Source::negotiate_config(&mut self.0, available).await
+    }
+
+    async fn next_event(&mut self) -> Result<SourceEvent<Self::MediaType>> {
+        Source::next_event(&mut self.0).await
+    }
+
+    fn boxed(self) -> BoxedSource<Self::MediaType> {
+        self.0
+    }
+
+    fn boxed_cancel_safe(self) -> BoxedSourceCancelSafe<Self::MediaType>
+    where
+        Self: NextEventIsCancelSafe,
+    {
+        self
     }
 }
