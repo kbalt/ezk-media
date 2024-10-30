@@ -13,9 +13,15 @@ use tokio::time::timeout_at;
 
 pub struct AudioMixer {
     sources: Vec<SourceEntry>,
-    config: Option<RawAudioConfig>,
+    stream: Option<Stream>,
 
     eos_on_empty_sources: bool,
+}
+
+struct Stream {
+    config: RawAudioConfig,
+    start: Instant,
+    count: u32,
 }
 
 impl AudioMixer {
@@ -24,9 +30,8 @@ impl AudioMixer {
             sources: vec![SourceEntry {
                 source: source.boxed(),
                 queue: None,
-                timestamp: 0,
             }],
-            config: None,
+            stream: None,
             eos_on_empty_sources: true,
         }
     }
@@ -34,7 +39,7 @@ impl AudioMixer {
     pub fn empty() -> Self {
         Self {
             sources: vec![],
-            config: None,
+            stream: None,
             eos_on_empty_sources: false,
         }
     }
@@ -51,9 +56,8 @@ impl AudioMixer {
         self.sources.push(SourceEntry {
             source: source.boxed(),
             queue: None,
-            timestamp: 0,
         });
-        self.config = None;
+        self.stream = None;
         self
     }
 
@@ -108,9 +112,7 @@ impl Source for AudioMixer {
             }
         }
 
-        ret.ok_or_else(|| {
-            Error::msg("AudioMixer cannot find any common capabilities between it's sources")
-        })
+        Ok(ret.unwrap_or_else(|| vec![RawAudioConfigRange::any()]))
     }
 
     async fn negotiate_config(
@@ -131,7 +133,11 @@ impl Source for AudioMixer {
             format: range.format.first_value(),
         };
 
-        self.config = Some(config.clone());
+        self.stream = Some(Stream {
+            config: config.clone(),
+            start: Instant::now(),
+            count: 0,
+        });
 
         for entry in &mut self.sources {
             entry
@@ -148,7 +154,7 @@ impl Source for AudioMixer {
     }
 
     async fn next_event(&mut self) -> Result<SourceEvent<Self::MediaType>> {
-        let Some(config) = &self.config else {
+        let Some(stream) = &mut self.stream else {
             return Ok(SourceEvent::RenegotiationNeeded);
         };
 
@@ -156,17 +162,22 @@ impl Source for AudioMixer {
             if self.eos_on_empty_sources {
                 return Ok(SourceEvent::EndOfData);
             } else {
-                return Ok(SourceEvent::Frame(make_silence_frame(config)));
+                return Ok(SourceEvent::Frame(make_silence_frame(&stream.config)));
             }
         }
 
-        let timeout = Instant::now() + Duration::from_millis(20);
+        let timeout = stream.start + (stream.count * Duration::from_millis(20));
+        stream.count += 1;
 
         let aggregate = self
             .sources
             .iter_mut()
             .enumerate()
-            .map(|(i, entry)| entry.next_event(config, timeout).map(move |e| (i, e)))
+            .map(|(i, entry)| {
+                entry
+                    .next_event(&stream.config, timeout)
+                    .map(move |e| (i, e))
+            })
             .rev();
 
         let mut frame = None;
@@ -193,14 +204,16 @@ impl Source for AudioMixer {
             }
         }
 
-        let frame = if let Some(frame) = frame {
+        let mut frame = if let Some(frame) = frame {
             frame
         } else {
-            make_silence_frame(config)
+            make_silence_frame(&stream.config)
         };
 
+        frame.timestamp = (stream.count * (stream.config.sample_rate.0 / 50)) as u64;
+
         if need_renegotiation {
-            self.config = None;
+            self.stream = None;
         }
 
         Ok(SourceEvent::Frame(frame))
@@ -214,7 +227,7 @@ fn make_silence_frame(config: &RawAudioConfig) -> Frame<RawAudio> {
             channels: config.channels.clone(),
             samples: Samples::equilibrium(config.format, (config.sample_rate.0 / 50) as usize),
         },
-        // TODO: correct timestamp
+        // This is set later
         0,
     )
 }
@@ -240,22 +253,18 @@ fn add(mut a: Frame<RawAudio>, b: Frame<RawAudio>) -> Frame<RawAudio> {
 struct SourceEntry {
     source: BoxedSource<RawAudio>,
     queue: Option<SamplesQueue>,
-
-    timestamp: u64,
 }
 
 impl SourceEntry {
     fn make_frame(&mut self, config: &RawAudioConfig, samples: Samples) -> Frame<RawAudio> {
-        let timestamp = self.timestamp;
-        self.timestamp += (samples.len() / config.channels.channel_count()) as u64;
-
         Frame::new(
             RawAudioFrame {
                 sample_rate: config.sample_rate,
                 channels: config.channels.clone(),
                 samples,
             },
-            timestamp,
+            // This is set later
+            0,
         )
     }
 
