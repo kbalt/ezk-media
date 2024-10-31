@@ -1,0 +1,19 @@
+[package]
+name = "ezk-rtp"
+version = "0.1.0"
+description = "RTP session implementation & utilities"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+ezk = { version = "0.1", path = "../ezk" }
+
+arrayvec = "0.7"
+bytes = "1"
+bytesstr = "1.0.2"
+rand = "0.8"
+time = "0.3"
+rtp-types = "0.1"
+rtcp-types = "0.1"
