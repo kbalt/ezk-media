@@ -1,0 +1,13 @@
+[package]
+name = "ezk-g711"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+ezk = { version = "0.1", path = "../ezk" }
+ezk-audio = { version = "0.1", path = "../ezk-audio" }
+ezk-rtp = { version = "0.1", path = "../ezk-rtp" }
+bytes = "1"
