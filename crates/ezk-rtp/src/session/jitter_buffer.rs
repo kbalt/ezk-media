@@ -148,10 +148,12 @@ mod tests {
         let mut jb = JitterBuffer::default();
 
         jb.push(make_packet(1, 100));
+        jb.push(make_packet(4, 400));
         jb.push(make_packet(3, 300));
 
-        assert_eq!(jb.pop(234234234).unwrap().get().sequence_number(), 1);
-        assert_eq!(jb.pop(12123).unwrap().get().sequence_number(), 3);
+        assert_eq!(jb.pop(0).unwrap().get().sequence_number(), 1);
+        assert_eq!(jb.pop(0).unwrap().get().sequence_number(), 3);
+        assert_eq!(jb.pop(0).unwrap().get().sequence_number(), 4);
         assert_eq!(jb.lost, 1)
     }
 
