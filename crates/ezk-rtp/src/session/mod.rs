@@ -4,10 +4,7 @@ use rtcp_types::{
     CompoundBuilder, ReceiverReport, ReportBlock, RtcpPacketWriterExt, RtcpWriteError, SdesBuilder,
     SdesChunkBuilder, SdesItem, SdesItemBuilder, SenderReport,
 };
-use std::{
-    cmp,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 use time::ext::InstantExt;
 
 mod jitter_buffer;
@@ -140,38 +137,6 @@ impl Session {
         receiver_status.jitter_buffer.push(rtp_packet);
     }
 
-    // TODO: untested
-    pub fn earliest_available_rtp_packet(&self) -> Option<Instant> {
-        let mut earliest = None;
-
-        for receiver in &self.receiver {
-            let Some((last_rtp_received_instant, last_rtp_received_timestamp)) =
-                receiver.last_rtp_received
-            else {
-                continue;
-            };
-
-            let Some(earliest_timestamp) = receiver.jitter_buffer.earliest_timestamp() else {
-                continue;
-            };
-
-            assert!(last_rtp_received_timestamp >= earliest_timestamp);
-
-            let delta = last_rtp_received_timestamp - earliest_timestamp;
-
-            let delta = Duration::from_secs_f32(delta as f32 / self.clock_rate as f32);
-            let v = last_rtp_received_instant - delta;
-
-            if let Some(earliest) = &mut earliest {
-                *earliest = cmp::min(*earliest, v);
-            } else {
-                earliest = Some(v);
-            }
-        }
-
-        earliest.map(|e| e + JITTERBUFFER_LENGTH)
-    }
-
     pub fn pop_rtp(&mut self) -> Option<RtpPacket> {
         let pop_earliest = Instant::now() - JITTERBUFFER_LENGTH;
 
@@ -182,14 +147,14 @@ impl Session {
                 continue;
             };
 
-            let min_timestamp = map_instant_to_rtp_timestamp(
+            let max_timestamp = map_instant_to_rtp_timestamp(
                 last_rtp_received_instant,
                 last_rtp_received_timestamp,
                 self.clock_rate,
                 pop_earliest,
             );
 
-            if let Some(packet) = receiver.jitter_buffer.pop(min_timestamp) {
+            if let Some(packet) = receiver.jitter_buffer.pop(max_timestamp) {
                 return Some(packet);
             }
         }
@@ -200,7 +165,11 @@ impl Session {
     pub fn recv_rtcp(&mut self, packet: rtcp_types::Packet<'_>) {
         // TODO: read reports
         if let rtcp_types::Packet::Sr(sr) = packet {
-            if let Some(receiver) = self.receiver.iter_mut().find(|rr| rr.ssrc == sr.ssrc()) {
+            if let Some(receiver) = self
+                .receiver
+                .iter_mut()
+                .find(|status| status.ssrc == sr.ssrc())
+            {
                 receiver.last_sr = Some(NtpTimestamp::now());
             }
         }

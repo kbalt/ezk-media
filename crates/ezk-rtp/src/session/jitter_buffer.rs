@@ -78,13 +78,7 @@ impl JitterBuffer {
         state.head = cmp::max(state.head, sequence_number);
     }
 
-    pub(crate) fn earliest_timestamp(&self) -> Option<u64> {
-        let state = self.state.as_ref()?;
-
-        Some(self.entries.get(&state.tail)?.timestamp)
-    }
-
-    pub(crate) fn pop(&mut self, min_timestamp: u64) -> Option<RtpPacket> {
+    pub(crate) fn pop(&mut self, max_timestamp: u64) -> Option<RtpPacket> {
         let state = self.state.as_mut()?;
 
         for i in state.tail..=state.head {
@@ -92,7 +86,7 @@ impl JitterBuffer {
                 continue;
             };
 
-            if entry.get().timestamp < min_timestamp {
+            if entry.get().timestamp > max_timestamp {
                 return None;
             }
 
@@ -151,9 +145,9 @@ mod tests {
         jb.push(make_packet(4, 400));
         jb.push(make_packet(3, 300));
 
-        assert_eq!(jb.pop(0).unwrap().get().sequence_number(), 1);
-        assert_eq!(jb.pop(0).unwrap().get().sequence_number(), 3);
-        assert_eq!(jb.pop(0).unwrap().get().sequence_number(), 4);
+        assert_eq!(jb.pop(1000).unwrap().get().sequence_number(), 1);
+        assert_eq!(jb.pop(1000).unwrap().get().sequence_number(), 3);
+        assert_eq!(jb.pop(1000).unwrap().get().sequence_number(), 4);
         assert_eq!(jb.lost, 1)
     }
 
