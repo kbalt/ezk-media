@@ -213,7 +213,7 @@ impl Session {
             let report_block = ReportBlock::builder(receiver.ssrc)
                 .fraction_lost(fraction_lost as u8)
                 .cumulative_lost(receiver.total_lost as u32)
-                .extended_sequence_number((last_sequence_number & u64::from(u32::MAX)) as u32)
+                .extended_sequence_number(lower_32bits(last_sequence_number))
                 .interarrival_jitter(receiver.jitter as u32)
                 .last_sender_report_timestamp(last_sr)
                 .delay_since_last_sender_report_timestamp(delay);
@@ -225,13 +225,15 @@ impl Session {
 
         // Add report block
         if let Some(sender_info) = &self.sender {
+            let rtp_timestamp = {
+                let offset = (self.clock_rate * (now - sender_info.ntp_timestamp)).as_seconds_f64()
+                    * self.clock_rate as f64;
+                sender_info.rtp_timestamp + offset as u64
+            };
+
             let mut sr = SenderReport::builder(self.ssrc)
                 .ntp_timestamp(now.to_fixed_u64())
-                .rtp_timestamp(
-                    (sender_info.rtp_timestamp & u64::from(u32::MAX)) as u32
-                        + ((self.clock_rate * (now - sender_info.ntp_timestamp)).as_seconds_f64()
-                            * self.clock_rate as f64) as u32,
-                )
+                .rtp_timestamp(lower_32bits(rtp_timestamp))
                 .packet_count(sender_info.sender_pkg_count)
                 .octet_count(sender_info.sender_octet_count);
 
@@ -270,4 +272,8 @@ fn map_instant_to_rtp_timestamp(
     let delta = instant.signed_duration_since(reference_instant);
     let delta_in_rtp_timesteps = (delta.as_seconds_f32() * clock_rate as f32) as i64;
     (reference_timestamp as i64 + delta_in_rtp_timesteps) as u64
+}
+
+fn lower_32bits(i: u64) -> u32 {
+    (i & u64::from(u32::MAX)) as u32
 }
