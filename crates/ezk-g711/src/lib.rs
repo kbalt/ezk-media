@@ -25,8 +25,8 @@ macro_rules! pcmx {
         pub enum $n {}
 
         impl MediaType for $n {
-            type ConfigRange = PCMAConfigRange;
-            type Config = PCMAConfig;
+            type ConfigRange = $cr;
+            type Config = $c;
             type FrameData = Bytes;
         }
 

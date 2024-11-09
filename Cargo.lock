@@ -308,6 +308,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ezk-g722"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ezk",
+ "ezk-audio",
+ "ezk-rtp",
+]
+
+[[package]]
 name = "ezk-rtp"
 version = "0.1.0"
 dependencies = [
@@ -320,6 +330,10 @@ dependencies = [
  "rtp-types",
  "time",
 ]
+
+[[package]]
+name = "ezk-video"
+version = "0.1.0"
 
 [[package]]
 name = "futures-core"
