@@ -1,12 +1,10 @@
 use crate::{Payloadable, Payloader, Rtp, RtpConfig, RtpConfigRange, RtpPacket};
-use ezk::{
-    ConfigRange, Frame, MediaType, NextEventIsCancelSafe, Result, Source, SourceEvent, ValueRange,
-};
+use ezk::{ConfigRange, Frame, NextEventIsCancelSafe, Result, Source, SourceEvent, ValueRange};
 use std::collections::VecDeque;
 
 pub struct Packetizer<S: Source<MediaType: Payloadable>> {
     source: S,
-
+    mtu: usize,
     stream: Option<Stream<S::MediaType>>,
 }
 
@@ -30,8 +28,14 @@ where
     pub fn new(source: S) -> Self {
         Self {
             source,
+            mtu: 1400,
             stream: None,
         }
+    }
+
+    pub fn with_mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu;
+        self
     }
 }
 
@@ -58,7 +62,7 @@ where
     async fn negotiate_config(&mut self, available: Vec<RtpConfigRange>) -> Result<RtpConfig> {
         let config_ = self
             .source
-            .negotiate_config(vec![<S::MediaType as MediaType>::ConfigRange::any()])
+            .negotiate_config(vec![ConfigRange::any()])
             .await?;
 
         let pt = available[0].pt.first_value();
@@ -87,26 +91,26 @@ where
                 return Ok(SourceEvent::Frame(Frame::new(packet, timestamp as u64)));
             }
 
-            match self.source.next_event().await? {
-                SourceEvent::Frame(frame) => {
-                    let timestamp = frame.timestamp as u32;
-
-                    for payload in stream.payloader.payload(frame) {
-                        stream.sequence_number = stream.sequence_number.wrapping_add(1);
-
-                        let packet = RtpPacket::new(
-                            &rtp_types::RtpPacketBuilder::new()
-                                .sequence_number(stream.sequence_number)
-                                .timestamp(timestamp)
-                                .payload_type(stream.config.pt)
-                                .payload(&payload),
-                        );
-
-                        stream.queue.push_back(packet);
-                    }
-                }
+            let frame = match self.source.next_event().await? {
+                SourceEvent::Frame(frame) => frame,
                 SourceEvent::EndOfData => return Ok(SourceEvent::EndOfData),
                 SourceEvent::RenegotiationNeeded => return Ok(SourceEvent::RenegotiationNeeded),
+            };
+
+            let timestamp = (frame.timestamp & u64::from(u32::MAX)) as u32;
+
+            for payload in stream.payloader.payload(frame, self.mtu) {
+                stream.sequence_number = stream.sequence_number.wrapping_add(1);
+
+                let packet = RtpPacket::new(
+                    &rtp_types::RtpPacketBuilder::new()
+                        .sequence_number(stream.sequence_number)
+                        .timestamp(timestamp)
+                        .payload_type(stream.config.pt)
+                        .payload(&payload),
+                );
+
+                stream.queue.push_back(packet);
             }
         }
     }

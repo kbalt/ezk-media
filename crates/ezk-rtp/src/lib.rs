@@ -38,17 +38,10 @@ impl From<Utf8Error> for DecodeError {
     }
 }
 
-/// Create RTP payload from media data
-pub trait Payloader<M: MediaType>: Send + 'static {
-    /// Payload a given frame
-    fn payload(&mut self, frame: Frame<M>) -> impl Iterator<Item = Bytes> + '_;
-}
-
 /// A media type that can be packed into RTP packets
 ///
 /// Usually encoded audio or video
 pub trait Payloadable: Sized + MediaType {
-    /// Payloader implementation to use
     type Payloader: Payloader<Self>;
     type DePayloader: DePayloader<Self>;
 
@@ -62,7 +55,12 @@ pub trait Payloadable: Sized + MediaType {
     fn make_depayloader(available: Vec<Self::ConfigRange>) -> (Self::Config, Self::DePayloader);
 }
 
+/// Create RTP payload from media data
+pub trait Payloader<M: MediaType>: Send + 'static {
+    /// Payload a given frame
+    fn payload(&mut self, frame: Frame<M>, max_size: usize) -> impl Iterator<Item = Bytes> + '_;
+}
+
 pub trait DePayloader<M: MediaType>: Send + 'static {
-    // TODO: temporary API until I know how this should work
     fn depayload(&mut self, payload: &[u8]) -> M::FrameData;
 }

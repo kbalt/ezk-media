@@ -1,3 +1,5 @@
+use std::{iter::from_fn, mem::take};
+
 use bytes::Bytes;
 use ezk::{ConfigRange, Frame, MediaType};
 use ezk_rtp::{DePayloader, Payloadable, Payloader};
@@ -98,15 +100,29 @@ impl PCMX for PCMU {
 pub struct G711Payloader;
 
 impl Payloader<PCMU> for G711Payloader {
-    fn payload(&mut self, frame: Frame<PCMU>) -> impl Iterator<Item = Bytes> + '_ {
-        Some(frame.into_data()).into_iter()
+    fn payload(&mut self, frame: Frame<PCMU>, max_size: usize) -> impl Iterator<Item = Bytes> + '_ {
+        split(frame.into_data(), max_size)
     }
 }
 
 impl Payloader<PCMA> for G711Payloader {
-    fn payload(&mut self, frame: Frame<PCMA>) -> impl Iterator<Item = Bytes> + '_ {
-        Some(frame.into_data()).into_iter()
+    fn payload(&mut self, frame: Frame<PCMA>, max_size: usize) -> impl Iterator<Item = Bytes> + '_ {
+        split(frame.into_data(), max_size)
     }
+}
+
+fn split(mut data: Bytes, max_size: usize) -> impl Iterator<Item = Bytes> {
+    from_fn(move || {
+        if let Some((pkg, rem)) = data.split_at_checked(max_size) {
+            let pkg = data.slice_ref(pkg);
+            data = data.slice_ref(rem);
+            Some(pkg)
+        } else if data.is_empty() {
+            None
+        } else {
+            Some(take(&mut data))
+        }
+    })
 }
 
 pub struct G711DePayloader;
