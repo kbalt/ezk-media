@@ -8,6 +8,6 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-ezk = { version = "0.1", path = "../ezk" }
+ezk.workspace = true
 byte-slice-cast = "1.2.2"
 bitflags = "2.6"
