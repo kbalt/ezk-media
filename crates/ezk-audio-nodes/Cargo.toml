@@ -8,8 +8,8 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-ezk = { version = "0.1", path = "../ezk" }
-ezk-audio = { version = "0.1", path = "../ezk-audio" }
+ezk.workspace = true
+ezk-audio.workspace = true
 rubato = "0.16"
 futures-util = "0.3"
 tokio = { version = "1", features = ["time", "sync"] }

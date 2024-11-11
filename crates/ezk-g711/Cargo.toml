@@ -1,13 +1,14 @@
 [package]
 name = "ezk-g711"
-version = "0.1.0"
+version = "0.2.0"
+description = "G.711 audio codec"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
 [dependencies]
-ezk = { version = "0.1", path = "../ezk" }
-ezk-audio = { version = "0.1", path = "../ezk-audio" }
-ezk-rtp = { version = "0.1", path = "../ezk-rtp" }
+ezk.workspace = true
+ezk-audio.workspace = true
+ezk-rtp.workspace = true
 bytes = "1"

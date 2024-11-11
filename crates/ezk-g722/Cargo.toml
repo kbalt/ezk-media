@@ -8,7 +8,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-ezk = { version = "0.1", path = "../ezk" }
-ezk-audio = { version = "0.1", path = "../ezk-audio" }
-ezk-rtp = { version = "0.1", path = "../ezk-rtp" }
+ezk.workspace = true
+ezk-audio.workspace = true
+ezk-rtp.workspace = true
 bytes = "1"
