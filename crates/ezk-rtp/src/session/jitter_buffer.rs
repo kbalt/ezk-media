@@ -4,8 +4,10 @@ use std::{
     collections::{btree_map::Entry, BTreeMap},
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct JitterBuffer {
+    /// maximum number of entries
+    max_entries: usize,
     /// sequence-number -> packet map
     entries: BTreeMap<u64, JbEntry>,
     /// highest and lowest sequence number
@@ -20,6 +22,19 @@ pub(crate) struct JitterBuffer {
     pub(crate) lost: u64,
 }
 
+impl Default for JitterBuffer {
+    fn default() -> Self {
+        Self {
+            max_entries: 1000,
+            entries: BTreeMap::new(),
+            state: None,
+            dropped: 0,
+            received: 0,
+            lost: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct State {
     /// highest seq number
@@ -28,7 +43,7 @@ struct State {
     tail: u64,
 
     /// last known timestamp
-    last_ts: u64,
+    last_timestamp: u64,
 }
 
 #[derive(Debug)]
@@ -55,15 +70,15 @@ impl JitterBuffer {
             self.state = Some(State {
                 head: sequence_number,
                 tail: sequence_number,
-                last_ts: timestamp,
+                last_timestamp: timestamp,
             });
 
             return;
         };
 
         let sequence_number = guess_sequence_number(state.tail, rtp_packet.sequence_number());
-        let timestamp = guess_timestamp(state.last_ts, rtp_packet.timestamp());
-        state.last_ts = timestamp;
+        let timestamp = guess_timestamp(state.last_timestamp, rtp_packet.timestamp());
+        state.last_timestamp = timestamp;
 
         if sequence_number < state.tail {
             self.dropped += 1;
@@ -76,6 +91,18 @@ impl JitterBuffer {
         }
 
         state.head = cmp::max(state.head, sequence_number);
+
+        self.ensure_max_size();
+    }
+
+    fn ensure_max_size(&mut self) {
+        if self.entries.len() > self.max_entries {
+            let (seq, _) = self.entries.pop_first().unwrap();
+
+            if let Some(state) = &mut self.state {
+                state.tail = seq + 1;
+            }
+        }
     }
 
     pub(crate) fn pop(&mut self, max_timestamp: u64) -> Option<RtpPacket> {

@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use ezk::{Frame, MediaType};
-use std::str::Utf8Error;
 
 mod depacketizer;
 mod media_type;
@@ -18,25 +17,6 @@ pub use session::Session;
 
 pub use rtcp_types;
 pub use rtp_types;
-
-#[derive(Debug)]
-pub enum DecodeError {
-    Incomplete,
-    InvalidVersion,
-    InvalidAlignment,
-
-    UnknownPayloadType(u8),
-    UnknownFmt(u8),
-    UnknownTag(u8),
-
-    Utf8(Utf8Error),
-}
-
-impl From<Utf8Error> for DecodeError {
-    fn from(value: Utf8Error) -> Self {
-        Self::Utf8(value)
-    }
-}
 
 /// A media type that can be packed into RTP packets
 ///
