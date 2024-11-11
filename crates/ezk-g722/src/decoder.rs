@@ -108,7 +108,7 @@ where
                         channels: stream.config.channels.clone(),
                         samples,
                     },
-                    frame.timestamp,
+                    frame.timestamp * 2,
                 )))
             }
             SourceEvent::EndOfData => {

@@ -91,7 +91,7 @@ where
 
                 Ok(SourceEvent::Frame(Frame::new(
                     stream.encoder.encode(samples).into(),
-                    frame.timestamp,
+                    frame.timestamp / 2,
                 )))
             }
             SourceEvent::EndOfData => Ok(SourceEvent::EndOfData),
