@@ -1,6 +1,6 @@
 [package]
 name = "ezk-g722"
-version = "0.1.0"
+version = "0.1.1"
 description = "G.722 audio codec"
 edition.workspace = true
 authors.workspace = true
