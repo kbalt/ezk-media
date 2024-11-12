@@ -13,7 +13,7 @@ pub use media_type::{Rtp, RtpConfig, RtpConfigRange};
 pub use ntp_timestamp::NtpTimestamp;
 pub use packetizer::Packetizer;
 pub use rtp_packet::*;
-pub use session::Session;
+pub use session::RtpSession;
 
 pub use rtcp_types;
 pub use rtp_types;

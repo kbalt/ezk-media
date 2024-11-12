@@ -26,7 +26,7 @@ impl ConfigRange for RtpConfigRange {
 
     fn any() -> Self {
         RtpConfigRange {
-            pt: ValueRange::range(0, 127),
+            pt: ValueRange::AnyOf(vec![ValueRange::range(0, 71), ValueRange::range(96, 127)]),
         }
     }
 

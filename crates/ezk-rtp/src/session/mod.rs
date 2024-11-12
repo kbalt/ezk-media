@@ -2,25 +2,28 @@ use crate::{NtpTimestamp, RtpPacket};
 use jitter_buffer::{guess_timestamp, JitterBuffer};
 use rtcp_types::{
     CompoundBuilder, ReceiverReport, ReportBlock, RtcpPacketWriterExt, RtcpWriteError, SdesBuilder,
-    SdesChunkBuilder, SdesItem, SdesItemBuilder, SenderReport,
+    SdesChunkBuilder, SdesItemBuilder, SenderReport,
 };
 use std::time::{Duration, Instant};
 use time::ext::InstantExt;
 
 mod jitter_buffer;
 
-const JITTERBUFFER_LENGTH: Duration = Duration::from_millis(100);
+const DEFAULT_JITTERBUFFER_LENGTH: Duration = Duration::from_millis(100);
 
 /// Single RTP session, (1 sender, many receiver)
 ///
 /// This can be used to publish a single RTP source and receive others.
 /// It manages a jitterbuffer for every remote ssrc and can generate RTCP reports.
-pub struct Session {
+pub struct RtpSession {
     ssrc: u32,
     clock_rate: u32,
-    cname: String,
+
+    /// tag/type, prefix, value
+    source_description_items: Vec<(u8, Option<Vec<u8>>, String)>,
+
     sender: Option<SenderState>,
-    receiver: Vec<ReceiverStatus>,
+    receiver: Vec<ReceiverState>,
 }
 
 struct SenderState {
@@ -32,7 +35,7 @@ struct SenderState {
 }
 
 #[derive(Default)]
-struct ReceiverStatus {
+struct ReceiverState {
     ssrc: u32,
 
     jitter_buffer: JitterBuffer,
@@ -44,15 +47,31 @@ struct ReceiverStatus {
     total_lost: u64,
 }
 
-impl Session {
-    pub fn new(ssrc: u32, clock_rate: u32, cname: String) -> Self {
+impl RtpSession {
+    pub fn new(ssrc: u32, clock_rate: u32) -> Self {
         Self {
             ssrc,
+            source_description_items: vec![],
             clock_rate,
-            cname,
             sender: None,
             receiver: vec![],
         }
+    }
+
+    /// Add an item to the RTCP packets source description
+    pub fn with_source_description_item(
+        mut self,
+        tag: u8,
+        prefix: Option<Vec<u8>>,
+        value: String,
+    ) -> Self {
+        self.add_source_description_item(tag, prefix, value);
+        self
+    }
+
+    /// Add an item to the RTCP packets source description
+    pub fn add_source_description_item(&mut self, tag: u8, prefix: Option<Vec<u8>>, value: String) {
+        self.source_description_items.push((tag, prefix, value));
     }
 
     /// Sender ssrc of this session
@@ -96,7 +115,12 @@ impl Session {
         {
             receiver_status
         } else {
-            self.receiver.push(ReceiverStatus {
+            // Don't allow an infinite amount of receivers
+            if self.receiver.len() > 4096 {
+                return;
+            }
+
+            self.receiver.push(ReceiverState {
                 ssrc: packet.ssrc(),
                 jitter_buffer: JitterBuffer::default(),
                 last_rtp_received: None,
@@ -137,8 +161,9 @@ impl Session {
         receiver_status.jitter_buffer.push(rtp_packet);
     }
 
-    pub fn pop_rtp(&mut self) -> Option<RtpPacket> {
-        let pop_earliest = Instant::now() - JITTERBUFFER_LENGTH;
+    pub fn pop_rtp(&mut self, jitter_buffer_length: Option<Duration>) -> Option<RtpPacket> {
+        let pop_earliest =
+            Instant::now() - jitter_buffer_length.unwrap_or(DEFAULT_JITTERBUFFER_LENGTH);
 
         for receiver in &mut self.receiver {
             let Some((last_rtp_received_instant, last_rtp_received_timestamp)) =
@@ -253,13 +278,24 @@ impl Session {
         }
 
         // Add source description block
-        let sdes = SdesBuilder::default().add_chunk(
-            SdesChunkBuilder::new(self.ssrc)
-                .add_item(SdesItemBuilder::new(SdesItem::CNAME, &self.cname)),
-        );
+        if !self.source_description_items.is_empty() {
+            let mut chunk = SdesChunkBuilder::new(self.ssrc);
 
-        // Add block and write into dst
-        compound.add_packet(sdes).write_into(dst)
+            for (tag, prefix, value) in &self.source_description_items {
+                let mut item = SdesItemBuilder::new(*tag, value);
+
+                if let Some(prefix) = prefix {
+                    item = item.prefix(prefix);
+                }
+
+                chunk = chunk.add_item(item);
+            }
+
+            compound = compound.add_packet(SdesBuilder::default().add_chunk(chunk));
+        };
+
+        // write into dst
+        compound.write_into(dst)
     }
 }
 
