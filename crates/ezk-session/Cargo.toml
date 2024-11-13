@@ -1,0 +1,21 @@
+[package]
+name = "ezk-session"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ezk.workspace = true
+ezk-rtp.workspace = true
+ezk-stun-types = "0.1"
+# sdp-types = { package = "ezk-sdp-types", version = "0.4" }
+sdp-types = { path = "../../../ezk/crates/sdp-types", package = "ezk-sdp-types" }
+log = "0.4"
+thiserror = "2"
+rand = "0.8"
+tokio = { version = "1", features = ["net"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+bytesstr = "1.0.2"
