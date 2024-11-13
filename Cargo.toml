@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "sip"]
 resolver = "2"
 
 [workspace.package]
@@ -15,3 +15,5 @@ ezk-audio-nodes = { version = "0.1", path = "crates/ezk-audio-nodes" }
 ezk-g711 = { version = "0.2", path = "crates/ezk-g711" }
 ezk-g722 = { version = "0.1", path = "crates/ezk-g722" }
 ezk-rtp = { version = "0.2", path = "crates/ezk-rtp" }
+
+ezk-session = { version = "0.1", path = "crates/ezk-session" }
