@@ -1,54 +1,17 @@
-use std::net::{IpAddr, Ipv4Addr};
-
 use ezk::BoxedSourceCancelSafe;
 use ezk_rtp::Rtp;
-use sdp_types::{Connection, Direction, IceOptions, MediaType, Origin, SessionDescription, Time};
+use sdp_session::LocalMediaId;
+use sdp_types::MediaType;
 
-pub struct Session {
-    sdp_id: u64,
-    sdp_version: u64,
+mod rtp_session;
+mod sdp_session;
 
-    address: IpAddr,
-}
-
-struct MediaSession {}
-
-impl Session {
-    pub fn new(address: IpAddr) -> Self {
-        Self {
-            sdp_id: rand::random(),
-            sdp_version: rand::random(),
-            address,
-        }
-    }
-
-    pub fn create_sdp(&self) -> SessionDescription {
-        SessionDescription {
-            name: "-".into(),
-            origin: Origin {
-                username: "-".into(),
-                session_id: self.sdp_id.to_string().into(),
-                session_version: self.sdp_version.to_string().into(),
-                address: self.address.into(),
-            },
-            time: Time { start: 0, stop: 0 },
-            direction: Direction::SendRecv,
-            connection: Some(Connection {
-                address: self.address.into(),
-                ttl: None,
-                num: None,
-            }),
-            bandwidth: vec![],
-            ice_options: IceOptions::default(),
-            ice_lite: false,
-            ice_ufrag: None,
-            ice_pwd: None,
-            attributes: vec![],
-            media_descriptions: vec![],
-        }
-    }
-
-    pub fn add_media_session(&mut self, codecs: Codecs) {}
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct Codec {
+    pub static_pt: Option<u8>,
+    pub name: String,
+    pub clock_rate: u32,
+    pub params: Vec<String>,
 }
 
 pub struct Codecs {
@@ -57,8 +20,7 @@ pub struct Codecs {
 }
 
 struct CodecsEntry {
-    pt: Option<u8>,
-
+    codec: Codec,
     build: Box<dyn FnMut(&mut TransceiverBuilder)>,
 }
 
@@ -70,57 +32,72 @@ impl Codecs {
         }
     }
 
-    pub fn with_codec<F: FnMut(&mut TransceiverBuilder)>(
-        mut self,
-        static_pt: Option<u8>,
-        encoding_name: &str,
-        clock_rate: u32,
-        on_use: F,
-    ) -> Self {
-        self.add_codec(static_pt, encoding_name, clock_rate, on_use);
+    pub fn with_codec<F>(mut self, codec: Codec, on_use: F) -> Self
+    where
+        F: FnMut(&mut TransceiverBuilder) + 'static,
+    {
+        self.add_codec(codec, on_use);
         self
     }
 
-    pub fn add_codec<F: FnMut(&mut TransceiverBuilder)>(
-        &mut self,
-        static_pt: Option<u8>,
-        encoding_name: &str,
-        clock_rate: u32,
-        on_use: F,
-    ) -> &mut Self {
+    pub fn add_codec<F>(&mut self, codec: Codec, on_use: F) -> &mut Self
+    where
+        F: FnMut(&mut TransceiverBuilder) + 'static,
+    {
+        self.codecs.push(CodecsEntry {
+            codec,
+            build: Box::new(on_use),
+        });
+
         self
     }
 }
 
 pub struct TransceiverBuilder {
-    rx: Option<Box<dyn FnOnce(BoxedSourceCancelSafe<Rtp>)>>,
-    tx: Option<Box<dyn FnOnce() -> BoxedSourceCancelSafe<Rtp>>>,
+    media_id: LocalMediaId,
+    create_receive: Option<Box<dyn FnMut(BoxedSourceCancelSafe<Rtp>)>>,
+    create_sender: Option<Box<dyn FnMut() -> BoxedSourceCancelSafe<Rtp>>>,
 }
 
 impl TransceiverBuilder {
+    /// Id of the media session which uses this transceiver
+    pub fn media_id(&self) -> LocalMediaId {
+        self.media_id
+    }
+
     pub fn add_receiver<F>(&mut self, on_create: F)
     where
-        F: FnOnce(BoxedSourceCancelSafe<Rtp>) + Send + 'static,
+        F: FnMut(BoxedSourceCancelSafe<Rtp>) + Send + 'static,
     {
-        self.rx = Some(Box::new(on_create));
+        self.create_receive = Some(Box::new(on_create));
     }
 
     pub fn add_sender<F>(&mut self, on_create: F)
     where
-        F: FnOnce() -> BoxedSourceCancelSafe<Rtp> + Send + 'static,
+        F: FnMut() -> BoxedSourceCancelSafe<Rtp> + Send + 'static,
     {
-        self.tx = Some(Box::new(on_create));
+        self.create_sender = Some(Box::new(on_create));
     }
 }
 
 #[test]
 fn ye() {
+    use sdp_session::Session;
+    use std::net::{IpAddr, Ipv4Addr};
     let mut session = Session::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
 
-    let codecs = Codecs::new(MediaType::Audio).with_codec(Some(9), "G722", 8000, |transceiver| {
-        transceiver.add_receiver(|source| {});
-        transceiver.add_sender(|| todo!());
-    });
+    let codecs = Codecs::new(MediaType::Audio).with_codec(
+        Codec {
+            static_pt: Some(9),
+            name: "G722".into(),
+            clock_rate: 8000,
+            params: vec![],
+        },
+        |transceiver| {
+            transceiver.add_receiver(|_source| {});
+            transceiver.add_sender(|| todo!());
+        },
+    );
 
-    session.add_media_session(codecs);
+    session.add_local_media(codecs, 1);
 }
