@@ -4,9 +4,9 @@ use sdp_session::LocalMediaId;
 use sdp_types::MediaType;
 
 mod rtp_session;
-mod sdp_session;
+pub mod sdp_session;
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Codec {
     pub static_pt: Option<u8>,
     pub name: String,
@@ -54,22 +54,23 @@ impl Codecs {
 }
 
 pub struct TransceiverBuilder {
-    media_id: LocalMediaId,
-    create_receive: Option<Box<dyn FnMut(BoxedSourceCancelSafe<Rtp>)>>,
+    local_media_id: LocalMediaId,
+
+    create_receiver: Option<Box<dyn FnMut(BoxedSourceCancelSafe<Rtp>)>>,
     create_sender: Option<Box<dyn FnMut() -> BoxedSourceCancelSafe<Rtp>>>,
 }
 
 impl TransceiverBuilder {
     /// Id of the media session which uses this transceiver
     pub fn media_id(&self) -> LocalMediaId {
-        self.media_id
+        self.local_media_id
     }
 
     pub fn add_receiver<F>(&mut self, on_create: F)
     where
         F: FnMut(BoxedSourceCancelSafe<Rtp>) + Send + 'static,
     {
-        self.create_receive = Some(Box::new(on_create));
+        self.create_receiver = Some(Box::new(on_create));
     }
 
     pub fn add_sender<F>(&mut self, on_create: F)
