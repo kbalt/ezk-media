@@ -21,7 +21,7 @@ pub struct Codecs {
 
 struct CodecsEntry {
     codec: Codec,
-    build: Box<dyn FnMut(&mut TransceiverBuilder)>,
+    build: Box<dyn FnMut(&mut TransceiverBuilder) + Send + Sync>,
 }
 
 impl Codecs {
@@ -34,7 +34,7 @@ impl Codecs {
 
     pub fn with_codec<F>(mut self, codec: Codec, on_use: F) -> Self
     where
-        F: FnMut(&mut TransceiverBuilder) + 'static,
+        F: FnMut(&mut TransceiverBuilder) + Send + Sync + 'static,
     {
         self.add_codec(codec, on_use);
         self
@@ -42,7 +42,7 @@ impl Codecs {
 
     pub fn add_codec<F>(&mut self, codec: Codec, on_use: F) -> &mut Self
     where
-        F: FnMut(&mut TransceiverBuilder) + 'static,
+        F: FnMut(&mut TransceiverBuilder) + Send + Sync + 'static,
     {
         self.codecs.push(CodecsEntry {
             codec,
@@ -56,8 +56,8 @@ impl Codecs {
 pub struct TransceiverBuilder {
     local_media_id: LocalMediaId,
 
-    create_receiver: Option<Box<dyn FnMut(BoxedSourceCancelSafe<Rtp>)>>,
-    create_sender: Option<Box<dyn FnMut() -> BoxedSourceCancelSafe<Rtp>>>,
+    create_receiver: Option<Box<dyn FnMut(BoxedSourceCancelSafe<Rtp>) + Send + Sync>>,
+    create_sender: Option<Box<dyn FnMut() -> BoxedSourceCancelSafe<Rtp> + Send + Sync>>,
 }
 
 impl TransceiverBuilder {
@@ -68,14 +68,14 @@ impl TransceiverBuilder {
 
     pub fn add_receiver<F>(&mut self, on_create: F)
     where
-        F: FnMut(BoxedSourceCancelSafe<Rtp>) + Send + 'static,
+        F: FnMut(BoxedSourceCancelSafe<Rtp>) + Send + Sync + 'static,
     {
         self.create_receiver = Some(Box::new(on_create));
     }
 
     pub fn add_sender<F>(&mut self, on_create: F)
     where
-        F: FnMut() -> BoxedSourceCancelSafe<Rtp> + Send + 'static,
+        F: FnMut() -> BoxedSourceCancelSafe<Rtp> + Send + Sync + 'static,
     {
         self.create_sender = Some(Box::new(on_create));
     }

@@ -1,14 +1,17 @@
 use crate::{rtp_session::RtpSession, Codec, Codecs, TransceiverBuilder};
 use sdp_types::{
-    Connection, Direction, IceOptions, Media, MediaDescription, Origin, RtpMap, SessionDescription,
-    TaggedAddress, Time,
+    Connection, Direction, Fmtp, IceOptions, Media, MediaDescription, Origin, Rtcp, RtpMap,
+    SessionDescription, TaggedAddress, Time, TransportProtocol,
 };
 use std::{
     collections::HashMap,
     io,
     net::{IpAddr, SocketAddr},
 };
-use tokio::{join, net::lookup_host};
+use tokio::{net::lookup_host, try_join};
+use transport::MediaTransport;
+
+mod transport;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -26,6 +29,9 @@ pub struct Session {
     local_media: HashMap<LocalMediaId, LocalMedia>,
 
     active: HashMap<LocalMediaId, Vec<ActiveMedia>>,
+
+    next_transport_id: MediaTransportId,
+    transports: HashMap<MediaTransportId, MediaTransport>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -43,6 +49,9 @@ struct ActiveMedia {
     codec: Codec,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MediaTransportId(u32);
+
 impl Session {
     pub fn new(address: IpAddr) -> Self {
         Self {
@@ -52,6 +61,8 @@ impl Session {
             address,
             local_media: HashMap::new(),
             active: HashMap::new(),
+            next_transport_id: MediaTransportId(0),
+            transports: HashMap::new(),
         }
     }
 
@@ -122,11 +133,12 @@ impl Session {
                     .iter()
                     .any(|attr| attr.name == "rtcp-mux");
 
-                let mut rtp_session = RtpSession::new(remote_rtcp_address, rtcp_mux).await?;
+                let mut rtp_session =
+                    RtpSession::new(remote_rtp_address, remote_rtcp_address, rtcp_mux).await?;
 
                 if let Some(create_sender) = builder.create_sender.as_mut().filter(|_| do_send) {
                     let sender = (create_sender)();
-                    rtp_session.set_sender(sender, remote_rtp_address);
+                    rtp_session.set_sender(sender);
                 };
 
                 if let Some(create_receiver) =
@@ -166,25 +178,33 @@ impl Session {
                     params: Default::default(),
                 };
 
+                let fmtps = active.codec.params.iter().map(|param| Fmtp {
+                    format: active.codec_pt,
+                    params: param.clone().into(),
+                });
+
                 MediaDescription {
                     media: Media {
                         media_type,
-                        port: todo!(),
+                        port: active.rtp_session.local_rtp_address().port(),
                         ports_num: None,
-                        proto: todo!(),
-                        fmts: todo!(),
+                        proto: TransportProtocol::RtpAvp,
+                        fmts: vec![active.codec_pt],
                     },
-                    direction: todo!(),
-                    connection: todo!(),
-                    bandwidth: todo!(),
-                    rtcp_attr: todo!(),
+                    direction: Direction::SendRecv, // TODO: set this correctly
+                    connection: None,
+                    bandwidth: vec![],
+                    rtcp_attr: Some(Rtcp {
+                        port: active.rtp_session.local_rtcp_address().port(),
+                        address: None,
+                    }),
                     rtpmaps: vec![rtpmap],
-                    fmtps: todo!(),
-                    ice_ufrag: todo!(),
-                    ice_pwd: todo!(),
-                    ice_candidates: todo!(),
-                    ice_end_of_candidates: todo!(),
-                    crypto: todo!(),
+                    fmtps: fmtps.collect(),
+                    ice_ufrag: None,
+                    ice_pwd: None,
+                    ice_candidates: vec![],
+                    ice_end_of_candidates: false,
+                    crypto: vec![],
                     attributes: vec![],
                 }
             });
@@ -274,13 +294,10 @@ async fn resolve_rtp_and_rtcp_address(
     let (remote_rtcp_address, remote_rtcp_port) =
         rtcp_address_and_port(remote_media_description, connection);
 
-    let (remote_rtp_address, remote_rtcp_address) = join!(
+    let (remote_rtp_address, remote_rtcp_address) = try_join!(
         resolve_tagged_address(&remote_rtp_address, remote_rtp_port),
         resolve_tagged_address(&remote_rtcp_address, remote_rtcp_port),
-    );
-
-    let remote_rtp_address = remote_rtp_address?;
-    let remote_rtcp_address = remote_rtcp_address?;
+    )?;
 
     Ok((remote_rtp_address, remote_rtcp_address))
 }
