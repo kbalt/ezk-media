@@ -1,104 +1,359 @@
-use ezk::BoxedSourceCancelSafe;
-use ezk_rtp::Rtp;
-use sdp_session::LocalMediaId;
-use sdp_types::MediaType;
+use sdp_types::{
+    Connection, Direction, Fmtp, IceOptions, Media, MediaDescription, Origin, Rtcp, RtpMap,
+    SessionDescription, TaggedAddress, Time, TransportProtocol,
+};
+use std::{
+    collections::HashMap,
+    io,
+    net::{IpAddr, SocketAddr},
+};
+use tokio::{net::lookup_host, try_join};
+use transport::DirectRtpTransport;
 
-mod rtp_session;
-pub mod sdp_session;
+mod codecs;
+mod sdp_session;
+mod transceiver_builder;
+mod transport;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Codec {
-    pub static_pt: Option<u8>,
-    pub name: String,
-    pub clock_rate: u32,
-    pub params: Vec<String>,
+pub use codecs::{Codec, Codecs};
+pub use transceiver_builder::TransceiverBuilder;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] io::Error),
 }
 
-pub struct Codecs {
-    media_type: MediaType,
-    codecs: Vec<CodecsEntry>,
+pub struct Session {
+    sdp_id: u64,
+    sdp_version: u64,
+
+    address: IpAddr,
+
+    next_media_id: LocalMediaId,
+    local_media: HashMap<LocalMediaId, LocalMedia>,
+
+    active: HashMap<LocalMediaId, Vec<ActiveMedia>>,
+    // next_transport_id: MediaTransportId,
+    // transports: HashMap<MediaTransportId, MediaTransport>,
 }
 
-struct CodecsEntry {
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LocalMediaId(u32);
+
+struct LocalMedia {
+    codecs: Codecs,
+    limit: usize,
+}
+
+struct ActiveMedia {
+    // transport: MediaTransportId,
+    rtp_transport: DirectRtpTransport,
+
+    codec_pt: u8,
     codec: Codec,
-    build: Box<dyn FnMut(&mut TransceiverBuilder) + Send + Sync>,
 }
 
-impl Codecs {
-    pub fn new(media_type: MediaType) -> Self {
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MediaTransportId(u32);
+
+impl Session {
+    pub fn new(address: IpAddr) -> Self {
         Self {
-            media_type,
-            codecs: vec![],
+            sdp_id: rand::random(),
+            sdp_version: rand::random(),
+            next_media_id: LocalMediaId(0),
+            address,
+            local_media: HashMap::new(),
+            active: HashMap::new(),
+            // next_transport_id: MediaTransportId(0),
+            // transports: HashMap::new(),
         }
     }
 
-    pub fn with_codec<F>(mut self, codec: Codec, on_use: F) -> Self
-    where
-        F: FnMut(&mut TransceiverBuilder) + Send + Sync + 'static,
-    {
-        self.add_codec(codec, on_use);
-        self
+    /// Register codecs for a media type with a limit of how many media session by can be created
+    pub fn add_local_media(&mut self, codecs: Codecs, limit: usize) -> LocalMediaId {
+        let id = self.next_media_id;
+        self.next_media_id = LocalMediaId(id.0 + 1);
+
+        self.local_media.insert(id, LocalMedia { codecs, limit });
+
+        id
     }
 
-    pub fn add_codec<F>(&mut self, codec: Codec, on_use: F) -> &mut Self
-    where
-        F: FnMut(&mut TransceiverBuilder) + Send + Sync + 'static,
-    {
-        self.codecs.push(CodecsEntry {
-            codec,
-            build: Box::new(on_use),
-        });
+    pub async fn receiver_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
+        // TODO: rejected media must be included in the response with port=0
+        for remote_media_description in &offer.media_descriptions {
+            for (local_media_id, local_media) in &mut self.local_media {
+                let active = self.active.entry(*local_media_id).or_default();
 
-        self
+                if local_media.codecs.media_type != remote_media_description.media.media_type
+                    || matches!(remote_media_description.direction, Direction::Inactive)
+                {
+                    continue;
+                }
+
+                // resolve remote rtp & rtcp address
+                let (remote_rtp_address, remote_rtcp_address) =
+                    resolve_rtp_and_rtcp_address(&offer, remote_media_description).await?;
+
+                // Find out if this offer is part of an active session
+                let active_media = active
+                    .iter()
+                    .find(|active| active.rtp_transport.remote_rtp_address() == remote_rtp_address);
+
+                if active_media.is_some() {
+                    // TODO: verify that the media is still valid (codec might need to change)
+                    continue;
+                }
+
+                if active.len() >= local_media.limit {
+                    // Cannot create more media sessions using this local media
+                    continue;
+                }
+
+                let Some((mut builder, codec, codec_pt)) =
+                    choose_codec(remote_media_description, local_media, local_media_id)
+                else {
+                    // No codec found, skip
+                    continue;
+                };
+
+                let (do_send, do_receive) = match remote_media_description.direction.flipped() {
+                    Direction::SendRecv => (true, true),
+                    Direction::RecvOnly => (false, true),
+                    Direction::SendOnly => (true, false),
+                    Direction::Inactive => (false, false),
+                };
+
+                if !(do_send && builder.create_sender.is_some()
+                    || do_receive && builder.create_receiver.is_some())
+                {
+                    // There would be no sender or receiver, skip
+                    continue;
+                }
+
+                // Create rtp session
+                let rtcp_mux = remote_media_description
+                    .attributes
+                    .iter()
+                    .any(|attr| attr.name == "rtcp-mux");
+
+                let mut rtp_transport = DirectRtpTransport::new(
+                    remote_rtp_address,
+                    Some(remote_rtcp_address),
+                    codec.clock_rate,
+                )
+                .await?;
+
+                if let Some(create_sender) = builder.create_sender.as_mut().filter(|_| do_send) {
+                    let sender = (create_sender)();
+                    rtp_transport.set_sender(sender, codec_pt).await;
+                };
+
+                if let Some(create_receiver) =
+                    builder.create_receiver.as_mut().filter(|_| do_receive)
+                {
+                    let receiver = rtp_transport.set_receiver(codec_pt).await;
+
+                    (create_receiver)(receiver);
+                }
+
+                self.active
+                    .entry(*local_media_id)
+                    .or_default()
+                    .push(ActiveMedia {
+                        rtp_transport,
+                        codec_pt,
+                        codec,
+                    });
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn create_sdp_answer(&self) -> SessionDescription {
+        let media = self
+            .active
+            .iter()
+            .flat_map(|(id, active)| active.iter().map(move |active| (id, active)))
+            .map(|(id, active)| {
+                let media_type = self.local_media[id].codecs.media_type;
+
+                let rtpmap = RtpMap {
+                    payload: active.codec_pt,
+                    encoding: active.codec.name.as_str().into(),
+                    clock_rate: active.codec.clock_rate,
+                    params: Default::default(),
+                };
+
+                let fmtps = active.codec.params.iter().map(|param| Fmtp {
+                    format: active.codec_pt,
+                    params: param.clone().into(),
+                });
+
+                MediaDescription {
+                    media: Media {
+                        media_type,
+                        port: active.rtp_transport.local_rtp_port(),
+                        ports_num: None,
+                        proto: TransportProtocol::RtpAvp,
+                        fmts: vec![active.codec_pt],
+                    },
+                    direction: Direction::SendRecv, // TODO: set this correctly
+                    connection: None,
+                    bandwidth: vec![],
+                    rtcp_attr: active.rtp_transport.local_rtcp_port().map(|port| Rtcp {
+                        port,
+                        address: None,
+                    }),
+                    rtpmaps: vec![rtpmap],
+                    fmtps: fmtps.collect(),
+                    ice_ufrag: None,
+                    ice_pwd: None,
+                    ice_candidates: vec![],
+                    ice_end_of_candidates: false,
+                    crypto: vec![],
+                    attributes: vec![],
+                }
+            });
+
+        SessionDescription {
+            name: "-".into(),
+            origin: Origin {
+                username: "-".into(),
+                session_id: self.sdp_id.to_string().into(),
+                session_version: self.sdp_version.to_string().into(),
+                address: self.address.into(),
+            },
+            time: Time { start: 0, stop: 0 },
+            direction: Direction::SendRecv,
+            connection: Some(Connection {
+                address: self.address.into(),
+                ttl: None,
+                num: None,
+            }),
+            bandwidth: vec![],
+            ice_options: IceOptions::default(),
+            ice_lite: false,
+            ice_ufrag: None,
+            ice_pwd: None,
+            attributes: vec![],
+            media_descriptions: media.collect(),
+        }
     }
 }
 
-pub struct TransceiverBuilder {
-    local_media_id: LocalMediaId,
+fn choose_codec(
+    remote_media_description: &MediaDescription,
+    local_media: &mut LocalMedia,
+    local_media_id: &LocalMediaId,
+) -> Option<(TransceiverBuilder, Codec, u8)> {
+    let mut chosen_codec = None;
 
-    create_receiver: Option<Box<dyn FnMut(BoxedSourceCancelSafe<Rtp>) + Send + Sync>>,
-    create_sender: Option<Box<dyn FnMut() -> BoxedSourceCancelSafe<Rtp> + Send + Sync>>,
+    for entry in &mut local_media.codecs.codecs {
+        let codec_pt = if let Some(static_pt) = entry.codec.static_pt {
+            if remote_media_description.media.fmts.contains(&static_pt) {
+                Some(static_pt)
+            } else {
+                None
+            }
+        } else {
+            remote_media_description
+                .rtpmaps
+                .iter()
+                .find(|rtpmap| {
+                    rtpmap.encoding == entry.codec.name.as_str()
+                        && rtpmap.clock_rate == entry.codec.clock_rate
+                })
+                .map(|rtpmap| rtpmap.payload)
+        };
+
+        if let Some(codec_pt) = codec_pt {
+            let mut builder = TransceiverBuilder {
+                local_media_id: *local_media_id,
+                create_receiver: None,
+                create_sender: None,
+            };
+
+            (entry.build)(&mut builder);
+
+            chosen_codec = Some((builder, entry.codec.clone(), codec_pt));
+
+            break;
+        }
+    }
+
+    chosen_codec
 }
 
-impl TransceiverBuilder {
-    /// Id of the media session which uses this transceiver
-    pub fn media_id(&self) -> LocalMediaId {
-        self.local_media_id
-    }
+async fn resolve_rtp_and_rtcp_address(
+    offer: &SessionDescription,
+    remote_media_description: &MediaDescription,
+) -> Result<(SocketAddr, SocketAddr), Error> {
+    let connection = offer
+        .connection
+        .as_ref()
+        .or(remote_media_description.connection.as_ref())
+        .unwrap();
 
-    pub fn add_receiver<F>(&mut self, on_create: F)
-    where
-        F: FnMut(BoxedSourceCancelSafe<Rtp>) + Send + Sync + 'static,
-    {
-        self.create_receiver = Some(Box::new(on_create));
-    }
+    let remote_rtp_address = connection.address.clone();
+    let remote_rtp_port = remote_media_description.media.port;
 
-    pub fn add_sender<F>(&mut self, on_create: F)
-    where
-        F: FnMut() -> BoxedSourceCancelSafe<Rtp> + Send + Sync + 'static,
-    {
-        self.create_sender = Some(Box::new(on_create));
+    let (remote_rtcp_address, remote_rtcp_port) =
+        rtcp_address_and_port(remote_media_description, connection);
+
+    let (remote_rtp_address, remote_rtcp_address) = try_join!(
+        resolve_tagged_address(&remote_rtp_address, remote_rtp_port),
+        resolve_tagged_address(&remote_rtcp_address, remote_rtcp_port),
+    )?;
+
+    Ok((remote_rtp_address, remote_rtcp_address))
+}
+
+fn rtcp_address_and_port(
+    remote_media_description: &MediaDescription,
+    connection: &Connection,
+) -> (TaggedAddress, u16) {
+    if let Some(rtcp_addr) = &remote_media_description.rtcp_attr {
+        let address = rtcp_addr
+            .address
+            .clone()
+            .unwrap_or_else(|| connection.address.clone());
+
+        (address, rtcp_addr.port)
+    } else {
+        let rtcp_mux = remote_media_description
+            .attributes
+            .iter()
+            .any(|attr| attr.name == "rtcp-mux");
+
+        let rtcp_port = if !rtcp_mux {
+            remote_media_description.media.port
+        } else {
+            remote_media_description.media.port + 1
+        };
+
+        (connection.address.clone(), rtcp_port)
     }
 }
 
-#[test]
-fn ye() {
-    use sdp_session::Session;
-    use std::net::{IpAddr, Ipv4Addr};
-    let mut session = Session::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
-
-    let codecs = Codecs::new(MediaType::Audio).with_codec(
-        Codec {
-            static_pt: Some(9),
-            name: "G722".into(),
-            clock_rate: 8000,
-            params: vec![],
-        },
-        |transceiver| {
-            transceiver.add_receiver(|_source| {});
-            transceiver.add_sender(|| todo!());
-        },
-    );
-
-    session.add_local_media(codecs, 1);
+async fn resolve_tagged_address(address: &TaggedAddress, port: u16) -> io::Result<SocketAddr> {
+    match address {
+        TaggedAddress::IP4(ipv4_addr) => Ok(SocketAddr::from((*ipv4_addr, port))),
+        TaggedAddress::IP4FQDN(bytes_str) => lookup_host((bytes_str.as_str(), port))
+            .await?
+            .find(|ip| ip.is_ipv4())
+            .ok_or(io::Error::other(format!(
+                "Failed to find IPv4 address for {bytes_str}"
+            ))),
+        TaggedAddress::IP6(ipv6_addr) => Ok(SocketAddr::from((*ipv6_addr, port))),
+        TaggedAddress::IP6FQDN(bytes_str) => lookup_host((bytes_str.as_str(), port))
+            .await?
+            .find(|ip| ip.is_ipv6())
+            .ok_or(io::Error::other(format!(
+                "Failed to find IPv6 address for {bytes_str}"
+            ))),
+    }
 }

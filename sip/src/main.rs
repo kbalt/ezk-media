@@ -1,4 +1,5 @@
 use bytesstr::BytesStr;
+use ezk::Source;
 use ezk_session::{Codec, Codecs};
 use sdp_types::{MediaType, SessionDescription};
 use sip_core::transport::udp::Udp;
@@ -43,8 +44,7 @@ impl Layer for InviteAcceptLayer {
             SessionDescription::parse(&BytesStr::from_utf8_bytes(invite.body.clone()).unwrap())
                 .unwrap();
 
-        let mut sdp_session =
-            ezk_session::sdp_session::Session::new("192.168.178.39".parse().unwrap());
+        let mut sdp_session = ezk_session::Session::new("192.168.178.39".parse().unwrap());
         sdp_session.add_local_media(
             Codecs::new(MediaType::Audio).with_codec(
                 Codec {
@@ -54,7 +54,15 @@ impl Layer for InviteAcceptLayer {
                     params: vec![],
                 },
                 |builder| {
-                    builder.add_receiver(|s| {});
+                    builder.add_receiver(|mut s| {
+                        println!("got receiver");
+
+                        // tokio::spawn(async move {
+                        //     loop {
+                        //         dbg!(s.next_event().await);
+                        //     }
+                        // });
+                    });
                 },
             ),
             1,

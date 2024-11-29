@@ -11,6 +11,7 @@ use std::future::Future;
 /// When using [`BoxedSource`] try using [`BoxedSourceCancelSafe`] instead if this trait is required. See [`Source::boxed_cancel_safe`].
 pub trait NextEventIsCancelSafe {}
 
+#[derive(Debug)]
 pub enum SourceEvent<M: MediaType> {
     /// Source produced a frame
     Frame(Frame<M>),
