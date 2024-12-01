@@ -1,7 +1,14 @@
 use crate::{Frame, MediaType, Result};
 use downcast_rs::Downcast;
+use ouroboros::self_referencing;
 use reusable_box::{ReusableBox, ReusedBoxFuture};
-use std::future::Future;
+use std::{
+    future::Future,
+    mem::take,
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio_stream::Stream;
 
 /// Types that implement [`Source`] and are allowed to prematurely drop the [`next_event`](Source::next_event) future.
 ///
@@ -17,7 +24,6 @@ pub enum SourceEvent<M: MediaType> {
     Frame(Frame<M>),
 
     /// This source will provide no more data
-    // TODO: should this be a permanent, or should a source be able to restart?
     EndOfData,
 
     /// After this event is received the source must be renegotiated using [`Source::negotiate_config`]. This may
@@ -245,4 +251,69 @@ impl<M: MediaType> Source for BoxedSourceCancelSafe<M> {
     {
         self
     }
+}
+
+/// Wraps a [`BoxedSource`], implements [`Future`] and [`Stream`] yielding the result of [`Source::next_event`]
+///
+/// The `Stream` implementation recalls `next_event` after returning an item, while the `Future` does not.
+pub struct SourceStream<M: MediaType>(Option<SourceStreamImpl<M>>);
+
+impl<M: MediaType> SourceStream<M> {
+    pub fn new(source: impl Source<MediaType = M>) -> Self {
+        let source = source.boxed();
+
+        Self(Some(new_impl(source)))
+    }
+
+    pub fn into_inner(self) -> BoxedSource<M> {
+        self.0.unwrap().into_heads().source
+    }
+}
+
+fn new_impl<M: MediaType>(source: BoxedSource<M>) -> SourceStreamImpl<M> {
+    SourceStreamImplBuilder {
+        source,
+        next_event_future_builder: |boxed_source| {
+            boxed_source
+                .source
+                .next_event(&mut boxed_source.reusable_box)
+        },
+    }
+    .build()
+}
+
+impl<M: MediaType> Future for SourceStream<M> {
+    type Output = Result<SourceEvent<M>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0
+            .as_mut()
+            .unwrap()
+            .with_mut(|mut this| Pin::new(&mut this.next_event_future).poll(cx))
+    }
+}
+
+impl<M: MediaType> Stream for SourceStream<M> {
+    type Item = Result<SourceEvent<M>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.as_mut().poll(cx) {
+            Poll::Ready(r) => {
+                let boxed_source = take(&mut self.0).unwrap().into_heads().source;
+
+                self.0 = Some(new_impl(boxed_source));
+
+                Poll::Ready(Some(r))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[self_referencing]
+struct SourceStreamImpl<M: MediaType> {
+    source: BoxedSource<M>,
+    #[borrows(mut source)]
+    #[covariant]
+    next_event_future: ReusedBoxFuture<'this, Result<SourceEvent<M>>>,
 }

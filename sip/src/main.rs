@@ -1,5 +1,5 @@
 use bytesstr::BytesStr;
-use ezk::Source;
+use ezk::{Source, SourceEvent};
 use ezk_session::{Codec, Codecs};
 use sdp_types::{MediaType, SessionDescription};
 use sip_core::transport::udp::Udp;
@@ -44,7 +44,7 @@ impl Layer for InviteAcceptLayer {
             SessionDescription::parse(&BytesStr::from_utf8_bytes(invite.body.clone()).unwrap())
                 .unwrap();
 
-        let mut sdp_session = ezk_session::Session::new("192.168.178.39".parse().unwrap());
+        let mut sdp_session = ezk_session::SdpSession::new("192.168.178.39".parse().unwrap());
         sdp_session.add_local_media(
             Codecs::new(MediaType::Audio).with_codec(
                 Codec {
@@ -55,18 +55,47 @@ impl Layer for InviteAcceptLayer {
                 },
                 |builder| {
                     builder.add_receiver(|mut s| {
-                        println!("got receiver");
+                        println!("got receiver pcma");
 
-                        // tokio::spawn(async move {
-                        //     loop {
-                        //         dbg!(s.next_event().await);
-                        //     }
-                        // });
+                        tokio::spawn(async move {
+                            loop {
+                                if let SourceEvent::EndOfData = s.next_event().await.unwrap() {
+                                    println!("break pcma");
+                                    break;
+                                }
+                            }
+                        });
                     });
                 },
             ),
             1,
         );
+        sdp_session.add_local_media(
+            Codecs::new(MediaType::Video).with_codec(
+                Codec {
+                    static_pt: None,
+                    name: "AV1".into(),
+                    clock_rate: 90000,
+                    params: vec![],
+                },
+                |builder| {
+                    builder.add_receiver(|mut s| {
+                        println!("got receiver av1");
+
+                        tokio::spawn(async move {
+                            loop {
+                                if let SourceEvent::EndOfData = s.next_event().await.unwrap() {
+                                    println!("break av1");
+                                    break;
+                                }
+                            }
+                        });
+                    });
+                },
+            ),
+            1,
+        );
+
         sdp_session.receiver_offer(sdp_offer).await.unwrap();
 
         let sdp_response = sdp_session.create_sdp_answer();

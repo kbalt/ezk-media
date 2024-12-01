@@ -9,8 +9,13 @@ repository.workspace = true
 [dependencies]
 ezk.workspace = true
 ezk-rtp.workspace = true
-sdp-types = { package = "ezk-sdp-types", version = "0.4" }
+ezk-stun-types = "0.1"
+# sdp-types = { package = "ezk-sdp-types", version = "0.4" }
+sdp-types = { path = "../../../ezk/crates/sdp-types", package = "ezk-sdp-types" }
 log = "0.4"
 thiserror = "2"
 rand = "0.8"
 tokio = { version = "1", features = ["net"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+bytesstr = "1.0.2"

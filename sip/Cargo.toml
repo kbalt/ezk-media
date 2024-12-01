@@ -12,7 +12,8 @@ ezk-session.workspace = true
 sip-types = { version = "0.3", package = "ezk-sip-types" }
 sip-ua = { version = "0.4", package = "ezk-sip-ua" }
 sip-core = { version = "0.4", package = "ezk-sip-core" }
-sdp-types = { version = "0.4", package = "ezk-sdp-types" }
+# sdp-types = { version = "0.4", package = "ezk-sdp-types" }
+sdp-types = { path = "../../ezk/crates/sdp-types", package = "ezk-sdp-types" }
 tokio = { version = "1.41.1", features = ["full"] }
 log = "0.4.22"
 env_logger = "0.11.5"
@@ -21,3 +22,4 @@ bytesstr = "1.0.2"
 
 ezk.workspace = true
 ezk-rtp.workspace = true
+ezk-audio.workspace = true

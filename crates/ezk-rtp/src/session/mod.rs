@@ -1,8 +1,9 @@
 use crate::{NtpTimestamp, RtpPacket};
 use jitter_buffer::{guess_timestamp, JitterBuffer};
 use rtcp_types::{
-    CompoundBuilder, ReceiverReport, ReportBlock, RtcpPacketWriterExt, RtcpWriteError, SdesBuilder,
-    SdesChunkBuilder, SdesItemBuilder, SenderReport,
+    CompoundBuilder, ReceiverReport, ReceiverReportBuilder, ReportBlock, RtcpPacketWriterExt,
+    RtcpWriteError, SdesBuilder, SdesChunkBuilder, SdesItemBuilder, SenderReport,
+    SenderReportBuilder,
 };
 use std::time::{Duration, Instant};
 use time::ext::InstantExt;
@@ -19,6 +20,7 @@ pub struct RtpSession {
     ssrc: u32,
     clock_rate: u32,
 
+    // TODO: remove me?
     /// tag/type, prefix, value
     source_description_items: Vec<(u8, Option<Vec<u8>>, String)>,
 
@@ -200,12 +202,8 @@ impl RtpSession {
         }
     }
 
-    /// Generate RTCP sender or receiver report packet.
-    ///
-    /// This resets the internal received & lost packets counter for every receiver.
-    pub fn write_rtcp_report(&mut self, dst: &mut [u8]) -> Result<usize, RtcpWriteError> {
+    pub fn generate_rtcp_report(&mut self) -> Result<SenderReportBuilder, ReceiverReportBuilder> {
         let now = NtpTimestamp::now();
-
         let mut report_blocks = vec![];
 
         for receiver in &mut self.receiver {
@@ -246,9 +244,6 @@ impl RtpSession {
             report_blocks.push(report_block);
         }
 
-        let mut compound = CompoundBuilder::default();
-
-        // Add report block
         if let Some(sender_info) = &self.sender {
             let rtp_timestamp = {
                 let offset = (self.clock_rate * (now - sender_info.ntp_timestamp)).as_seconds_f64()
@@ -266,7 +261,7 @@ impl RtpSession {
                 sr = sr.add_report_block(report_blocks);
             }
 
-            compound = compound.add_packet(sr);
+            Ok(sr)
         } else {
             let mut rr = ReceiverReport::builder(self.ssrc);
 
@@ -274,25 +269,43 @@ impl RtpSession {
                 rr = rr.add_report_block(report_blocks);
             }
 
-            compound = compound.add_packet(rr);
+            Err(rr)
+        }
+    }
+
+    pub fn generate_sdes_chunk(&self) -> Option<SdesChunkBuilder<'_>> {
+        if self.source_description_items.is_empty() {
+            return None;
         }
 
-        // Add source description block
-        if !self.source_description_items.is_empty() {
-            let mut chunk = SdesChunkBuilder::new(self.ssrc);
+        let mut chunk = SdesChunkBuilder::new(self.ssrc);
 
-            for (tag, prefix, value) in &self.source_description_items {
-                let mut item = SdesItemBuilder::new(*tag, value);
+        for (tag, prefix, value) in &self.source_description_items {
+            let mut item = SdesItemBuilder::new(*tag, value);
 
-                if let Some(prefix) = prefix {
-                    item = item.prefix(prefix);
-                }
-
-                chunk = chunk.add_item(item);
+            if let Some(prefix) = prefix {
+                item = item.prefix(prefix);
             }
 
-            compound = compound.add_packet(SdesBuilder::default().add_chunk(chunk));
+            chunk = chunk.add_item(item);
+        }
+
+        Some(chunk)
+    }
+
+    /// Generate RTCP sender or receiver report packet.
+    ///
+    /// This resets the internal received & lost packets counter for every receiver.
+    pub fn write_rtcp_report(&mut self, dst: &mut [u8]) -> Result<usize, RtcpWriteError> {
+        let mut compound = match self.generate_rtcp_report() {
+            Ok(sr) => CompoundBuilder::default().add_packet(sr),
+            Err(rr) => CompoundBuilder::default().add_packet(rr),
         };
+
+        // Add source description block
+        if let Some(sdes_chunk) = self.generate_sdes_chunk() {
+            compound = compound.add_packet(SdesBuilder::default().add_chunk(sdes_chunk));
+        }
 
         // write into dst
         compound.write_into(dst)

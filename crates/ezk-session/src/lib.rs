@@ -1,6 +1,8 @@
+use bytesstr::BytesStr;
+use ezk::Source;
 use sdp_types::{
-    Connection, Direction, Fmtp, IceOptions, Media, MediaDescription, Origin, Rtcp, RtpMap,
-    SessionDescription, TaggedAddress, Time, TransportProtocol,
+    Connection, Direction, ExtMap, Fmtp, Group, IceOptions, Media, MediaDescription, Origin, Rtcp,
+    RtpMap, SessionDescription, TaggedAddress, Time, TransportProtocol,
 };
 use std::{
     collections::HashMap,
@@ -8,10 +10,9 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 use tokio::{net::lookup_host, try_join};
-use transport::DirectRtpTransport;
+use transport::{DirectRtpTransport, IdentifyableBy, TransportTaskHandle};
 
 mod codecs;
-mod sdp_session;
 mod transceiver_builder;
 mod transport;
 
@@ -24,57 +25,104 @@ pub enum Error {
     Io(#[from] io::Error),
 }
 
-pub struct Session {
+pub struct SdpSession {
     sdp_id: u64,
     sdp_version: u64,
 
     address: IpAddr,
 
+    // Local configured media
     next_media_id: LocalMediaId,
     local_media: HashMap<LocalMediaId, LocalMedia>,
 
-    active: HashMap<LocalMediaId, Vec<ActiveMedia>>,
-    // next_transport_id: MediaTransportId,
-    // transports: HashMap<MediaTransportId, MediaTransport>,
+    // Active media
+    next_active_media_id: ActiveMediaId,
+    active_media: HashMap<LocalMediaId, Vec<ActiveMedia>>,
+
+    // Transports
+    next_transport_id: TransportId,
+    transports: HashMap<TransportId, Transport>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LocalMediaId(u32);
+
+impl LocalMediaId {
+    fn step(&mut self) -> LocalMediaId {
+        let id = *self;
+        self.0 += 1;
+        id
+    }
+}
 
 struct LocalMedia {
     codecs: Codecs,
     limit: usize,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ActiveMediaId(u32);
+
+impl ActiveMediaId {
+    fn step(&mut self) -> ActiveMediaId {
+        let id = *self;
+        self.0 += 1;
+        id
+    }
+}
+
 struct ActiveMedia {
-    // transport: MediaTransportId,
-    rtp_transport: DirectRtpTransport,
+    id: ActiveMediaId,
+
+    mid: Option<BytesStr>,
+
+    // position in the remote's sdp
+    remote_pos: usize,
+
+    transport: TransportId,
+
+    remote_rtp_address: SocketAddr,
+    remote_rtcp_address: Option<SocketAddr>,
 
     codec_pt: u8,
     codec: Codec,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MediaTransportId(u32);
+pub struct TransportId(u32);
 
-impl Session {
+impl TransportId {
+    fn step(&mut self) -> TransportId {
+        let id = *self;
+        self.0 += 1;
+        id
+    }
+}
+
+struct Transport {
+    local_rtp_port: u16,
+    local_rtcp_port: Option<u16>,
+    handle: TransportTaskHandle,
+}
+
+impl SdpSession {
     pub fn new(address: IpAddr) -> Self {
-        Self {
-            sdp_id: rand::random(),
-            sdp_version: rand::random(),
-            next_media_id: LocalMediaId(0),
+        SdpSession {
+            sdp_id: u64::from(rand::random::<u16>()),
+            sdp_version: u64::from(rand::random::<u16>()),
             address,
+            next_media_id: LocalMediaId(0),
             local_media: HashMap::new(),
-            active: HashMap::new(),
-            // next_transport_id: MediaTransportId(0),
-            // transports: HashMap::new(),
+            next_active_media_id: ActiveMediaId(0),
+            active_media: HashMap::new(),
+            next_transport_id: TransportId(0),
+            transports: HashMap::new(),
         }
     }
 
     /// Register codecs for a media type with a limit of how many media session by can be created
     pub fn add_local_media(&mut self, codecs: Codecs, limit: usize) -> LocalMediaId {
-        let id = self.next_media_id;
-        self.next_media_id = LocalMediaId(id.0 + 1);
+        let id = self.next_media_id.step();
 
         self.local_media.insert(id, LocalMedia { codecs, limit });
 
@@ -82,10 +130,13 @@ impl Session {
     }
 
     pub async fn receiver_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
+        let mut not_mentioned: Vec<ActiveMediaId> =
+            self.active_media.values().flatten().map(|m| m.id).collect();
+
         // TODO: rejected media must be included in the response with port=0
-        for remote_media_description in &offer.media_descriptions {
+        for (remote_pos, remote_media_description) in offer.media_descriptions.iter().enumerate() {
             for (local_media_id, local_media) in &mut self.local_media {
-                let active = self.active.entry(*local_media_id).or_default();
+                let active = self.active_media.entry(*local_media_id).or_default();
 
                 if local_media.codecs.media_type != remote_media_description.media.media_type
                     || matches!(remote_media_description.direction, Direction::Inactive)
@@ -100,9 +151,10 @@ impl Session {
                 // Find out if this offer is part of an active session
                 let active_media = active
                     .iter()
-                    .find(|active| active.rtp_transport.remote_rtp_address() == remote_rtp_address);
+                    .find(|active| active.remote_rtp_address == remote_rtp_address);
 
-                if active_media.is_some() {
+                if let Some(active_media) = active_media {
+                    not_mentioned.retain(|id| active_media.id != *id);
                     // TODO: verify that the media is still valid (codec might need to change)
                     continue;
                 }
@@ -133,49 +185,164 @@ impl Session {
                     continue;
                 }
 
-                // Create rtp session
-                let rtcp_mux = remote_media_description
-                    .attributes
-                    .iter()
-                    .any(|attr| attr.name == "rtcp-mux");
-
-                let mut rtp_transport = DirectRtpTransport::new(
+                // Get or create transport for the m-line
+                let transport_id = Self::get_or_create_transport(
+                    &self.active_media,
+                    &mut self.next_transport_id,
+                    &mut self.transports,
+                    &offer,
+                    remote_media_description,
                     remote_rtp_address,
-                    Some(remote_rtcp_address),
-                    codec.clock_rate,
+                    remote_rtcp_address,
                 )
                 .await?;
 
+                let transport = self
+                    .transports
+                    .get_mut(&transport_id)
+                    .expect("transport_id must be valid");
+
+                let active_media_id = self.next_active_media_id.step();
+
+                transport
+                    .handle
+                    .add_media_session(
+                        active_media_id,
+                        IdentifyableBy {
+                            mid: None,
+                            ssrc: vec![],
+                            pt: vec![codec_pt],
+                        },
+                        codec.clock_rate,
+                    )
+                    .await;
+
                 if let Some(create_sender) = builder.create_sender.as_mut().filter(|_| do_send) {
                     let sender = (create_sender)();
-                    rtp_transport.set_sender(sender, codec_pt).await;
+                    // TODO: do not call boxed here, the cancel safe requirement is too strict in transceiver builder
+                    transport
+                        .handle
+                        .set_sender(active_media_id, sender.boxed(), codec_pt)
+                        .await;
                 };
 
                 if let Some(create_receiver) =
                     builder.create_receiver.as_mut().filter(|_| do_receive)
                 {
-                    let receiver = rtp_transport.set_receiver(codec_pt).await;
+                    let receiver = transport
+                        .handle
+                        .set_receiver(active_media_id, codec_pt)
+                        .await;
 
                     (create_receiver)(receiver);
                 }
 
-                self.active
+                self.active_media
                     .entry(*local_media_id)
                     .or_default()
                     .push(ActiveMedia {
-                        rtp_transport,
+                        id: active_media_id,
+                        mid: remote_media_description.mid.clone(),
+                        remote_pos,
+                        transport: transport_id,
+                        remote_rtp_address,
+                        remote_rtcp_address: Some(remote_rtcp_address),
                         codec_pt,
                         codec,
                     });
             }
         }
 
+        for active_media_id in not_mentioned {
+            // TODO: remove active media
+        }
+
         Ok(())
     }
 
+    async fn get_or_create_transport(
+        active_media: &HashMap<LocalMediaId, Vec<ActiveMedia>>,
+        next_transport_id: &mut TransportId,
+        transports: &mut HashMap<TransportId, Transport>,
+
+        offer: &SessionDescription,
+        remote_media_description: &MediaDescription,
+
+        remote_rtp_address: SocketAddr,
+        remote_rtcp_address: SocketAddr,
+    ) -> Result<TransportId, Error> {
+        match remote_media_description
+            .mid
+            .as_ref()
+            .and_then(|mid| Self::find_bundled_transport(active_media, offer, mid))
+        {
+            Some(id) => {
+                // Bundled transport found, use that one
+                Ok(id)
+            }
+
+            None => {
+                // Not bundled or no transport for the group created yet
+                let mid_rtp_id = remote_media_description
+                    .extmap
+                    .iter()
+                    .find(|extmap| extmap.uri == "urn:ietf:params:rtp-hdrext:sdes:mid")
+                    .map(|extmap| extmap.id);
+
+                let transport = DirectRtpTransport::new(
+                    remote_rtp_address,
+                    Some(remote_rtcp_address).filter(|_| !remote_media_description.rtcp_mux),
+                )
+                .await?;
+
+                let local_rtp_port = transport.local_rtp_port();
+                let local_rtcp_port = transport.local_rtcp_port();
+
+                let handle = TransportTaskHandle::new(transport, mid_rtp_id).await?;
+
+                let id = next_transport_id.step();
+
+                transports.insert(
+                    id,
+                    Transport {
+                        local_rtp_port,
+                        local_rtcp_port,
+                        handle,
+                    },
+                );
+
+                Ok(id)
+            }
+        }
+    }
+
+    fn find_bundled_transport(
+        active_media: &HashMap<LocalMediaId, Vec<ActiveMedia>>,
+        offer: &SessionDescription,
+        mid: &BytesStr,
+    ) -> Option<TransportId> {
+        let group = offer
+            .group
+            .iter()
+            .find(|g| g.typ == "BUNDLE" && g.mids.contains(mid))?;
+
+        active_media
+            .values()
+            .flat_map(|vec| vec.iter())
+            .find_map(|m| {
+                let mid = m.mid.as_ref()?;
+
+                group
+                    .mids
+                    .iter()
+                    .any(|gmid| gmid == mid.as_str())
+                    .then_some(m.transport)
+            })
+    }
+
     pub fn create_sdp_answer(&self) -> SessionDescription {
-        let media = self
-            .active
+        let mut media: Vec<(usize, MediaDescription)> = self
+            .active_media
             .iter()
             .flat_map(|(id, active)| active.iter().map(move |active| (id, active)))
             .map(|(id, active)| {
@@ -193,10 +360,21 @@ impl Session {
                     params: param.clone().into(),
                 });
 
-                MediaDescription {
+                let mut extmap = vec![];
+                if active.mid.is_some() {
+                    extmap.push(ExtMap {
+                        id: 1, // TODO: have this not be hardcoded
+                        uri: "urn:ietf:params:rtp-hdrext:sdes:mid".into(),
+                        direction: Direction::SendRecv,
+                    });
+                }
+
+                let transport = &self.transports[&active.transport];
+
+                let media_description = MediaDescription {
                     media: Media {
                         media_type,
-                        port: active.rtp_transport.local_rtp_port(),
+                        port: transport.local_rtp_port,
                         ports_num: None,
                         proto: TransportProtocol::RtpAvp,
                         fmts: vec![active.codec_pt],
@@ -204,10 +382,12 @@ impl Session {
                     direction: Direction::SendRecv, // TODO: set this correctly
                     connection: None,
                     bandwidth: vec![],
-                    rtcp_attr: active.rtp_transport.local_rtcp_port().map(|port| Rtcp {
+                    rtcp_attr: transport.local_rtcp_port.map(|port| Rtcp {
                         port,
                         address: None,
                     }),
+                    rtcp_mux: true, // TODO: set accordingly
+                    mid: active.mid.clone(),
                     rtpmaps: vec![rtpmap],
                     fmtps: fmtps.collect(),
                     ice_ufrag: None,
@@ -215,9 +395,33 @@ impl Session {
                     ice_candidates: vec![],
                     ice_end_of_candidates: false,
                     crypto: vec![],
+                    extmap,
                     attributes: vec![],
-                }
-            });
+                };
+
+                (active.remote_pos, media_description)
+            })
+            .collect();
+
+        media.sort_by_key(|(position, _)| *position);
+
+        // Create bundle group attributes
+        let group = {
+            let mut bundle_groups: HashMap<TransportId, Vec<BytesStr>> =
+                self.transports.keys().map(|id| (*id, vec![])).collect();
+
+            for active_media in self.active_media.values().flatten() {
+                bundle_groups
+                    .get_mut(&active_media.transport)
+                    .unwrap()
+                    .push(active_media.mid.clone().unwrap());
+            }
+
+            bundle_groups.into_values().map(|mids| Group {
+                typ: BytesStr::from_static("BUNDLE"),
+                mids,
+            })
+        };
 
         SessionDescription {
             name: "-".into(),
@@ -235,12 +439,14 @@ impl Session {
                 num: None,
             }),
             bandwidth: vec![],
+            group: group.collect(),
+            extmap: vec![],
             ice_options: IceOptions::default(),
             ice_lite: false,
             ice_ufrag: None,
             ice_pwd: None,
             attributes: vec![],
-            media_descriptions: media.collect(),
+            media_descriptions: media.into_iter().map(|(_, media)| media).collect(),
         }
     }
 }
