@@ -54,9 +54,10 @@ impl DirectRtpTransport {
 
 impl RtpTransport for DirectRtpTransport {
     async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let result = if let Some(rtcp_socket) = &self.rtcp_socket {
-                select! {
+        if let Some(rtcp_socket) = &self.rtcp_socket {
+            // Poll both rtp_socket & rtcp_socket for readyness and try_read once available
+            loop {
+                let result = select! {
                     result = self.rtp_socket.readable() => {
                         result?;
                         Self::try_recv(&self.rtp_socket, buf)
@@ -65,17 +66,16 @@ impl RtpTransport for DirectRtpTransport {
                         result?;
                         Self::try_recv(rtcp_socket, buf)
                     },
+                };
+
+                if let Some(len) = result? {
+                    return Ok(len);
                 }
-            } else {
-                self.rtp_socket.readable().await?;
-
-                Self::try_recv(&self.rtp_socket, buf)
-            };
-
-            if let Some(len) = result? {
-                return Ok(len);
             }
         }
+
+        // No rtcp_socket, just read from the rtp_socket
+        self.rtp_socket.recv_from(buf).await.map(|(len, _)| len)
     }
 
     async fn send_rtp(&mut self, buf: &[u8]) -> io::Result<()> {
