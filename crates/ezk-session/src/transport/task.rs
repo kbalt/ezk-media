@@ -2,7 +2,7 @@ use super::{RtpMpscSource, RtpTransport};
 use crate::{ActiveMediaId, RTP_MID_HDREXT_ID};
 use bytesstr::BytesStr;
 use ezk::{BoxedSource, BoxedSourceCancelSafe, Source, SourceEvent, SourceStream};
-use ezk_rtp::rtcp_types::{self, Compound, RtcpPacketWriterExt, SdesBuilder};
+use ezk_rtp::rtcp_types::{self, Compound};
 use ezk_rtp::{parse_extensions, Rtp, RtpConfigRange, RtpPacket, RtpSession};
 use ezk_stun_types::{is_stun_message, IsStunMessageInfo};
 use futures_util::StreamExt;
@@ -287,7 +287,7 @@ impl<T: RtpTransport> TransportTask<T> {
             Ok(event) => event,
             Err(e) => {
                 log::error!(
-                    "rtp task's source mid={id:?} encountered an error, removing it - {e:?}"
+                    "rtp task's source id={id:?} encountered an error, removing it - {e:?}"
                 );
                 self.rtp_sender_sources.remove(&id);
                 return;
@@ -300,7 +300,7 @@ impl<T: RtpTransport> TransportTask<T> {
                 unreachable!("rtp sources should not need renegotiation");
             }
             SourceEvent::EndOfData => {
-                log::debug!("rtp source mid={id:?} end of data, removing");
+                log::debug!("rtp source id={id:?} end of data, removing");
                 self.rtp_sender_sources.remove(&id);
                 return;
             }
@@ -442,37 +442,32 @@ impl<T: RtpTransport> TransportTask<T> {
     }
 
     fn handle_rtp_packet(&mut self, rtp_packet: RtpPacket) {
-        let rtp_packet_ = rtp_packet.get();
+        let pkg = rtp_packet.get();
 
-        // First search for an entry that matches the provided mid or ssrc
-        let entry = if let Some((mid_rtp_id, (profile, data))) =
-            self.mid_rtp_id.zip(rtp_packet_.extension())
-        {
-            let mid = parse_extensions(profile, data)
-                .find(|(id, _)| *id == mid_rtp_id)
-                .map(|(_, mid)| mid);
+        // Parse the mid from the rtp-packet's extensions
+        let mid = self
+            .mid_rtp_id
+            .zip(pkg.extension())
+            .and_then(|(mid_rtp_id, (profile, data))| {
+                parse_extensions(profile, data)
+                    .find(|(id, _)| *id == mid_rtp_id)
+                    .map(|(_, mid)| mid)
+            });
 
-            self.rtp_sessions
-                .values_mut()
-                .find(|e| match (&e.remote_identifyable_by.mid, mid) {
-                    (Some(a), Some(b)) => a.as_bytes() == b,
-                    (None, None) => e.remote_identifyable_by.ssrc.contains(&rtp_packet_.ssrc()),
-                    _ => false,
-                })
-        } else {
-            None
-        };
-
-        // Try to search for a matching payload type
-        let entry = if let Some(entry) = entry {
-            Some(entry)
-        } else {
-            self.rtp_sessions.values_mut().find(|e| {
-                e.remote_identifyable_by
-                    .pt
-                    .contains(&rtp_packet_.payload_type())
+        let entry = self
+            .rtp_sessions
+            .values_mut()
+            .find(|e| match (&e.remote_identifyable_by.mid, mid) {
+                (Some(a), Some(b)) => a.as_bytes() == b,
+                (None, None) => e.remote_identifyable_by.ssrc.contains(&pkg.ssrc()),
+                _ => false,
             })
-        };
+            .or_else(|| {
+                // Try to search for a matching payload type
+                self.rtp_sessions
+                    .values_mut()
+                    .find(|e| e.remote_identifyable_by.pt.contains(&pkg.payload_type()))
+            });
 
         if let Some(entry) = entry {
             entry.rtp_session.recv_rtp(rtp_packet);
