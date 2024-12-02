@@ -341,43 +341,27 @@ impl<T: RtpTransport> TransportTask<T> {
     }
 
     async fn send_rtcp(&mut self) {
-        // make_rtcp needs a mut slice to write into, resize encode buf accordingly
-        self.encode_buf.resize(65535, 0);
+        for entry in self.rtp_sessions.values_mut() {
+            // make_rtcp needs a mut slice to write into, resize encode buf accordingly
+            self.encode_buf.resize(65535, 0);
 
-        // Scope compound to avoid it living when calling `send_rtcp`
-        {
-            let mut compound = Compound::builder();
-            let mut sdes_builder = SdesBuilder::default();
-
-            for entry in self.rtp_sessions.values_mut() {
-                compound = match entry.rtp_session.generate_rtcp_report() {
-                    Ok(sr) => compound.add_packet(sr),
-                    Err(rr) => compound.add_packet(rr),
-                };
-
-                if let Some(sdes_chunk) = entry.rtp_session.generate_sdes_chunk() {
-                    sdes_builder = sdes_builder.add_chunk(sdes_chunk);
-                }
-            }
-
-            let compound = compound.add_packet(sdes_builder);
-
-            let len = match compound.write_into(&mut self.encode_buf) {
+            let len = match entry.rtp_session.write_rtcp_report(&mut self.encode_buf) {
                 Ok(len) => len,
                 Err(e) => {
                     log::warn!("Failed to write RTCP packet, {e:?}");
                     return;
                 }
             };
-            self.encode_buf.truncate(len);
-        }
 
-        if let Err(e) = self.transport.send_rtcp(&self.encode_buf).await {
-            log::warn!(
-                "Failed to send RTCP packet of length={} {e}",
-                self.encode_buf.len(),
-            );
-            self.state = TaskState::ExitErr;
+            self.encode_buf.truncate(len);
+
+            if let Err(e) = self.transport.send_rtcp(&self.encode_buf).await {
+                log::warn!(
+                    "Failed to send RTCP packet of length={} {e}",
+                    self.encode_buf.len(),
+                );
+                self.state = TaskState::ExitErr;
+            }
         }
     }
 

@@ -171,7 +171,7 @@ impl<T: Iterator, U: Iterator<Item = T::Item>> Iterator for ExtensionsIter<T, U>
 }
 
 pub fn parse_extensions(profile: u16, data: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
-    if dbg!(profile) == 0xBEDE {
+    if profile == 0xBEDE {
         ExtensionsIter::OneByte(parse_onebyte(data))
     } else if (profile & 0xFFF) == 0x100 {
         ExtensionsIter::TwoBytes(parse_twobyte(data))
@@ -186,8 +186,6 @@ fn parse_onebyte(mut data: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
         let [b, remaining @ ..] = data else {
             return None;
         };
-
-        dbg!(b);
 
         let id = (b & 0xF0) >> 4;
         if id == 15 {
