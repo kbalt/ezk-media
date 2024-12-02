@@ -171,7 +171,7 @@ impl<T: Iterator, U: Iterator<Item = T::Item>> Iterator for ExtensionsIter<T, U>
 }
 
 pub fn parse_extensions(profile: u16, data: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
-    if profile == 0xBEDE {
+    if dbg!(profile) == 0xBEDE {
         ExtensionsIter::OneByte(parse_onebyte(data))
     } else if (profile & 0xFFF) == 0x100 {
         ExtensionsIter::TwoBytes(parse_twobyte(data))
@@ -187,9 +187,15 @@ fn parse_onebyte(mut data: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
             return None;
         };
 
-        let id = b & 0x0F;
-        let len = ((b & 0xF0) >> 4) as usize;
-        let padding = padding_32_bit_boundry(1 + len);
+        dbg!(b);
+
+        let id = (b & 0xF0) >> 4;
+        if id == 15 {
+            return None;
+        }
+
+        let len = (b & 0x0F) as usize + 1;
+        let padding = padding_32_bit_boundry(2 + len);
 
         if remaining.len() >= len {
             data = &remaining[len + padding..];
@@ -208,7 +214,7 @@ fn parse_twobyte(mut data: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
         };
 
         let len = *len as usize;
-        let padding = padding_32_bit_boundry(2 + len);
+        let padding = padding_32_bit_boundry(len);
 
         if remaining.len() >= len {
             data = &remaining[len + padding..];

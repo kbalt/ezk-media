@@ -1,6 +1,7 @@
 [package]
 name = "ezk-session"
 version = "0.1.0"
+description = "SDP based media sessions, suitable for SIP applications & more"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

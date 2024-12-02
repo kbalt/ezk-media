@@ -1,5 +1,6 @@
 use super::{RtpMpscSource, RtpTransport};
-use crate::ActiveMediaId;
+use crate::{ActiveMediaId, RTP_MID_HDREXT_ID};
+use bytesstr::BytesStr;
 use ezk::{BoxedSource, BoxedSourceCancelSafe, Source, SourceEvent, SourceStream};
 use ezk_rtp::rtcp_types::{self, Compound, RtcpPacketWriterExt, SdesBuilder};
 use ezk_rtp::{parse_extensions, Rtp, RtpConfigRange, RtpPacket, RtpSession};
@@ -7,8 +8,8 @@ use ezk_stun_types::{is_stun_message, IsStunMessageInfo};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::future::pending;
-use std::io;
 use std::time::Duration;
+use std::{fmt, io};
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::{interval, interval_at, Instant};
@@ -18,10 +19,12 @@ const RECV_BUFFER_SIZE: usize = 65535;
 
 // TODO: name
 // TODO: https://www.rfc-editor.org/rfc/rfc8843#section-9.2
+// TODO: https://www.rfc-editor.org/rfc/rfc4585.html
 
 /// See https://www.rfc-editor.org/rfc/rfc8843#section-9.2
+#[derive(Debug)]
 pub struct IdentifyableBy {
-    pub mid: Option<String>,
+    pub mid: Option<BytesStr>,
     pub ssrc: Vec<u32>,
     pub pt: Vec<u8>,
 }
@@ -160,6 +163,16 @@ struct Entry {
     receiver_sender: Option<mpsc::Sender<RtpPacket>>,
 }
 
+impl fmt::Debug for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Entry")
+            .field("rtp_session", &self.rtp_session)
+            .field("remote_identifyable_by", &self.remote_identifyable_by)
+            .field("receiver_sender", &"[opaque]")
+            .finish()
+    }
+}
+
 enum TaskState {
     Ok,
     ExitOk,
@@ -220,6 +233,11 @@ impl<T: RtpTransport> TransportTask<T> {
                 remote_identifyable_by,
                 clock_rate,
             } => {
+                let mut rtp_session = RtpSession::new(rand::random(), clock_rate);
+                if let Some(mid) = &remote_identifyable_by.mid {
+                    rtp_session.add_source_description_item(15, None, mid.to_string());
+                }
+
                 self.rtp_sessions.insert(
                     id,
                     Entry {
@@ -290,17 +308,28 @@ impl<T: RtpTransport> TransportTask<T> {
 
         let mut packet = frame.into_data();
         let mut packet_mut = packet.get_mut();
+        let entry = self.rtp_sessions.get_mut(&id).unwrap();
 
-        let rtp_session = &mut self.rtp_sessions.get_mut(&id).unwrap().rtp_session;
+        {
+            // Set missing packet header fields
+            packet_mut.set_ssrc(entry.rtp_session.ssrc());
+            let mut builder = packet_mut.as_builder();
 
-        // Set missing packet header fields
-        packet_mut.set_ssrc(rtp_session.ssrc());
-        packet_mut
-            .as_builder()
-            .write_into_vec(&mut self.encode_buf)
-            .expect("buffer of 65535 bytes must be large enough");
+            let mut extension_data = vec![];
+            if let Some(mid) = &entry.remote_identifyable_by.mid {
+                extension_data.reserve(mid.len() + 2);
+                extension_data.extend_from_slice(&[RTP_MID_HDREXT_ID, mid.len() as u8]);
+                extension_data.extend_from_slice(mid.as_bytes());
 
-        rtp_session.send_rtp(&packet);
+                builder = builder.extension(0xBEDE, &extension_data);
+            }
+
+            builder
+                .write_into_vec(&mut self.encode_buf)
+                .expect("buffer of 65535 bytes must be large enough");
+        }
+
+        entry.rtp_session.send_rtp(&packet);
 
         if let Err(e) = self.transport.send_rtp(&self.encode_buf).await {
             log::warn!(
@@ -450,7 +479,7 @@ impl<T: RtpTransport> TransportTask<T> {
             None
         };
 
-        // Try to search for a matching pt
+        // Try to search for a matching payload type
         let entry = if let Some(entry) = entry {
             Some(entry)
         } else {
