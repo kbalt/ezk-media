@@ -14,4 +14,3 @@ tokio-stream = { version = "0.1" }
 parking_lot = "0.12"
 reusable-box = { version = "0.1", path = "../reusable-box" }
 downcast-rs = "1.2"
-ouroboros = "0.18"

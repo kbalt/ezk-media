@@ -1,5 +1,4 @@
 use bytesstr::BytesStr;
-use ezk::Source;
 use sdp_types::{
     Connection, Direction, ExtMap, Fmtp, Group, IceOptions, Media, MediaDescription, Origin, Rtcp,
     RtpMap, SessionDescription, TaggedAddress, Time, TransportProtocol,
@@ -9,7 +8,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
 };
-use tokio::{net::lookup_host, try_join};
+use tokio::{net::lookup_host, sync::mpsc, try_join};
 use transport::{DirectRtpTransport, IdentifyableBy, TransportTaskHandle};
 
 mod codecs;
@@ -221,24 +220,20 @@ impl SdpSession {
 
                 if do_send {
                     let create_sender = builder.create_sender.as_mut().unwrap();
+                    let (tx, rx) = mpsc::channel(8);
 
-                    let sender = (create_sender)();
-                    // TODO: do not call boxed here, the cancel safe requirement is too strict in transceiver builder
-                    transport
-                        .handle
-                        .set_sender(active_media_id, sender.boxed(), codec_pt)
-                        .await;
+                    (create_sender)(tx);
+
+                    transport.handle.set_sender(active_media_id, rx).await;
                 }
 
                 if do_receive {
                     let create_receiver = builder.create_receiver.as_mut().unwrap();
+                    let (tx, rx) = mpsc::channel(8);
 
-                    let receiver = transport
-                        .handle
-                        .set_receiver(active_media_id, codec_pt)
-                        .await;
+                    transport.handle.set_receiver(active_media_id, tx).await;
 
-                    (create_receiver)(receiver);
+                    (create_receiver)(rx);
                 }
 
                 self.active_media
@@ -388,7 +383,7 @@ impl SdpSession {
                     },
                     connection: None,
                     bandwidth: vec![],
-                    direction: Direction::SendRecv, // TODO: set this correctly
+                    direction: active.direction,
                     rtcp: transport.local_rtcp_port.map(|port| Rtcp {
                         port,
                         address: None,
