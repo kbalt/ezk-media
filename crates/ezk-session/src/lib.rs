@@ -19,6 +19,33 @@ mod transport;
 pub use codecs::{Codec, Codecs};
 pub use transceiver_builder::TransceiverBuilder;
 
+// TODO: have this not be hardcoded
+const RTP_MID_HDREXT_ID: u8 = 1;
+const RTP_MID_HDREXT: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
+
+macro_rules! id_types {
+    ($($name:ident),* $(,)?) => {
+        $(
+        #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(u32);
+
+        impl $name {
+            fn step(&mut self) -> Self {
+                let id = *self;
+                self.0 += 1;
+                id
+            }
+        }
+        )*
+    };
+}
+
+id_types! {
+    LocalMediaId,
+    ActiveMediaId,
+    TransportId,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -29,6 +56,7 @@ pub struct SdpSession {
     sdp_id: u64,
     sdp_version: u64,
 
+    // Local ip address to use
     address: IpAddr,
 
     // Local configured media
@@ -44,36 +72,15 @@ pub struct SdpSession {
     transports: HashMap<TransportId, Transport>,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LocalMediaId(u32);
-
-impl LocalMediaId {
-    fn step(&mut self) -> LocalMediaId {
-        let id = *self;
-        self.0 += 1;
-        id
-    }
-}
-
 struct LocalMedia {
     codecs: Codecs,
     limit: usize,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ActiveMediaId(u32);
-
-impl ActiveMediaId {
-    fn step(&mut self) -> ActiveMediaId {
-        let id = *self;
-        self.0 += 1;
-        id
-    }
-}
-
 struct ActiveMedia {
     id: ActiveMediaId,
 
+    /// Optional mid
     mid: Option<BytesStr>,
 
     // position in the remote's sdp
@@ -88,14 +95,13 @@ struct ActiveMedia {
     codec: Codec,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TransportId(u32);
+impl ActiveMedia {
+    fn matches(&self, desc: &MediaDescription) -> bool {
+        if let Some((self_mid, desc_mid)) = self.mid.as_ref().zip(desc.mid.as_ref()) {
+            return self_mid == desc_mid;
+        }
 
-impl TransportId {
-    fn step(&mut self) -> TransportId {
-        let id = *self;
-        self.0 += 1;
-        id
+        self.remote_rtp_address.port() == desc.media.port
     }
 }
 
@@ -148,7 +154,7 @@ impl SdpSession {
                 // Find out if this offer is part of an active session
                 let active_media = active
                     .iter()
-                    .find(|active| active.remote_rtp_address == remote_rtp_address);
+                    .find(|active| active.matches(remote_media_description));
 
                 if active_media.is_some() {
                     // TODO: verify that the media is still valid (codec might need to change)
@@ -205,8 +211,8 @@ impl SdpSession {
                     .add_media_session(
                         active_media_id,
                         IdentifyableBy {
-                            mid: None,
-                            ssrc: vec![],
+                            mid: remote_media_description.mid.clone(),
+                            ssrc: vec![], // TODO: read ssrc attributes
                             pt: vec![codec_pt],
                         },
                         codec.clock_rate,
@@ -252,6 +258,7 @@ impl SdpSession {
         Ok(())
     }
 
+    /// Get or create a transport for the given media description
     async fn get_or_create_transport(
         active_media: &HashMap<LocalMediaId, Vec<ActiveMedia>>,
         next_transport_id: &mut TransportId,
@@ -278,7 +285,7 @@ impl SdpSession {
                 let mid_rtp_id = remote_media_description
                     .extmap
                     .iter()
-                    .find(|extmap| extmap.uri == "urn:ietf:params:rtp-hdrext:sdes:mid")
+                    .find(|extmap| extmap.uri == RTP_MID_HDREXT)
                     .map(|extmap| extmap.id);
 
                 let transport = DirectRtpTransport::new(
@@ -355,8 +362,8 @@ impl SdpSession {
                 let mut extmap = vec![];
                 if active.mid.is_some() {
                     extmap.push(ExtMap {
-                        id: 1, // TODO: have this not be hardcoded
-                        uri: "urn:ietf:params:rtp-hdrext:sdes:mid".into(),
+                        id: RTP_MID_HDREXT_ID,
+                        uri: BytesStr::from_static(RTP_MID_HDREXT),
                         direction: Direction::SendRecv,
                     });
                 }
@@ -371,17 +378,17 @@ impl SdpSession {
                         proto: TransportProtocol::RtpAvp,
                         fmts: vec![active.codec_pt],
                     },
-                    direction: Direction::SendRecv, // TODO: set this correctly
                     connection: None,
                     bandwidth: vec![],
-                    rtcp_attr: transport.local_rtcp_port.map(|port| Rtcp {
+                    direction: Direction::SendRecv, // TODO: set this correctly
+                    rtcp: transport.local_rtcp_port.map(|port| Rtcp {
                         port,
                         address: None,
                     }),
                     rtcp_mux: true, // TODO: set accordingly
                     mid: active.mid.clone(),
-                    rtpmaps: vec![rtpmap],
-                    fmtps: fmtps.collect(),
+                    rtpmap: vec![rtpmap],
+                    fmtp: fmtps.collect(),
                     ice_ufrag: None,
                     ice_pwd: None,
                     ice_candidates: vec![],
@@ -402,7 +409,10 @@ impl SdpSession {
             let mut bundle_groups: HashMap<TransportId, Vec<BytesStr>> =
                 self.transports.keys().map(|id| (*id, vec![])).collect();
 
-            for active_media in self.active_media.values().flatten() {
+            let mut active_media: Vec<_> = self.active_media.values().flatten().collect();
+            active_media.sort_by_key(|m| m.remote_pos);
+
+            for active_media in active_media {
                 bundle_groups
                     .get_mut(&active_media.transport)
                     .unwrap()
@@ -459,7 +469,7 @@ fn choose_codec(
             }
         } else {
             remote_media_description
-                .rtpmaps
+                .rtpmap
                 .iter()
                 .find(|rtpmap| {
                     rtpmap.encoding == entry.codec.name.as_str()
@@ -514,7 +524,7 @@ fn rtcp_address_and_port(
     remote_media_description: &MediaDescription,
     connection: &Connection,
 ) -> (TaggedAddress, u16) {
-    if let Some(rtcp_addr) = &remote_media_description.rtcp_attr {
+    if let Some(rtcp_addr) = &remote_media_description.rtcp {
         let address = rtcp_addr
             .address
             .clone()
@@ -522,12 +532,7 @@ fn rtcp_address_and_port(
 
         (address, rtcp_addr.port)
     } else {
-        let rtcp_mux = remote_media_description
-            .attributes
-            .iter()
-            .any(|attr| attr.name == "rtcp-mux");
-
-        let rtcp_port = if !rtcp_mux {
+        let rtcp_port = if remote_media_description.rtcp_mux {
             remote_media_description.media.port
         } else {
             remote_media_description.media.port + 1

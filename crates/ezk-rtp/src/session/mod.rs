@@ -5,7 +5,10 @@ use rtcp_types::{
     RtcpWriteError, SdesBuilder, SdesChunkBuilder, SdesItemBuilder, SenderReport,
     SenderReportBuilder,
 };
-use std::time::{Duration, Instant};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 use time::ext::InstantExt;
 
 mod jitter_buffer;
@@ -28,6 +31,19 @@ pub struct RtpSession {
     receiver: Vec<ReceiverState>,
 }
 
+impl fmt::Debug for RtpSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RtpSession")
+            .field("ssrc", &self.ssrc)
+            .field("clock_rate", &self.clock_rate)
+            .field("source_description_items", &self.source_description_items)
+            .field("sender", &"[opaque]")
+            .field("receiver", &"[opaque]")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
 struct SenderState {
     ntp_timestamp: NtpTimestamp,
     rtp_timestamp: u64,
@@ -36,7 +52,7 @@ struct SenderState {
     sender_octet_count: u32,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ReceiverState {
     ssrc: u32,
 
