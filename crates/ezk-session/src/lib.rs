@@ -79,15 +79,14 @@ struct LocalMedia {
 
 struct ActiveMedia {
     id: ActiveMediaId,
-
     /// Optional mid
     mid: Option<BytesStr>,
+    direction: Direction,
 
     // position in the remote's sdp
     remote_pos: usize,
 
     transport: TransportId,
-
     remote_rtp_address: SocketAddr,
     remote_rtcp_address: Option<SocketAddr>,
 
@@ -173,16 +172,17 @@ impl SdpSession {
                     continue;
                 };
 
+                let has_sender = builder.create_sender.is_some();
+                let has_receiver = builder.create_receiver.is_some();
+
                 let (do_send, do_receive) = match remote_media_description.direction.flipped() {
-                    Direction::SendRecv => (true, true),
-                    Direction::RecvOnly => (false, true),
-                    Direction::SendOnly => (true, false),
+                    Direction::SendRecv => (has_sender, has_receiver),
+                    Direction::RecvOnly => (false, has_receiver),
+                    Direction::SendOnly => (has_sender, false),
                     Direction::Inactive => (false, false),
                 };
 
-                if !(do_send && builder.create_sender.is_some()
-                    || do_receive && builder.create_receiver.is_some())
-                {
+                if !(do_send || do_receive) {
                     // There would be no sender or receiver, skip
                     continue;
                 }
@@ -219,18 +219,20 @@ impl SdpSession {
                     )
                     .await;
 
-                if let Some(create_sender) = builder.create_sender.as_mut().filter(|_| do_send) {
+                if do_send {
+                    let create_sender = builder.create_sender.as_mut().unwrap();
+
                     let sender = (create_sender)();
                     // TODO: do not call boxed here, the cancel safe requirement is too strict in transceiver builder
                     transport
                         .handle
                         .set_sender(active_media_id, sender.boxed(), codec_pt)
                         .await;
-                };
+                }
 
-                if let Some(create_receiver) =
-                    builder.create_receiver.as_mut().filter(|_| do_receive)
-                {
+                if do_receive {
+                    let create_receiver = builder.create_receiver.as_mut().unwrap();
+
                     let receiver = transport
                         .handle
                         .set_receiver(active_media_id, codec_pt)
@@ -245,6 +247,12 @@ impl SdpSession {
                     .push(ActiveMedia {
                         id: active_media_id,
                         mid: remote_media_description.mid.clone(),
+                        direction: match (do_send, do_receive) {
+                            (true, true) => Direction::SendRecv,
+                            (true, false) => Direction::SendOnly,
+                            (false, true) => Direction::RecvOnly,
+                            (false, false) => Direction::Inactive,
+                        },
                         remote_pos,
                         transport: transport_id,
                         remote_rtp_address,
@@ -500,10 +508,10 @@ async fn resolve_rtp_and_rtcp_address(
     offer: &SessionDescription,
     remote_media_description: &MediaDescription,
 ) -> Result<(SocketAddr, SocketAddr), Error> {
-    let connection = offer
+    let connection = remote_media_description
         .connection
         .as_ref()
-        .or(remote_media_description.connection.as_ref())
+        .or(offer.connection.as_ref())
         .unwrap();
 
     let remote_rtp_address = connection.address.clone();
@@ -524,22 +532,26 @@ fn rtcp_address_and_port(
     remote_media_description: &MediaDescription,
     connection: &Connection,
 ) -> (TaggedAddress, u16) {
+    if remote_media_description.rtcp_mux {
+        return (
+            connection.address.clone(),
+            remote_media_description.media.port,
+        );
+    }
+
     if let Some(rtcp_addr) = &remote_media_description.rtcp {
         let address = rtcp_addr
             .address
             .clone()
             .unwrap_or_else(|| connection.address.clone());
 
-        (address, rtcp_addr.port)
-    } else {
-        let rtcp_port = if remote_media_description.rtcp_mux {
-            remote_media_description.media.port
-        } else {
-            remote_media_description.media.port + 1
-        };
-
-        (connection.address.clone(), rtcp_port)
+        return (address, rtcp_addr.port);
     }
+
+    (
+        connection.address.clone(),
+        remote_media_description.media.port + 1,
+    )
 }
 
 async fn resolve_tagged_address(address: &TaggedAddress, port: u16) -> io::Result<SocketAddr> {
