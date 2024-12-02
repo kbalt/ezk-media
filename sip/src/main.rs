@@ -1,5 +1,4 @@
 use bytesstr::BytesStr;
-use ezk::{Source, SourceEvent};
 use ezk_session::{Codec, Codecs};
 use sdp_types::{MediaType, SessionDescription};
 use sip_core::transport::udp::Udp;
@@ -34,16 +33,6 @@ impl Layer for InviteAcceptLayer {
             return;
         };
 
-        let contact: SipUri = "sip:192.168.178.39:5065".parse().unwrap();
-        let contact = Contact::new(NameAddr::uri(contact));
-
-        let dialog =
-            Dialog::new_server(endpoint.clone(), self.dialog_layer, &invite, contact).unwrap();
-
-        let sdp_offer =
-            SessionDescription::parse(&BytesStr::from_utf8_bytes(invite.body.clone()).unwrap())
-                .unwrap();
-
         let mut sdp_session = ezk_session::SdpSession::new("192.168.178.39".parse().unwrap());
         sdp_session.add_local_media(
             Codecs::new(MediaType::Audio).with_codec(
@@ -58,12 +47,9 @@ impl Layer for InviteAcceptLayer {
                         println!("got receiver pcma");
 
                         tokio::spawn(async move {
-                            loop {
-                                if let SourceEvent::EndOfData = s.next_event().await.unwrap() {
-                                    println!("break pcma");
-                                    break;
-                                }
-                            }
+                            while let Some(_) = s.recv().await {}
+
+                            println!("break pcma");
                         });
                     });
                 },
@@ -83,12 +69,9 @@ impl Layer for InviteAcceptLayer {
                         println!("got receiver av1");
 
                         tokio::spawn(async move {
-                            loop {
-                                if let SourceEvent::EndOfData = s.next_event().await.unwrap() {
-                                    println!("break av1");
-                                    break;
-                                }
-                            }
+                            while let Some(_) = s.recv().await {}
+
+                            println!("break av1");
                         });
                     });
                 },
@@ -96,18 +79,22 @@ impl Layer for InviteAcceptLayer {
             1,
         );
 
+        let contact: SipUri = "sip:192.168.178.39:5065".parse().unwrap();
+        let contact = Contact::new(NameAddr::uri(contact));
+
+        let dialog =
+            Dialog::new_server(endpoint.clone(), self.dialog_layer, &invite, contact).unwrap();
+
+        let sdp_offer =
+            SessionDescription::parse(&BytesStr::from_utf8_bytes(invite.body.clone()).unwrap())
+                .unwrap();
+
         sdp_session.receiver_offer(sdp_offer).await.unwrap();
 
         let sdp_response = sdp_session.create_sdp_answer();
-
-        println!("{sdp_response}");
-
         let acceptor = Acceptor::new(dialog, self.invite_layer, invite).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
         let mut response = acceptor.create_response(Code::OK, None).await.unwrap();
-
         response.msg.body = sdp_response.to_string().into();
         response
             .msg

@@ -18,5 +18,5 @@ thiserror = "2"
 rand = "0.8"
 tokio = { version = "1", features = ["net"] }
 futures-util = "0.3"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = [] }
 bytesstr = "1.0.2"

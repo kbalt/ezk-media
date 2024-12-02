@@ -1,12 +1,12 @@
 use crate::LocalMediaId;
-use ezk::BoxedSourceCancelSafe;
-use ezk_rtp::Rtp;
+use ezk_rtp::RtpPacket;
+use tokio::sync::mpsc;
 
 pub struct TransceiverBuilder {
     pub(crate) local_media_id: LocalMediaId,
 
-    pub(crate) create_receiver: Option<Box<dyn FnMut(BoxedSourceCancelSafe<Rtp>) + Send + Sync>>,
-    pub(crate) create_sender: Option<Box<dyn FnMut() -> BoxedSourceCancelSafe<Rtp> + Send + Sync>>,
+    pub(crate) create_receiver: Option<Box<dyn FnMut(mpsc::Receiver<RtpPacket>) + Send + Sync>>,
+    pub(crate) create_sender: Option<Box<dyn FnMut(mpsc::Sender<RtpPacket>) + Send + Sync>>,
 }
 
 impl TransceiverBuilder {
@@ -17,14 +17,14 @@ impl TransceiverBuilder {
 
     pub fn add_receiver<F>(&mut self, on_create: F)
     where
-        F: FnMut(BoxedSourceCancelSafe<Rtp>) + Send + Sync + 'static,
+        F: FnMut(mpsc::Receiver<RtpPacket>) + Send + Sync + 'static,
     {
         self.create_receiver = Some(Box::new(on_create));
     }
 
     pub fn add_sender<F>(&mut self, on_create: F)
     where
-        F: FnMut() -> BoxedSourceCancelSafe<Rtp> + Send + Sync + 'static,
+        F: FnMut(mpsc::Sender<RtpPacket>) + Send + Sync + 'static,
     {
         self.create_sender = Some(Box::new(on_create));
     }
