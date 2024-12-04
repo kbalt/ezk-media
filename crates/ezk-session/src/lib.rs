@@ -518,9 +518,9 @@ impl SdpSession {
                 params: Default::default(),
             };
 
-            let fmtps = active.codec.param.iter().map(|param| Fmtp {
+            let fmtps = active.codec.params.iter().map(|param| Fmtp {
                 format: active.codec_pt,
-                params: param.as_ref().into(),
+                params: param.as_str().into(),
             });
 
             let mut extmap = vec![];

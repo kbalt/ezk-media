@@ -10,7 +10,7 @@ pub struct Codec {
     pub(crate) name: Cow<'static, str>,
     pub(crate) clock_rate: u32,
     pub(crate) channels: Option<u32>,
-    pub(crate) param: Option<Cow<'static, str>>,
+    pub(crate) params: Vec<String>,
 }
 
 impl Codec {
@@ -30,7 +30,7 @@ impl Codec {
             name: Cow::Borrowed(name),
             clock_rate,
             channels: None,
-            param: None,
+            params: vec![],
         }
     }
 
@@ -44,13 +44,8 @@ impl Codec {
         self
     }
 
-    pub fn with_const_param(mut self, param: &'static str) -> Self {
-        self.param = Some(Cow::Borrowed(param));
-        self
-    }
-
-    pub fn with_param(mut self, param: impl Into<Cow<'static, str>>) {
-        self.param = Some(param.into());
+    pub fn with_param(mut self, param: impl Into<String>) {
+        self.params.push(param.into());
     }
 }
 
