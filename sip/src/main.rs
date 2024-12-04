@@ -11,7 +11,7 @@ use sip_ua::dialog::{Dialog, DialogLayer};
 use sip_ua::invite::acceptor::Acceptor;
 use sip_ua::invite::session::Event;
 use sip_ua::invite::InviteLayer;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 /// Custom layer which we use to accept incoming invites
@@ -32,6 +32,8 @@ impl Layer for InviteAcceptLayer {
         } else {
             return;
         };
+
+        let start = Instant::now();
 
         let mut sdp_session = ezk_session::SdpSession::new("192.168.178.39".parse().unwrap());
         sdp_session.add_local_media(
@@ -72,6 +74,8 @@ impl Layer for InviteAcceptLayer {
             .insert("Content-Type", "application/sdp");
 
         // Here goes SDP handling
+
+        println!("Ready to respond in {:?}", start.elapsed());
 
         let (mut session, _ack) = acceptor.respond_success(response).await.unwrap();
 

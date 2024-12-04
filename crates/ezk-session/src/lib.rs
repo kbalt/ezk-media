@@ -11,10 +11,12 @@ use std::{
 };
 use tokio::{net::lookup_host, sync::mpsc, try_join};
 use transport::{DirectRtpTransport, IdentifyableBy, TransportTaskHandle};
+use u32_hasher::U32Hasher;
 
 mod codecs;
 mod transceiver_builder;
 mod transport;
+mod u32_hasher;
 
 pub use codecs::{Codec, Codecs};
 pub use transceiver_builder::TransceiverBuilder;
@@ -61,7 +63,7 @@ pub struct SdpSession {
 
     // Local configured media
     next_media_id: LocalMediaId,
-    local_media: HashMap<LocalMediaId, LocalMedia>,
+    local_media: HashMap<LocalMediaId, LocalMedia, U32Hasher>,
 
     // Active media
     next_active_media_id: ActiveMediaId, // TODO: this will be used to set the `mid` and `msid?` when creating offers?
@@ -69,7 +71,7 @@ pub struct SdpSession {
 
     // Transports
     next_transport_id: TransportId,
-    transports: HashMap<TransportId, Transport>,
+    transports: HashMap<TransportId, Transport, U32Hasher>,
 }
 
 struct LocalMedia {
@@ -79,7 +81,7 @@ struct LocalMedia {
 }
 
 impl LocalMedia {
-    fn maybe_use(
+    fn maybe_use_for_offer(
         &mut self,
         self_id: LocalMediaId,
         m_line_index: usize,
@@ -167,7 +169,7 @@ struct ActiveMedia {
 
     /// Optional mid
     mid: Option<BytesStr>,
-    direction: Direction2,
+    direction: DirectionBools,
 
     transport: TransportId,
     remote_rtp_address: SocketAddr,
@@ -205,11 +207,11 @@ impl SdpSession {
             sdp_version: u64::from(rand::random::<u16>()),
             address,
             next_media_id: LocalMediaId(0),
-            local_media: HashMap::new(),
+            local_media: HashMap::with_hasher(U32Hasher::default()),
             next_active_media_id: ActiveMediaId(0),
             state: Vec::new(),
             next_transport_id: TransportId(0),
-            transports: HashMap::new(),
+            transports: HashMap::with_hasher(U32Hasher::default()),
         }
     }
 
@@ -230,16 +232,14 @@ impl SdpSession {
     pub async fn receiver_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
         let mut new_state = vec![];
 
-        for (m_line_index, remote_media_description) in offer.media_descriptions.iter().enumerate()
-        {
-            let requested_direction: Direction2 =
-                remote_media_description.direction.flipped().into();
+        for (m_line_index, remote_media_desc) in offer.media_descriptions.iter().enumerate() {
+            let requested_direction: DirectionBools = remote_media_desc.direction.flipped().into();
 
             // First thing: Search the current state for an entry that matches this description - and update accordingly
             let matched_position = self.state.iter().position(|e| match e {
-                MediaEntry::Active(active_media) => active_media.matches(remote_media_description),
+                MediaEntry::Active(active_media) => active_media.matches(remote_media_desc),
                 MediaEntry::Rejected(media_type) => {
-                    *media_type == remote_media_description.media.media_type
+                    *media_type == remote_media_desc.media.media_type
                 }
             });
 
@@ -254,33 +254,29 @@ impl SdpSession {
             }
 
             // Reject any invalid/inactive m-lines
-            if remote_media_description.direction == Direction::Inactive
-                || remote_media_description.media.port == 0
+            if remote_media_desc.direction == Direction::Inactive
+                || remote_media_desc.media.port == 0
             {
-                new_state.push(MediaEntry::Rejected(
-                    remote_media_description.media.media_type,
-                ));
+                new_state.push(MediaEntry::Rejected(remote_media_desc.media.media_type));
 
                 continue;
             }
 
             // resolve remote rtp & rtcp address
             let (remote_rtp_address, remote_rtcp_address) =
-                resolve_rtp_and_rtcp_address(&offer, remote_media_description).await?;
+                resolve_rtp_and_rtcp_address(&offer, remote_media_desc).await?;
 
             // Choose local media for this m-line
             let Some((local_media_id, (mut builder, codec, codec_pt))) =
                 self.local_media.iter_mut().find_map(|(id, local_media)| {
                     let config =
-                        local_media.maybe_use(*id, m_line_index, remote_media_description)?;
+                        local_media.maybe_use_for_offer(*id, m_line_index, remote_media_desc)?;
 
                     Some((*id, config))
                 })
             else {
                 // no local media found for this
-                new_state.push(MediaEntry::Rejected(
-                    remote_media_description.media.media_type,
-                ));
+                new_state.push(MediaEntry::Rejected(remote_media_desc.media.media_type));
 
                 continue;
             };
@@ -293,7 +289,7 @@ impl SdpSession {
                 .get_or_create_transport(
                     &new_state,
                     &offer,
-                    remote_media_description,
+                    remote_media_desc,
                     remote_rtp_address,
                     remote_rtcp_address,
                 )
@@ -311,7 +307,7 @@ impl SdpSession {
                 .add_media_session(
                     active_media_id,
                     IdentifyableBy {
-                        mid: remote_media_description.mid.clone(),
+                        mid: remote_media_desc.mid.clone(),
                         ssrc: vec![], // TODO: read ssrc attributes
                         pt: vec![codec_pt],
                     },
@@ -336,9 +332,9 @@ impl SdpSession {
             new_state.push(MediaEntry::Active(ActiveMedia {
                 id: active_media_id,
                 local_media_id,
-                media_type: remote_media_description.media.media_type,
-                mid: remote_media_description.mid.clone(),
-                direction: Direction2 {
+                media_type: remote_media_desc.media.media_type,
+                mid: remote_media_desc.mid.clone(),
+                direction: DirectionBools {
                     send: do_send,
                     recv: do_recv,
                 },
@@ -351,10 +347,16 @@ impl SdpSession {
             }));
         }
 
+        // Store new state and destroy all media sessions
         let old_state = replace(&mut self.state, new_state);
 
         for entry in old_state {
             if let MediaEntry::Active(active) = entry {
+                let transport = &self.transports[&active.transport];
+
+                transport.handle.remove_sender(active.id).await;
+                transport.handle.remove_receiver(active.id).await;
+
                 self.local_media
                     .get_mut(&active.local_media_id)
                     .unwrap()
@@ -362,15 +364,26 @@ impl SdpSession {
             }
         }
 
+        // Remove all transports that are not being used anymore
+        self.transports.retain(|id, _| {
+            self.state
+                .iter()
+                .filter_map(MediaEntry::active)
+                .any(|active| active.transport == *id)
+        });
+
         Ok(())
     }
 
     async fn update_active_media(
         &mut self,
-        requested_direction: Direction2,
+        requested_direction: DirectionBools,
         active_media: &mut ActiveMedia,
     ) {
-        let transport = self.transports.get_mut(&active_media.transport).unwrap();
+        let transport = self
+            .transports
+            .get_mut(&active_media.transport)
+            .expect("transpod id must be valid");
 
         // If remote wants to receive data, but we're not sending anything
         if requested_direction.send && !active_media.direction.send {
@@ -417,11 +430,11 @@ impl SdpSession {
         &mut self,
         new_state: &[MediaEntry],
         offer: &SessionDescription,
-        remote_media_description: &MediaDescription,
+        remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
     ) -> Result<TransportId, Error> {
-        match remote_media_description
+        match remote_media_desc
             .mid
             .as_ref()
             .and_then(|mid| self.find_bundled_transport(new_state, offer, mid))
@@ -433,7 +446,7 @@ impl SdpSession {
 
             None => {
                 // Not bundled or no transport for the group created yet
-                let mid_rtp_id = remote_media_description
+                let mid_rtp_id = remote_media_desc
                     .extmap
                     .iter()
                     .find(|extmap| extmap.uri == RTP_MID_HDREXT)
@@ -441,7 +454,7 @@ impl SdpSession {
 
                 let transport = DirectRtpTransport::new(
                     remote_rtp_address,
-                    Some(remote_rtcp_address).filter(|_| !remote_media_description.rtcp_mux),
+                    Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux),
                 )
                 .await?;
 
@@ -553,7 +566,8 @@ impl SdpSession {
 
         // Create bundle group attributes
         let group = {
-            let mut bundle_groups: HashMap<TransportId, Vec<BytesStr>> = HashMap::new();
+            let mut bundle_groups: HashMap<TransportId, Vec<BytesStr>, U32Hasher> =
+                HashMap::with_hasher(U32Hasher::default());
 
             for active_media in self.state.iter().filter_map(MediaEntry::active) {
                 if let Some(mid) = active_media.mid.clone() {
@@ -656,17 +670,17 @@ async fn resolve_tagged_address(address: &TaggedAddress, port: u16) -> io::Resul
         TaggedAddress::IP4(ipv4_addr) => Ok(SocketAddr::from((*ipv4_addr, port))),
         TaggedAddress::IP4FQDN(bytes_str) => lookup_host((bytes_str.as_str(), port))
             .await?
-            .find(|ip| ip.is_ipv4())
-            .ok_or(io::Error::other(format!(
-                "Failed to find IPv4 address for {bytes_str}"
-            ))),
+            .find(SocketAddr::is_ipv4)
+            .ok_or_else(|| {
+                io::Error::other(format!("Failed to find IPv4 address for {bytes_str}"))
+            }),
         TaggedAddress::IP6(ipv6_addr) => Ok(SocketAddr::from((*ipv6_addr, port))),
         TaggedAddress::IP6FQDN(bytes_str) => lookup_host((bytes_str.as_str(), port))
             .await?
-            .find(|ip| ip.is_ipv6())
-            .ok_or(io::Error::other(format!(
-                "Failed to find IPv6 address for {bytes_str}"
-            ))),
+            .find(SocketAddr::is_ipv6)
+            .ok_or_else(|| {
+                io::Error::other(format!("Failed to find IPv6 address for {bytes_str}"))
+            }),
     }
 }
 
@@ -697,14 +711,15 @@ fn rejected_media_description(media_type: &MediaType) -> MediaDescription {
     }
 }
 
+// i'm too lazy to work with the direction type, so using this as a cop out
 #[derive(Debug, Clone, Copy)]
-struct Direction2 {
+struct DirectionBools {
     send: bool,
     recv: bool,
 }
 
-impl From<Direction2> for Direction {
-    fn from(value: Direction2) -> Self {
+impl From<DirectionBools> for Direction {
+    fn from(value: DirectionBools) -> Self {
         match (value.send, value.recv) {
             (true, true) => Direction::SendRecv,
             (true, false) => Direction::SendOnly,
@@ -714,7 +729,7 @@ impl From<Direction2> for Direction {
     }
 }
 
-impl From<Direction> for Direction2 {
+impl From<Direction> for DirectionBools {
     fn from(value: Direction) -> Self {
         let (send, recv) = match value {
             Direction::SendRecv => (true, true),

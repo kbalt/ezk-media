@@ -1,4 +1,5 @@
 use super::RtpTransport;
+use crate::u32_hasher::U32Hasher;
 use crate::{ActiveMediaId, RTP_MID_HDREXT_ID};
 use bytesstr::BytesStr;
 use ezk_rtp::rtcp_types::{self, Compound};
@@ -41,7 +42,7 @@ impl TransportTaskHandle {
         tokio::spawn(
             TransportTask {
                 state: TaskState::Ok,
-                rtp_sessions: HashMap::new(),
+                rtp_sessions: HashMap::with_hasher(U32Hasher::default()),
                 mid_rtp_id,
                 transport,
                 encode_buf: vec![],
@@ -55,7 +56,7 @@ impl TransportTaskHandle {
     }
 
     pub async fn add_media_session(
-        &mut self,
+        &self,
         id: ActiveMediaId,
         remote_identifyable_by: IdentifyableBy,
         clock_rate: u32,
@@ -70,28 +71,28 @@ impl TransportTaskHandle {
             .expect("task must not exit while command_tx exists");
     }
 
-    pub async fn set_sender(&mut self, id: ActiveMediaId, receiver: mpsc::Receiver<RtpPacket>) {
+    pub async fn set_sender(&self, id: ActiveMediaId, receiver: mpsc::Receiver<RtpPacket>) {
         self.command_tx
             .send(ToTaskCommand::SetSender(id, receiver))
             .await
             .expect("task must not exit while command_tx exists");
     }
 
-    pub async fn remove_sender(&mut self, id: ActiveMediaId) {
+    pub async fn remove_sender(&self, id: ActiveMediaId) {
         self.command_tx
             .send(ToTaskCommand::RemoveSender(id))
             .await
             .expect("task must not exit while command_tx exists");
     }
 
-    pub async fn set_receiver(&mut self, id: ActiveMediaId, sender: mpsc::Sender<RtpPacket>) {
+    pub async fn set_receiver(&self, id: ActiveMediaId, sender: mpsc::Sender<RtpPacket>) {
         self.command_tx
             .send(ToTaskCommand::SetReceiver(id, sender))
             .await
             .expect("task must not exit while command_tx exists");
     }
 
-    pub async fn remove_receiver(&mut self, id: ActiveMediaId) {
+    pub async fn remove_receiver(&self, id: ActiveMediaId) {
         self.command_tx
             .send(ToTaskCommand::RemoveReceiver(id))
             .await
@@ -117,7 +118,7 @@ enum ToTaskCommand {
 struct TransportTask<T> {
     state: TaskState,
 
-    rtp_sessions: HashMap<ActiveMediaId, Entry>,
+    rtp_sessions: HashMap<ActiveMediaId, Entry, U32Hasher>,
     mid_rtp_id: Option<u8>,
 
     transport: T,
