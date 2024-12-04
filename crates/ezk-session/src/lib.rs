@@ -258,7 +258,6 @@ impl SdpSession {
                 || remote_media_desc.media.port == 0
             {
                 new_state.push(MediaEntry::Rejected(remote_media_desc.media.media_type));
-
                 continue;
             }
 
@@ -509,7 +508,7 @@ impl SdpSession {
         let media = self.state.iter().map(|entry| {
             let active = match entry {
                 MediaEntry::Active(active_media) => active_media,
-                MediaEntry::Rejected(media_type) => return rejected_media_description(media_type),
+                MediaEntry::Rejected(media_type) => return MediaDescription::rejected(*media_type),
             };
 
             let rtpmap = RtpMap {
@@ -560,6 +559,7 @@ impl SdpSession {
                 ice_end_of_candidates: false,
                 crypto: vec![],
                 extmap,
+                extmap_allow_mixed: false,
                 attributes: vec![],
             }
         });
@@ -588,25 +588,26 @@ impl SdpSession {
         };
 
         SessionDescription {
-            name: "-".into(),
             origin: Origin {
                 username: "-".into(),
                 session_id: self.sdp_id.to_string().into(),
                 session_version: self.sdp_version.to_string().into(),
                 address: self.address.into(),
             },
-            time: Time { start: 0, stop: 0 },
-            direction: Direction::SendRecv,
+            name: "-".into(),
             connection: Some(Connection {
                 address: self.address.into(),
                 ttl: None,
                 num: None,
             }),
             bandwidth: vec![],
+            time: Time { start: 0, stop: 0 },
+            direction: Direction::SendRecv,
             group: group.collect(),
             extmap: vec![],
-            ice_options: IceOptions::default(),
+            extmap_allow_mixed: true,
             ice_lite: false,
+            ice_options: IceOptions::default(),
             ice_ufrag: None,
             ice_pwd: None,
             attributes: vec![],
@@ -681,33 +682,6 @@ async fn resolve_tagged_address(address: &TaggedAddress, port: u16) -> io::Resul
             .ok_or_else(|| {
                 io::Error::other(format!("Failed to find IPv6 address for {bytes_str}"))
             }),
-    }
-}
-
-fn rejected_media_description(media_type: &MediaType) -> MediaDescription {
-    MediaDescription {
-        media: Media {
-            media_type: *media_type,
-            port: 0,
-            ports_num: None,
-            proto: TransportProtocol::RtpAvp,
-            fmts: vec![],
-        },
-        connection: None,
-        bandwidth: vec![],
-        direction: Direction::Inactive,
-        rtcp: None,
-        rtcp_mux: false,
-        mid: None,
-        rtpmap: vec![],
-        fmtp: vec![],
-        ice_ufrag: None,
-        ice_pwd: None,
-        ice_candidates: vec![],
-        ice_end_of_candidates: false,
-        crypto: vec![],
-        extmap: vec![],
-        attributes: vec![],
     }
 }
 

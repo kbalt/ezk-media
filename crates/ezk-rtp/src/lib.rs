@@ -2,6 +2,7 @@ use bytes::Bytes;
 use ezk::{Frame, MediaType};
 
 mod depacketizer;
+mod extensions;
 mod media_type;
 mod ntp_timestamp;
 mod packetizer;
@@ -9,10 +10,11 @@ mod rtp_packet;
 mod session;
 
 pub use depacketizer::DePacketizer;
+pub use extensions::{parse_extensions, RtpExtensionsWriter};
 pub use media_type::{Rtp, RtpConfig, RtpConfigRange};
 pub use ntp_timestamp::NtpTimestamp;
 pub use packetizer::Packetizer;
-pub use rtp_packet::*;
+pub use rtp_packet::RtpPacket;
 pub use session::RtpSession;
 
 pub use rtcp_types;

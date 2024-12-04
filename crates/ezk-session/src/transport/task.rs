@@ -3,7 +3,7 @@ use crate::u32_hasher::U32Hasher;
 use crate::{ActiveMediaId, RTP_MID_HDREXT_ID};
 use bytesstr::BytesStr;
 use ezk_rtp::rtcp_types::{self, Compound};
-use ezk_rtp::{parse_extensions, RtpPacket, RtpSession};
+use ezk_rtp::{parse_extensions, RtpExtensionsWriter, RtpPacket, RtpSession};
 use ezk_stun_types::{is_stun_message, IsStunMessageInfo};
 use std::collections::HashMap;
 use std::future::pending;
@@ -265,11 +265,11 @@ impl<T: RtpTransport> TransportTask<T> {
 
             let mut extension_data = vec![];
             if let Some(mid) = &entry.remote_identifyable_by.mid {
-                extension_data.reserve(mid.len() + 2);
-                extension_data.extend_from_slice(&[RTP_MID_HDREXT_ID, mid.len() as u8]);
-                extension_data.extend_from_slice(mid.as_bytes());
+                let profile = RtpExtensionsWriter::new(&mut extension_data, mid.len() <= 16)
+                    .with(RTP_MID_HDREXT_ID, mid.as_bytes())
+                    .finish();
 
-                builder = builder.extension(0xBEDE, &extension_data);
+                builder = builder.extension(profile, &extension_data);
             }
 
             builder
