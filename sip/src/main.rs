@@ -3,7 +3,7 @@ use ezk_session::{Codec, Codecs};
 use sdp_types::{MediaType, SessionDescription};
 use sip_core::transport::udp::Udp;
 use sip_core::{Endpoint, IncomingRequest, Layer, LayerKey, MayTake, Result};
-use sip_types::header::typed::Contact;
+use sip_types::header::typed::{Contact, ContentType};
 use sip_types::uri::sip::SipUri;
 use sip_types::uri::NameAddr;
 use sip_types::{Code, Method};
@@ -35,47 +35,17 @@ impl Layer for InviteAcceptLayer {
 
         let mut sdp_session = ezk_session::SdpSession::new("192.168.178.39".parse().unwrap());
         sdp_session.add_local_media(
-            Codecs::new(MediaType::Audio).with_codec(
-                Codec {
-                    static_pt: Some(8),
-                    name: "PCMA".into(),
-                    clock_rate: 8000,
-                    params: vec![],
-                },
-                |builder| {
-                    builder.add_receiver(|mut s| {
-                        println!("got receiver pcma");
+            Codecs::new(MediaType::Audio).with_codec(Codec::PCMA, |builder| {
+                builder.add_receiver(|mut s| {
+                    println!("got receiver pcma");
 
-                        tokio::spawn(async move {
-                            while let Some(_) = s.recv().await {}
+                    tokio::spawn(async move {
+                        while s.recv().await.is_some() {}
 
-                            println!("break pcma");
-                        });
+                        println!("break pcma");
                     });
-                },
-            ),
-            1,
-        );
-        sdp_session.add_local_media(
-            Codecs::new(MediaType::Video).with_codec(
-                Codec {
-                    static_pt: None,
-                    name: "AV1".into(),
-                    clock_rate: 90000,
-                    params: vec![],
-                },
-                |builder| {
-                    builder.add_receiver(|mut s| {
-                        println!("got receiver av1");
-
-                        tokio::spawn(async move {
-                            while let Some(_) = s.recv().await {}
-
-                            println!("break av1");
-                        });
-                    });
-                },
-            ),
+                });
+            }),
             1,
         );
 
@@ -105,14 +75,42 @@ impl Layer for InviteAcceptLayer {
 
         let (mut session, _ack) = acceptor.respond_success(response).await.unwrap();
 
+        sdp_session.add_local_media(
+            Codecs::new(MediaType::Video).with_codec(Codec::AV1, |builder| {
+                builder.add_receiver(|mut s| {
+                    println!("got receiver av1");
+
+                    tokio::spawn(async move {
+                        while s.recv().await.is_some() {}
+
+                        println!("break av1");
+                    });
+                });
+            }),
+            1,
+        );
+
         loop {
             match session.drive().await.unwrap() {
                 Event::RefreshNeeded(event) => {
                     event.process_default().await.unwrap();
                 }
                 Event::ReInviteReceived(event) => {
-                    let response = endpoint.create_response(&event.invite, Code::OK, None);
+                    let mut response = endpoint.create_response(&event.invite, Code::OK, None);
 
+                    let offer = SessionDescription::parse(
+                        &BytesStr::from_utf8_bytes(event.invite.body.clone()).unwrap(),
+                    )
+                    .unwrap();
+
+                    sdp_session.receiver_offer(offer).await.unwrap();
+
+                    response
+                        .msg
+                        .headers
+                        .insert_named(&ContentType(BytesStr::from_static("application/sdp")));
+
+                    response.msg.body = sdp_session.create_sdp_answer().to_string().into();
                     event.respond_success(response).await.unwrap();
                 }
                 Event::Bye(event) => {
