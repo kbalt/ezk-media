@@ -44,12 +44,13 @@ macro_rules! id_types {
 }
 
 id_types! {
-    LocalMediaId,
+    // LocalMediaId,
     ActiveMediaId,
     // TransportId,
 }
 
 slotmap::new_key_type! {
+    pub struct LocalMediaId;
     struct TransportId;
 }
 
@@ -67,8 +68,7 @@ pub struct SdpSession {
     address: IpAddr,
 
     // Local configured media
-    next_media_id: LocalMediaId,
-    local_media: HashMap<LocalMediaId, LocalMedia, U32Hasher>,
+    local_media: SlotMap<LocalMediaId, LocalMedia>,
 
     // Active media
     next_active_media_id: ActiveMediaId, // TODO: this will be used to set the `mid` and `msid?` when creating offers?
@@ -210,8 +210,7 @@ impl SdpSession {
             sdp_id: u64::from(rand::random::<u16>()),
             sdp_version: u64::from(rand::random::<u16>()),
             address,
-            next_media_id: LocalMediaId(0),
-            local_media: HashMap::with_hasher(U32Hasher::default()),
+            local_media: SlotMap::with_key(),
             next_active_media_id: ActiveMediaId(0),
             state: Vec::new(),
             transports: SlotMap::with_key(),
@@ -220,16 +219,11 @@ impl SdpSession {
 
     /// Register codecs for a media type with a limit of how many media session by can be created
     pub fn add_local_media(&mut self, codecs: Codecs, limit: usize) -> LocalMediaId {
-        let id = self.next_media_id.step();
-        self.local_media.insert(
-            id,
-            LocalMedia {
-                codecs,
-                limit,
-                use_count: 0,
-            },
-        );
-        id
+        self.local_media.insert(LocalMedia {
+            codecs,
+            limit,
+            use_count: 0,
+        })
     }
 
     pub async fn receiver_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
@@ -272,9 +266,9 @@ impl SdpSession {
             let Some((local_media_id, (mut builder, codec, codec_pt))) =
                 self.local_media.iter_mut().find_map(|(id, local_media)| {
                     let config =
-                        local_media.maybe_use_for_offer(*id, m_line_index, remote_media_desc)?;
+                        local_media.maybe_use_for_offer(id, m_line_index, remote_media_desc)?;
 
-                    Some((*id, config))
+                    Some((id, config))
                 })
             else {
                 // no local media found for this
@@ -356,10 +350,7 @@ impl SdpSession {
                 transport.handle.remove_sender(active.id).await;
                 transport.handle.remove_receiver(active.id).await;
 
-                self.local_media
-                    .get_mut(&active.local_media_id)
-                    .unwrap()
-                    .use_count -= 1;
+                self.local_media[active.local_media_id].use_count -= 1;
             }
         }
 
