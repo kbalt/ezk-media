@@ -3,6 +3,7 @@ use sdp_types::{
     Connection, Direction, ExtMap, Fmtp, Group, IceOptions, Media, MediaDescription, MediaType,
     Origin, Rtcp, RtpMap, SessionDescription, TaggedAddress, Time, TransportProtocol,
 };
+use slotmap::SlotMap;
 use std::{
     collections::HashMap,
     io,
@@ -45,7 +46,11 @@ macro_rules! id_types {
 id_types! {
     LocalMediaId,
     ActiveMediaId,
-    TransportId,
+    // TransportId,
+}
+
+slotmap::new_key_type! {
+    struct TransportId;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,8 +75,7 @@ pub struct SdpSession {
     state: Vec<MediaEntry>,
 
     // Transports
-    next_transport_id: TransportId,
-    transports: HashMap<TransportId, Transport, U32Hasher>,
+    transports: SlotMap<TransportId, Transport>,
 }
 
 struct LocalMedia {
@@ -210,8 +214,7 @@ impl SdpSession {
             local_media: HashMap::with_hasher(U32Hasher::default()),
             next_active_media_id: ActiveMediaId(0),
             state: Vec::new(),
-            next_transport_id: TransportId(0),
-            transports: HashMap::with_hasher(U32Hasher::default()),
+            transports: SlotMap::with_key(),
         }
     }
 
@@ -294,10 +297,7 @@ impl SdpSession {
                 )
                 .await?;
 
-            let transport = self
-                .transports
-                .get_mut(&transport_id)
-                .expect("transport_id must be valid");
+            let transport = &mut self.transports[transport_id];
 
             let active_media_id = self.next_active_media_id.step();
 
@@ -351,7 +351,7 @@ impl SdpSession {
 
         for entry in old_state {
             if let MediaEntry::Active(active) = entry {
-                let transport = &self.transports[&active.transport];
+                let transport = &self.transports[active.transport];
 
                 transport.handle.remove_sender(active.id).await;
                 transport.handle.remove_receiver(active.id).await;
@@ -368,7 +368,7 @@ impl SdpSession {
             self.state
                 .iter()
                 .filter_map(MediaEntry::active)
-                .any(|active| active.transport == *id)
+                .any(|active| active.transport == id)
         });
 
         Ok(())
@@ -379,10 +379,7 @@ impl SdpSession {
         requested_direction: DirectionBools,
         active_media: &mut ActiveMedia,
     ) {
-        let transport = self
-            .transports
-            .get_mut(&active_media.transport)
-            .expect("transpod id must be valid");
+        let transport = &mut self.transports[active_media.transport];
 
         // If remote wants to receive data, but we're not sending anything
         if requested_direction.send && !active_media.direction.send {
@@ -462,16 +459,11 @@ impl SdpSession {
 
                 let handle = TransportTaskHandle::new(transport, mid_rtp_id).await?;
 
-                let id = self.next_transport_id.step();
-
-                self.transports.insert(
-                    id,
-                    Transport {
-                        local_rtp_port,
-                        local_rtcp_port,
-                        handle,
-                    },
-                );
+                let id = self.transports.insert(Transport {
+                    local_rtp_port,
+                    local_rtcp_port,
+                    handle,
+                });
 
                 Ok(id)
             }
@@ -532,7 +524,7 @@ impl SdpSession {
                 });
             }
 
-            let transport = &self.transports[&active.transport];
+            let transport = &self.transports[active.transport];
 
             MediaDescription {
                 media: Media {
