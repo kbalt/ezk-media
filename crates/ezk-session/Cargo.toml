@@ -10,9 +10,10 @@ repository.workspace = true
 [dependencies]
 ezk.workspace = true
 ezk-rtp.workspace = true
-ezk-stun-types = "0.1"
+# stun-types = "0.1"
+stun-types = { git = "https://github.com/kbalt/ezk", package = "ezk-stun-types" }
 # sdp-types = { package = "ezk-sdp-types", version = "0.4" }
-sdp-types = { path = "../../../ezk/crates/sdp-types", package = "ezk-sdp-types" }
+sdp-types = { git = "https://github.com/kbalt/ezk", package = "ezk-sdp-types" }
 log = "0.4"
 thiserror = "2"
 rand = "0.8"
