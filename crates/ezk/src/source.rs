@@ -11,6 +11,7 @@ use std::future::Future;
 /// When using [`BoxedSource`] try using [`BoxedSourceCancelSafe`] instead if this trait is required. See [`Source::boxed_cancel_safe`].
 pub trait NextEventIsCancelSafe {}
 
+#[derive(Debug)]
 pub enum SourceEvent<M: MediaType> {
     /// Source produced a frame
     Frame(Frame<M>),
@@ -37,17 +38,16 @@ pub trait Source: Send + Sized + 'static {
     ///
     /// # Cancel safety
     ///
-    /// This method is __never__ cancel safe. Cancelling it may leave some sources in the stack configured and others not.
+    /// This method should __never__ be considered cancel safe, as it may leave some sources in the stack configured and others not.
     fn negotiate_config(
         &mut self,
         available: Vec<<Self::MediaType as MediaType>::ConfigRange>,
     ) -> impl Future<Output = Result<<Self::MediaType as MediaType>::Config>> + Send;
 
-    /// Fetch the next even from the source. This method should be called as much as possible to
+    /// Fetch the next event from the source. This method should be called as much as possible to
     /// allow source to drive their internal logic without having to rely on extra tasks.
     ///
-    /// Should not be called before successfully negotiating a config with [`Source::negotiate_config`]. It is valid for
-    /// implementations to assume that this method will never be called before negotiating.
+    /// Should return [`SourceEvent::RenegotiationNeeded`] when called before [`negotiate_config`](Source::negotiate_config).
     ///
     /// # Cancel safety
     ///
