@@ -1,4 +1,12 @@
 use std::{io, net::SocketAddr, sync::Arc};
+use stun_types::{
+    attributes::XorMappedAddress,
+    builder::MessageBuilder,
+    header::{Class, Method},
+    is_stun_message,
+    parse::ParsedMessage,
+    IsStunMessageInfo,
+};
 use tokio::{net::UdpSocket, select};
 
 use super::RtpTransport;
@@ -42,14 +50,6 @@ impl DirectRtpTransport {
 
         Some(rtcp_socket.local_addr().unwrap().port())
     }
-
-    fn try_recv(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        match socket.try_recv(buf) {
-            Ok(len) => Ok(Some(len)),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
 }
 
 impl RtpTransport for DirectRtpTransport {
@@ -60,11 +60,11 @@ impl RtpTransport for DirectRtpTransport {
                 let result = select! {
                     result = self.rtp_socket.readable() => {
                         result?;
-                        Self::try_recv(&self.rtp_socket, buf)
+                        try_recv(&self.rtp_socket, buf).await
                     },
                     result = rtcp_socket.readable() => {
                         result?;
-                        Self::try_recv(rtcp_socket, buf)
+                        try_recv(rtcp_socket, buf).await
                     },
                 };
 
@@ -74,8 +74,14 @@ impl RtpTransport for DirectRtpTransport {
             }
         }
 
-        // No rtcp_socket, just read from the rtp_socket
-        self.rtp_socket.recv_from(buf).await.map(|(len, _)| len)
+        loop {
+            // No rtcp_socket, just read from the rtp_socket
+            let (len, remote) = self.rtp_socket.recv_from(buf).await?;
+
+            if !check_for_stun_binding_request(&self.rtp_socket, buf, remote).await? {
+                return Ok(len);
+            }
+        }
     }
 
     async fn send_rtp(&mut self, buf: &[u8]) -> io::Result<()> {
@@ -100,4 +106,44 @@ impl RtpTransport for DirectRtpTransport {
             self.send_rtp(buf).await
         }
     }
+}
+
+async fn try_recv(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<Option<usize>> {
+    let (len, remote) = match socket.try_recv_from(buf) {
+        Ok((len, remote)) => (len, remote),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    if check_for_stun_binding_request(socket, buf, remote).await? {
+        Ok(None)
+    } else {
+        Ok(Some(len))
+    }
+}
+
+async fn check_for_stun_binding_request(
+    socket: &UdpSocket,
+    buf: &[u8],
+    remote: SocketAddr,
+) -> io::Result<bool> {
+    let len = if let IsStunMessageInfo::Yes { len } = is_stun_message(buf) {
+        len
+    } else {
+        return Ok(false);
+    };
+
+    let Ok(e) = ParsedMessage::parse(buf[..len].to_vec()) else {
+        return Ok(false);
+    };
+
+    if e.class == Class::Request && e.method == Method::Binding {
+        let mut msg = MessageBuilder::new(Class::Success, Method::Binding, e.tsx_id);
+        msg.add_attr(&XorMappedAddress(remote)).unwrap();
+        let msg = msg.finish();
+        socket.send_to(&msg, remote).await?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }

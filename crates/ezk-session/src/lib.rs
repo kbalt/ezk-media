@@ -1,4 +1,5 @@
 use bytesstr::BytesStr;
+use local_media::LocalMedia;
 use sdp_types::{
     Connection, Direction, ExtMap, Fmtp, Group, IceOptions, Media, MediaDescription, MediaType,
     Origin, Rtcp, RtpMap, SessionDescription, TaggedAddress, Time, TransportProtocol,
@@ -12,12 +13,11 @@ use std::{
 };
 use tokio::{net::lookup_host, sync::mpsc, try_join};
 use transport::{DirectRtpTransport, IdentifyableBy, TransportTaskHandle};
-use u32_hasher::U32Hasher;
 
 mod codecs;
+mod local_media;
 mod transceiver_builder;
 mod transport;
-mod u32_hasher;
 
 pub use codecs::{Codec, Codecs};
 pub use transceiver_builder::TransceiverBuilder;
@@ -26,27 +26,15 @@ pub use transceiver_builder::TransceiverBuilder;
 const RTP_MID_HDREXT_ID: u8 = 1;
 const RTP_MID_HDREXT: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
 
-macro_rules! id_types {
-    ($($name:ident),* $(,)?) => {
-        $(
-        #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(u32);
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ActiveMediaId(u32);
 
-        impl $name {
-            fn step(&mut self) -> Self {
-                let id = *self;
-                self.0 += 1;
-                id
-            }
-        }
-        )*
-    };
-}
-
-id_types! {
-    // LocalMediaId,
-    ActiveMediaId,
-    // TransportId,
+impl ActiveMediaId {
+    fn step(&mut self) -> Self {
+        let id = *self;
+        self.0 += 1;
+        id
+    }
 }
 
 slotmap::new_key_type! {
@@ -76,79 +64,6 @@ pub struct SdpSession {
 
     // Transports
     transports: SlotMap<TransportId, Transport>,
-}
-
-struct LocalMedia {
-    codecs: Codecs,
-    limit: usize,
-    use_count: usize,
-}
-
-impl LocalMedia {
-    fn maybe_use_for_offer(
-        &mut self,
-        self_id: LocalMediaId,
-        m_line_index: usize,
-        desc: &MediaDescription,
-    ) -> Option<(TransceiverBuilder, Codec, u8)> {
-        if self.limit == self.use_count || self.codecs.media_type != desc.media.media_type {
-            return None;
-        }
-
-        // Try choosing a codec
-
-        for entry in &mut self.codecs.codecs {
-            let codec_pt = if let Some(static_pt) = entry.codec.static_pt {
-                if desc.media.fmts.contains(&static_pt) {
-                    Some(static_pt)
-                } else {
-                    None
-                }
-            } else {
-                desc.rtpmap
-                    .iter()
-                    .find(|rtpmap| {
-                        rtpmap.encoding == entry.codec.name.as_ref()
-                            && rtpmap.clock_rate == entry.codec.clock_rate
-                    })
-                    .map(|rtpmap| rtpmap.payload)
-            };
-
-            if let Some(codec_pt) = codec_pt {
-                let mut builder = TransceiverBuilder {
-                    local_media_id: self_id,
-                    m_line_index,
-                    mid: desc.mid.clone(),
-                    msid: None, // TODO: read msid
-
-                    create_receiver: None,
-                    create_sender: None,
-                };
-
-                (entry.build)(&mut builder);
-
-                let has_sender = builder.create_sender.is_some();
-                let has_receiver = builder.create_receiver.is_some();
-
-                let (do_send, do_receive) = match desc.direction.flipped() {
-                    Direction::SendRecv => (has_sender, has_receiver),
-                    Direction::RecvOnly => (false, has_receiver),
-                    Direction::SendOnly => (has_sender, false),
-                    Direction::Inactive => (false, false),
-                };
-
-                if !(do_send || do_receive) {
-                    // There would be no sender or receiver
-                    return None;
-                }
-
-                self.use_count += 1; // TODO: decrement this
-                return Some((builder, entry.codec.clone(), codec_pt));
-            }
-        }
-
-        None
-    }
 }
 
 enum MediaEntry {
@@ -549,8 +464,7 @@ impl SdpSession {
 
         // Create bundle group attributes
         let group = {
-            let mut bundle_groups: HashMap<TransportId, Vec<BytesStr>, U32Hasher> =
-                HashMap::with_hasher(U32Hasher::default());
+            let mut bundle_groups: HashMap<TransportId, Vec<BytesStr>> = HashMap::new();
 
             for active_media in self.state.iter().filter_map(MediaEntry::active) {
                 if let Some(mid) = active_media.mid.clone() {

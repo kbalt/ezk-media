@@ -1,10 +1,8 @@
 use super::RtpTransport;
-use crate::u32_hasher::U32Hasher;
 use crate::{ActiveMediaId, RTP_MID_HDREXT_ID};
 use bytesstr::BytesStr;
 use ezk_rtp::rtcp_types::{self, Compound};
 use ezk_rtp::{parse_extensions, RtpExtensionsWriter, RtpPacket, RtpSession};
-use ezk_stun_types::{is_stun_message, IsStunMessageInfo};
 use std::collections::HashMap;
 use std::future::pending;
 use std::time::Duration;
@@ -42,7 +40,7 @@ impl TransportTaskHandle {
         tokio::spawn(
             TransportTask {
                 state: TaskState::Ok,
-                rtp_sessions: HashMap::with_hasher(U32Hasher::default()),
+                rtp_sessions: HashMap::new(),
                 mid_rtp_id,
                 transport,
                 encode_buf: vec![],
@@ -118,7 +116,7 @@ enum ToTaskCommand {
 struct TransportTask<T> {
     state: TaskState,
 
-    rtp_sessions: HashMap<ActiveMediaId, Entry, U32Hasher>,
+    rtp_sessions: HashMap<ActiveMediaId, Entry>,
     mid_rtp_id: Option<u8>,
 
     transport: T,
@@ -322,11 +320,6 @@ impl<T: RtpTransport> TransportTask<T> {
                 return;
             }
         };
-
-        if let IsStunMessageInfo::Yes { .. } = is_stun_message(buf) {
-            log::debug!("got unhandled stun package");
-            return;
-        }
 
         if len < 2 {
             return;
