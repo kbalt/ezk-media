@@ -397,11 +397,7 @@ impl SdpSession {
             .find_map(|m| {
                 let mid = m.mid.as_ref()?;
 
-                group
-                    .mids
-                    .iter()
-                    .any(|gmid| gmid == mid.as_str())
-                    .then_some(m.transport)
+                group.mids.contains(mid).then_some(m.transport)
             })
     }
 
@@ -461,6 +457,9 @@ impl SdpSession {
                 crypto: vec![],
                 extmap,
                 extmap_allow_mixed: false,
+                ssrc: vec![],
+                setup: None,
+                fingerprint: vec![],
                 attributes: vec![],
             }
         });
@@ -510,6 +509,8 @@ impl SdpSession {
             ice_options: IceOptions::default(),
             ice_ufrag: None,
             ice_pwd: None,
+            setup: None,
+            fingerprint: vec![],
             attributes: vec![],
             media_descriptions: media.collect(),
         }
