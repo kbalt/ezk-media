@@ -12,7 +12,7 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 use tokio::{net::lookup_host, sync::mpsc, try_join};
-use transport::{DirectRtpTransport, IdentifyableBy, TransportTaskHandle};
+use transport::{DirectRtpTransport, IdentifyableBy, LibSrtpTransport, TransportTaskHandle};
 
 mod codecs;
 mod local_media;
@@ -141,6 +141,10 @@ impl SdpSession {
         })
     }
 
+    pub fn remove_local_media(&mut self, local_media_id: LocalMediaId) {
+        self.local_media.remove(local_media_id);
+    }
+
     pub async fn receiver_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
         let mut new_state = vec![];
 
@@ -262,8 +266,7 @@ impl SdpSession {
             if let MediaEntry::Active(active) = entry {
                 let transport = &self.transports[active.transport];
 
-                transport.handle.remove_sender(active.id).await;
-                transport.handle.remove_receiver(active.id).await;
+                transport.handle.remove_media_session(active.id).await;
 
                 self.local_media[active.local_media_id].use_count -= 1;
             }
@@ -354,7 +357,7 @@ impl SdpSession {
                     .find(|extmap| extmap.uri == RTP_MID_HDREXT)
                     .map(|extmap| extmap.id);
 
-                let transport = DirectRtpTransport::new(
+                let transport = LibSrtpTransport::new(
                     remote_rtp_address,
                     Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux),
                 )
@@ -437,7 +440,7 @@ impl SdpSession {
                     media_type: active.media_type,
                     port: transport.local_rtp_port,
                     ports_num: None,
-                    proto: TransportProtocol::RtpAvp,
+                    proto: TransportProtocol::Other(BytesStr::from_static("UDP/TLS/RTP/SAVP")),
                     fmts: vec![active.codec_pt],
                 },
                 connection: None,
