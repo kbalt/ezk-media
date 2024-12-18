@@ -1,9 +1,11 @@
 use std::{future::Future, io};
 
 mod direct;
+mod libsrtp_dtls;
 mod task;
 
 pub(crate) use direct::DirectRtpTransport;
+pub(crate) use libsrtp_dtls::LibSrtpTransport;
 pub(crate) use task::{IdentifyableBy, TransportTaskHandle};
 
 pub trait RtpTransport: Send + 'static {

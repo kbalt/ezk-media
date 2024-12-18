@@ -96,6 +96,13 @@ impl TransportTaskHandle {
             .await
             .expect("task must not exit while command_tx exists");
     }
+
+    pub async fn remove_media_session(&self, id: ActiveMediaId) {
+        self.command_tx
+            .send(ToTaskCommand::RemoveMediaSession(id))
+            .await
+            .expect("task must not exit while command_tx exists");
+    }
 }
 
 enum ToTaskCommand {
@@ -104,6 +111,7 @@ enum ToTaskCommand {
         remote_identifyable_by: IdentifyableBy,
         clock_rate: u32,
     },
+    RemoveMediaSession(ActiveMediaId),
 
     SetSender(ActiveMediaId, mpsc::Receiver<RtpPacket>),
     RemoveSender(ActiveMediaId),
@@ -220,6 +228,10 @@ impl<T: RtpTransport> TransportTask<T> {
                         receiver_sender: None,
                     },
                 );
+            }
+            ToTaskCommand::RemoveMediaSession(id) => {
+                self.rtp_sessions.remove(&id);
+                self.rtp_sender_sources.remove(&id);
             }
             ToTaskCommand::SetSender(id, receiver) => {
                 self.rtp_sender_sources

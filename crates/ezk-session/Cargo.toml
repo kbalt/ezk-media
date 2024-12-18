@@ -22,3 +22,9 @@ futures-util = "0.3"
 tokio-stream = { version = "0.1", features = [] }
 bytesstr = "1.0.2"
 slotmap = "1.0.7"
+srtp = "0.7"
+openssl = "0.10"
+tokio-openssl = "0.6"
+
+[patch.crates-io]
+srtp2-sys = { git = "https://github.com/kbalt/srtp2-sys.git", rev = "7ecbec0660575210d58136b2937d8f65f19972a8" }

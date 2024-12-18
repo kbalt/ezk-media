@@ -34,8 +34,9 @@ impl Layer for InviteAcceptLayer {
         };
 
         let start = Instant::now();
+        let ip = local_ip_address::local_ip().unwrap();
 
-        let mut sdp_session = ezk_session::SdpSession::new("192.168.178.39".parse().unwrap());
+        let mut sdp_session = ezk_session::SdpSession::new(ip);
         sdp_session.add_local_media(
             Codecs::new(MediaType::Audio).with_codec(Codec::PCMA, |builder| {
                 builder.add_receiver(|mut s| {
@@ -51,7 +52,8 @@ impl Layer for InviteAcceptLayer {
             1,
         );
 
-        let contact: SipUri = "sip:192.168.178.39:5065".parse().unwrap();
+        let ip = local_ip_address::local_ip().unwrap();
+        let contact: SipUri = format!("sip:{ip}:5060").parse().unwrap();
         let contact = Contact::new(NameAddr::uri(contact));
 
         let dialog =
@@ -142,7 +144,7 @@ async fn main() -> Result<()> {
         invite_layer,
     });
 
-    Udp::spawn(&mut builder, "0.0.0.0:5065").await?;
+    Udp::spawn(&mut builder, "0.0.0.0:5060").await?;
 
     // Build endpoint to start the SIP Stack
     let _endpoint = builder.build();
