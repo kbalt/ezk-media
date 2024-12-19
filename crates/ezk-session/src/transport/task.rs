@@ -1,18 +1,16 @@
-use super::RtpTransport;
+use super::{RtpTransport, RECV_BUFFER_SIZE};
 use crate::{ActiveMediaId, RTP_MID_HDREXT_ID};
 use bytesstr::BytesStr;
 use ezk_rtp::rtcp_types::{self, Compound};
 use ezk_rtp::{parse_extensions, RtpExtensionsWriter, RtpPacket, RtpSession};
 use std::collections::HashMap;
-use std::future::pending;
+use std::future::{pending, poll_fn};
+use std::task::Poll;
 use std::time::Duration;
 use std::{fmt, io};
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::{interval, interval_at, Instant};
-use tokio_stream::{wrappers::ReceiverStream, StreamExt, StreamMap};
-
-const RECV_BUFFER_SIZE: usize = 65535;
 
 // TODO: name
 // TODO: https://www.rfc-editor.org/rfc/rfc8843#section-9.2
@@ -31,10 +29,7 @@ pub(crate) struct TransportTaskHandle {
 }
 
 impl TransportTaskHandle {
-    pub async fn new<T: RtpTransport>(
-        transport: T,
-        mid_rtp_id: Option<u8>,
-    ) -> Result<Self, io::Error> {
+    pub fn new<T: RtpTransport>(transport: T, mid_rtp_id: Option<u8>) -> Self {
         let (command_tx, command_rx) = mpsc::channel(1);
 
         tokio::spawn(
@@ -44,13 +39,12 @@ impl TransportTaskHandle {
                 mid_rtp_id,
                 transport,
                 encode_buf: vec![],
-                rtp_sender_sources: StreamMap::new(),
                 command_rx,
             }
             .run(),
         );
 
-        Ok(Self { command_tx })
+        Self { command_tx }
     }
 
     pub async fn add_media_session(
@@ -132,9 +126,6 @@ struct TransportTask<T> {
     /// Reusable buffer to serialize RTP/RTCP packets into
     encode_buf: Vec<u8>,
 
-    /// The RTP task polls this source yielding RTP packets to send out via `transport`
-    rtp_sender_sources: StreamMap<ActiveMediaId, ReceiverStream<RtpPacket>>,
-
     /// Channel to receive commands from the RtpSessions object from. When this returns None, the Task quits
     command_rx: mpsc::Receiver<ToTaskCommand>,
 }
@@ -143,6 +134,7 @@ struct Entry {
     rtp_session: RtpSession,
     remote_identifyable_by: IdentifyableBy,
     receiver_sender: Option<mpsc::Sender<RtpPacket>>,
+    sender_receiver: Option<mpsc::Receiver<RtpPacket>>,
 }
 
 impl fmt::Debug for Entry {
@@ -185,8 +177,10 @@ impl<T: RtpTransport> TransportTask<T> {
                 // Check the jitterbuffer in a fixed interval
                 _ = poll_jitterbuffer_interval.tick() => self.poll_jitterbuffer().await,
 
-                // Wait for the application to generate RTP packets and send them out
-                (mid, event) = poll_sources(&mut self.rtp_sender_sources) => self.send_rtp_packet(mid, event).await,
+                // Wait for the application to generate RTP packets and send them out, but only when the transport is ready
+                (mid, event) = poll_session_sources(&mut self.rtp_sessions, self.transport.is_ready()) => {
+                    self.send_rtp_packet(mid, event).await;
+                }
 
                 // Send out RTCP packets in a fixed interval
                 _ = rtcp_interval.tick() => self.send_rtcp().await,
@@ -226,19 +220,18 @@ impl<T: RtpTransport> TransportTask<T> {
                         rtp_session: RtpSession::new(rand::random(), clock_rate),
                         remote_identifyable_by,
                         receiver_sender: None,
+                        sender_receiver: None,
                     },
                 );
             }
             ToTaskCommand::RemoveMediaSession(id) => {
                 self.rtp_sessions.remove(&id);
-                self.rtp_sender_sources.remove(&id);
             }
             ToTaskCommand::SetSender(id, receiver) => {
-                self.rtp_sender_sources
-                    .insert(id, ReceiverStream::new(receiver));
+                self.rtp_sessions.get_mut(&id).unwrap().sender_receiver = Some(receiver);
             }
             ToTaskCommand::RemoveSender(id) => {
-                self.rtp_sender_sources.remove(&id);
+                self.rtp_sessions.get_mut(&id).unwrap().sender_receiver = None;
             }
             ToTaskCommand::SetReceiver(id, sender) => {
                 self.rtp_sessions.get_mut(&id).unwrap().receiver_sender = Some(sender)
@@ -289,7 +282,7 @@ impl<T: RtpTransport> TransportTask<T> {
 
         entry.rtp_session.send_rtp(&packet);
 
-        if let Err(e) = self.transport.send_rtp(&self.encode_buf).await {
+        if let Err(e) = self.transport.send_rtp(&mut self.encode_buf).await {
             log::warn!(
                 "Failed to send RTP packet of length={}, {e}",
                 self.encode_buf.len(),
@@ -313,7 +306,7 @@ impl<T: RtpTransport> TransportTask<T> {
 
             self.encode_buf.truncate(len);
 
-            if let Err(e) = self.transport.send_rtcp(&self.encode_buf).await {
+            if let Err(e) = self.transport.send_rtcp(&mut self.encode_buf).await {
                 log::warn!(
                     "Failed to send RTCP packet of length={} {e}",
                     self.encode_buf.len(),
@@ -323,21 +316,17 @@ impl<T: RtpTransport> TransportTask<T> {
         }
     }
 
-    fn handle_recv(&mut self, buf: &[u8], result: io::Result<usize>) {
-        let len = match result {
-            Ok(len) => len,
-            Err(e) => {
-                log::warn!("Failed to read from udpsocket, {e}");
-                self.state = TaskState::ExitErr;
-                return;
-            }
+    fn handle_recv(&mut self, buf: &[u8], result: io::Result<()>) {
+        if let Err(e) = result {
+            log::warn!("Failed to read from udpsocket, {e}");
+            self.state = TaskState::ExitErr;
+            return;
         };
 
-        if len < 2 {
+        if buf.len() < 2 {
             return;
         }
 
-        let buf = &buf[..len];
         let pt = buf[1];
 
         // Test if the packet's payload type is inside the forbidden range, which would make it a RTCP packet
@@ -436,12 +425,28 @@ impl<T: RtpTransport> TransportTask<T> {
     }
 }
 
-async fn poll_sources(
-    sources: &mut StreamMap<ActiveMediaId, ReceiverStream<RtpPacket>>,
+async fn poll_session_sources(
+    entries: &mut HashMap<ActiveMediaId, Entry>,
+    transport_is_ready: bool,
 ) -> (ActiveMediaId, RtpPacket) {
-    if sources.is_empty() {
+    if entries.is_empty() || !transport_is_ready {
         return pending().await;
     }
 
-    sources.next().await.expect("sources cannot return none")
+    poll_fn(|cx| {
+        for (id, entry) in &mut *entries {
+            let Some(receiver) = &mut entry.sender_receiver else {
+                continue;
+            };
+
+            match receiver.poll_recv(cx) {
+                Poll::Ready(Some(packet)) => return Poll::Ready((*id, packet)),
+                Poll::Ready(None) => entry.sender_receiver = None,
+                Poll::Pending => {}
+            }
+        }
+
+        Poll::Pending
+    })
+    .await
 }
