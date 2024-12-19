@@ -1,3 +1,4 @@
+use super::RtpTransport;
 use std::{io, net::SocketAddr, sync::Arc};
 use stun_types::{
     attributes::XorMappedAddress,
@@ -8,8 +9,6 @@ use stun_types::{
     IsStunMessageInfo,
 };
 use tokio::{net::UdpSocket, select};
-
-use super::RtpTransport;
 
 pub struct DirectRtpTransport {
     rtp_socket: Arc<UdpSocket>,
@@ -53,7 +52,7 @@ impl DirectRtpTransport {
 }
 
 impl RtpTransport for DirectRtpTransport {
-    async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    async fn recv(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
         if let Some(rtcp_socket) = &self.rtcp_socket {
             // Poll both rtp_socket & rtcp_socket for readyness and try_read once available
             loop {
@@ -69,7 +68,8 @@ impl RtpTransport for DirectRtpTransport {
                 };
 
                 if let Some(len) = result? {
-                    return Ok(len);
+                    buf.truncate(len);
+                    return Ok(());
                 }
             }
         }
@@ -79,12 +79,13 @@ impl RtpTransport for DirectRtpTransport {
             let (len, remote) = self.rtp_socket.recv_from(buf).await?;
 
             if !check_for_stun_binding_request(&self.rtp_socket, buf, remote).await? {
-                return Ok(len);
+                buf.truncate(len);
+                return Ok(());
             }
         }
     }
 
-    async fn send_rtp(&mut self, buf: &[u8]) -> io::Result<()> {
+    async fn send_rtp(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
         self.rtp_socket
             .send_to(buf, self.remote_rtp_address)
             .await?;
@@ -92,7 +93,7 @@ impl RtpTransport for DirectRtpTransport {
         Ok(())
     }
 
-    async fn send_rtcp(&mut self, buf: &[u8]) -> io::Result<()> {
+    async fn send_rtcp(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
         if let Some(rtcp_socket) = &self.rtcp_socket {
             rtcp_socket
                 .send_to(
@@ -105,6 +106,10 @@ impl RtpTransport for DirectRtpTransport {
         } else {
             self.send_rtp(buf).await
         }
+    }
+
+    fn is_ready(&self) -> bool {
+        true
     }
 }
 

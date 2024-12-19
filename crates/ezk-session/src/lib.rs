@@ -1,8 +1,9 @@
 use bytesstr::BytesStr;
 use local_media::LocalMedia;
 use sdp_types::{
-    Connection, Direction, ExtMap, Fmtp, Group, IceOptions, Media, MediaDescription, MediaType,
-    Origin, Rtcp, RtpMap, SessionDescription, TaggedAddress, Time, TransportProtocol,
+    Connection, Direction, ExtMap, Fingerprint, Fmtp, Group, IceOptions, Media, MediaDescription,
+    MediaType, Origin, Rtcp, RtpMap, SessionDescription, Setup, TaggedAddress, Time,
+    TransportProtocol,
 };
 use slotmap::SlotMap;
 use std::{
@@ -12,7 +13,9 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 use tokio::{net::lookup_host, sync::mpsc, try_join};
-use transport::{DirectRtpTransport, IdentifyableBy, LibSrtpTransport, TransportTaskHandle};
+use transport::{
+    DirectDtlsSrtpTransport, DirectRtpTransport, DtlsSetup, IdentifyableBy, TransportTaskHandle,
+};
 
 mod codecs;
 mod local_media;
@@ -92,7 +95,7 @@ struct ActiveMedia {
 
     transport: TransportId,
     remote_rtp_address: SocketAddr,
-    remote_rtcp_address: Option<SocketAddr>,
+    remote_rtcp_address: SocketAddr,
 
     codec_pt: u8,
     codec: Codec,
@@ -117,6 +120,13 @@ struct Transport {
     local_rtp_port: u16,
     local_rtcp_port: Option<u16>,
     handle: TransportTaskHandle,
+    kind: TransportKind,
+}
+
+enum TransportKind {
+    Rtp,
+    // SdesSrtp
+    DtlsSrtp(Vec<Fingerprint>),
 }
 
 impl SdpSession {
@@ -192,7 +202,6 @@ impl SdpSession {
             else {
                 // no local media found for this
                 new_state.push(MediaEntry::Rejected(remote_media_desc.media.media_type));
-
                 continue;
             };
 
@@ -209,6 +218,12 @@ impl SdpSession {
                     remote_rtcp_address,
                 )
                 .await?;
+
+            let Some(transport_id) = transport_id else {
+                // No transport was found or created, reject media
+                new_state.push(MediaEntry::Rejected(remote_media_desc.media.media_type));
+                continue;
+            };
 
             let transport = &mut self.transports[transport_id];
 
@@ -252,7 +267,7 @@ impl SdpSession {
                 },
                 transport: transport_id,
                 remote_rtp_address,
-                remote_rtcp_address: Some(remote_rtcp_address),
+                remote_rtcp_address,
                 codec_pt,
                 codec,
                 builder,
@@ -331,6 +346,8 @@ impl SdpSession {
     }
 
     /// Get or create a transport for the given media description
+    ///
+    /// If the transport type is unknown or cannot be created Ok(None) is returned. The media section must then be declined.
     async fn get_or_create_transport(
         &mut self,
         new_state: &[MediaEntry],
@@ -338,7 +355,7 @@ impl SdpSession {
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
-    ) -> Result<TransportId, Error> {
+    ) -> Result<Option<TransportId>, Error> {
         match remote_media_desc
             .mid
             .as_ref()
@@ -346,7 +363,7 @@ impl SdpSession {
         {
             Some(id) => {
                 // Bundled transport found, use that one
-                Ok(id)
+                Ok(Some(id))
             }
 
             None => {
@@ -357,24 +374,55 @@ impl SdpSession {
                     .find(|extmap| extmap.uri == RTP_MID_HDREXT)
                     .map(|extmap| extmap.id);
 
-                let transport = LibSrtpTransport::new(
-                    remote_rtp_address,
-                    Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux),
-                )
-                .await?;
+                let transport = match remote_media_desc.media.proto {
+                    TransportProtocol::RtpAvp => {
+                        // Create direct RTP transport
+                        let transport = DirectRtpTransport::new(
+                            remote_rtp_address,
+                            Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux),
+                        )
+                        .await?;
 
-                let local_rtp_port = transport.local_rtp_port();
-                let local_rtcp_port = transport.local_rtcp_port();
+                        Transport {
+                            local_rtp_port: transport.local_rtp_port(),
+                            local_rtcp_port: transport.local_rtcp_port(),
+                            handle: TransportTaskHandle::new(transport, mid_rtp_id),
+                            kind: TransportKind::Rtp,
+                        }
+                    }
+                    TransportProtocol::UdpTlsRtpSavp => {
+                        let setup = match remote_media_desc.setup {
+                            Some(Setup::Active) => DtlsSetup::Accept,
+                            Some(Setup::Passive) => DtlsSetup::Connect,
+                            Some(Setup::ActPass) => {
+                                // For now always play the server
+                                DtlsSetup::Accept
+                            }
+                            Some(Setup::HoldConn) | None => {
+                                // Missing or invalid setup specified, just silently fail here
+                                return Ok(None);
+                            }
+                        };
 
-                let handle = TransportTaskHandle::new(transport, mid_rtp_id).await?;
+                        let (transport, fingerprint) = DirectDtlsSrtpTransport::new(
+                            remote_rtp_address,
+                            Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux),
+                            remote_media_desc.fingerprint.clone(),
+                            setup,
+                        )
+                        .await?;
 
-                let id = self.transports.insert(Transport {
-                    local_rtp_port,
-                    local_rtcp_port,
-                    handle,
-                });
+                        Transport {
+                            local_rtp_port: transport.local_rtp_port(),
+                            local_rtcp_port: transport.local_rtcp_port(),
+                            handle: TransportTaskHandle::new(transport, mid_rtp_id),
+                            kind: TransportKind::DtlsSrtp(fingerprint),
+                        }
+                    }
+                    _ => return Ok(None),
+                };
 
-                Ok(id)
+                Ok(Some(self.transports.insert(transport)))
             }
         }
     }
@@ -431,12 +479,22 @@ impl SdpSession {
 
             let transport = &self.transports[active.transport];
 
+            let mut fingerprint = vec![];
+
+            let proto = match &transport.kind {
+                TransportKind::Rtp => TransportProtocol::RtpAvp,
+                TransportKind::DtlsSrtp(f) => {
+                    fingerprint.clone_from(f);
+                    TransportProtocol::UdpTlsRtpSavp
+                }
+            };
+
             MediaDescription {
                 media: Media {
                     media_type: active.media_type,
                     port: transport.local_rtp_port,
                     ports_num: None,
-                    proto: TransportProtocol::Other(BytesStr::from_static("UDP/TLS/RTP/SAVP")),
+                    proto,
                     fmts: vec![active.codec_pt],
                 },
                 connection: None,
@@ -446,7 +504,7 @@ impl SdpSession {
                     port,
                     address: None,
                 }),
-                rtcp_mux: active.remote_rtcp_address.is_none(),
+                rtcp_mux: active.remote_rtp_address == active.remote_rtcp_address,
                 mid: active.mid.clone(),
                 rtpmap: vec![rtpmap],
                 fmtp: fmtps.collect(),
@@ -458,8 +516,8 @@ impl SdpSession {
                 extmap,
                 extmap_allow_mixed: false,
                 ssrc: vec![],
-                setup: None,
-                fingerprint: vec![],
+                setup: Some(sdp_types::Setup::Passive),
+                fingerprint,
                 attributes: vec![],
             }
         });
