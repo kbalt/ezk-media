@@ -2,7 +2,7 @@ use bytesstr::BytesStr;
 use local_media::LocalMedia;
 use sdp_types::{
     Connection, Direction, ExtMap, Fingerprint, Fmtp, Group, IceOptions, Media, MediaDescription,
-    MediaType, Origin, Rtcp, RtpMap, SessionDescription, Setup, TaggedAddress, Time,
+    MediaType, Origin, Rtcp, RtpMap, SessionDescription, Setup, SrtpCrypto, TaggedAddress, Time,
     TransportProtocol,
 };
 use slotmap::SlotMap;
@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::{net::lookup_host, sync::mpsc, try_join};
 use transport::{
-    DirectDtlsSrtpTransport, DirectRtpTransport, DtlsSetup, IdentifyableBy, TransportTaskHandle,
+    DirectRtpTransport, DirectSrtpTransport, DtlsSetup, IdentifyableBy, TransportTaskHandle,
 };
 
 mod codecs;
@@ -125,8 +125,8 @@ struct Transport {
 
 enum TransportKind {
     Rtp,
-    // SdesSrtp
-    DtlsSrtp(Vec<Fingerprint>),
+    SdesSrtp(Vec<SrtpCrypto>),
+    DtlsSrtp(Vec<Fingerprint>, Setup),
 }
 
 impl SdpSession {
@@ -390,6 +390,22 @@ impl SdpSession {
                             kind: TransportKind::Rtp,
                         }
                     }
+                    TransportProtocol::RtpSavp => {
+                        // Create direct SRTP transport
+                        let (transport, crypto) = DirectSrtpTransport::sdes_srtp(
+                            remote_rtp_address,
+                            Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux),
+                            &remote_media_desc.crypto,
+                        )
+                        .await?;
+
+                        Transport {
+                            local_rtp_port: transport.local_rtp_port(),
+                            local_rtcp_port: transport.local_rtcp_port(),
+                            handle: TransportTaskHandle::new(transport, mid_rtp_id),
+                            kind: TransportKind::SdesSrtp(crypto),
+                        }
+                    }
                     TransportProtocol::UdpTlsRtpSavp => {
                         let setup = match remote_media_desc.setup {
                             Some(Setup::Active) => DtlsSetup::Accept,
@@ -404,7 +420,7 @@ impl SdpSession {
                             }
                         };
 
-                        let (transport, fingerprint) = DirectDtlsSrtpTransport::new(
+                        let (transport, fingerprint) = DirectSrtpTransport::dtls_srtp(
                             remote_rtp_address,
                             Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux),
                             remote_media_desc.fingerprint.clone(),
@@ -416,7 +432,13 @@ impl SdpSession {
                             local_rtp_port: transport.local_rtp_port(),
                             local_rtcp_port: transport.local_rtcp_port(),
                             handle: TransportTaskHandle::new(transport, mid_rtp_id),
-                            kind: TransportKind::DtlsSrtp(fingerprint),
+                            kind: TransportKind::DtlsSrtp(
+                                fingerprint,
+                                match setup {
+                                    DtlsSetup::Connect => Setup::Active,
+                                    DtlsSetup::Accept => Setup::Passive,
+                                },
+                            ),
                         }
                     }
                     _ => return Ok(None),
@@ -480,11 +502,18 @@ impl SdpSession {
             let transport = &self.transports[active.transport];
 
             let mut fingerprint = vec![];
+            let mut crypto = vec![];
+            let mut setup = None;
 
             let proto = match &transport.kind {
                 TransportKind::Rtp => TransportProtocol::RtpAvp,
-                TransportKind::DtlsSrtp(f) => {
-                    fingerprint.clone_from(f);
+                TransportKind::SdesSrtp(c) => {
+                    crypto.extend_from_slice(c);
+                    TransportProtocol::RtpSavp
+                }
+                TransportKind::DtlsSrtp(f, s) => {
+                    fingerprint.extend_from_slice(f);
+                    setup = Some(*s);
                     TransportProtocol::UdpTlsRtpSavp
                 }
             };
@@ -512,11 +541,11 @@ impl SdpSession {
                 ice_pwd: None,
                 ice_candidates: vec![],
                 ice_end_of_candidates: false,
-                crypto: vec![],
+                crypto,
                 extmap,
                 extmap_allow_mixed: false,
                 ssrc: vec![],
-                setup: Some(sdp_types::Setup::Passive),
+                setup,
                 fingerprint,
                 attributes: vec![],
             }

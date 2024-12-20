@@ -2,12 +2,12 @@ use std::{future::Future, io};
 use stun_types::{is_stun_message, IsStunMessageInfo};
 
 mod direct_rtp;
-mod direct_srtp_dtls;
+mod direct_srtp;
 mod dtls_srtp;
 mod task;
 
 pub(crate) use direct_rtp::DirectRtpTransport;
-pub(crate) use direct_srtp_dtls::{DirectDtlsSrtpTransport, DtlsSetup};
+pub(crate) use direct_srtp::{DirectSrtpTransport, DtlsSetup};
 pub(crate) use task::{IdentifyableBy, TransportTaskHandle};
 
 const RECV_BUFFER_SIZE: usize = 65535;
