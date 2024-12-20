@@ -17,7 +17,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
 };
 use tokio::{
@@ -32,12 +32,12 @@ pub(crate) struct DtlsSrtpAcceptor {
 
 impl DtlsSrtpAcceptor {
     pub(crate) fn new(socket: Arc<UdpSocket>, remote_addr: SocketAddr) -> io::Result<Self> {
-        let (cert, pkey) = mk_ca_cert().unwrap();
+        let (cert, pkey) = get_ca_cert();
 
         let mut ctx = SslAcceptor::mozilla_modern(SslMethod::dtls())?;
         ctx.set_tlsext_use_srtp(srtp::openssl::SRTP_PROFILE_NAMES)?;
-        ctx.set_private_key(&pkey)?;
-        ctx.set_certificate(&cert)?;
+        ctx.set_private_key(pkey)?;
+        ctx.set_certificate(cert)?;
         ctx.check_private_key()?;
         let ctx = ctx.build().into_context();
 
@@ -101,12 +101,12 @@ impl DtlsSrtpConnector {
         remote_addr: SocketAddr,
         fingerprints: Vec<(MessageDigest, Vec<u8>)>,
     ) -> io::Result<Self> {
-        let (cert, pkey) = mk_ca_cert().unwrap();
+        let (cert, pkey) = get_ca_cert();
 
         let mut ctx = SslAcceptor::mozilla_modern(SslMethod::dtls())?;
         ctx.set_tlsext_use_srtp(srtp::openssl::SRTP_PROFILE_NAMES)?;
-        ctx.set_private_key(&pkey)?;
-        ctx.set_certificate(&cert)?;
+        ctx.set_private_key(pkey)?;
+        ctx.set_certificate(cert)?;
         ctx.check_private_key()?;
         let ctx = ctx.build().into_context();
 
@@ -137,10 +137,14 @@ impl DtlsSrtpConnector {
             .await
             .map_err(io::Error::other)?;
 
-        let peer_cert = self.stream.ssl().peer_certificate().unwrap();
+        let peer_cert = self
+            .stream
+            .ssl()
+            .peer_certificate()
+            .ok_or_else(|| io::Error::other("no peer certificate after connect"))?;
 
         for (digest, fingerprint) in &self.fingerprints {
-            let peer_fingerprint = peer_cert.digest(*digest).unwrap();
+            let peer_fingerprint = peer_cert.digest(*digest)?;
 
             if peer_fingerprint.as_ref() != fingerprint {
                 return Err(io::Error::other(
@@ -193,8 +197,13 @@ impl AsyncWrite for UdpAsyncRW {
     }
 }
 
-/// Make a CA certificate and private key
-fn mk_ca_cert() -> Result<(X509, PKey<Private>), ErrorStack> {
+// TODO: do I generate a pair for each session? Currently one cert per application, which expires after a year
+fn get_ca_cert() -> &'static (X509, PKey<Private>) {
+    static CA: OnceLock<(X509, PKey<Private>)> = OnceLock::new();
+    CA.get_or_init(|| make_ca_cert().unwrap())
+}
+
+fn make_ca_cert() -> Result<(X509, PKey<Private>), ErrorStack> {
     openssl::init();
 
     let rsa = Rsa::generate(2048)?;

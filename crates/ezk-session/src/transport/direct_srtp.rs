@@ -2,9 +2,11 @@ use super::{
     dtls_srtp::{DtlsSrtpAcceptor, DtlsSrtpConnector},
     PacketKind, RtpTransport, RECV_BUFFER_SIZE,
 };
+use base64::{prelude::BASE64_STANDARD, Engine};
 use openssl::hash::MessageDigest;
-use sdp_types::{Fingerprint, FingerprintAlgorithm};
-use srtp::openssl::InboundSession;
+use rand::RngCore;
+use sdp_types::{Fingerprint, FingerprintAlgorithm, SrtpCrypto, SrtpKeyingMaterial, SrtpSuite};
+use srtp::CryptoPolicy;
 use std::{
     io::{self},
     net::SocketAddr,
@@ -18,7 +20,7 @@ use stun_types::{
 };
 use tokio::{net::UdpSocket, select};
 
-pub struct DirectDtlsSrtpTransport {
+pub struct DirectSrtpTransport {
     rtp_socket: Arc<UdpSocket>,
     rtcp_socket: Option<Arc<UdpSocket>>,
 
@@ -29,21 +31,105 @@ pub struct DirectDtlsSrtpTransport {
 }
 
 enum State {
-    Connecting(DtlsSrtpConnector),
-    Accepting(DtlsSrtpAcceptor),
-    Established {
-        inbound: srtp::openssl::InboundSession,
-        outbound: srtp::openssl::OutboundSession,
+    DtlsConnecting(DtlsSrtpConnector),
+    DtlsAccepting(DtlsSrtpAcceptor),
+    SrtpEstablished {
+        inbound: srtp::Session,
+        outbound: srtp::Session,
     },
 }
 
+#[derive(Clone, Copy)]
 pub enum DtlsSetup {
     Connect,
     Accept,
 }
 
-impl DirectDtlsSrtpTransport {
-    pub async fn new(
+impl DirectSrtpTransport {
+    pub async fn sdes_srtp(
+        remote_rtp_address: SocketAddr,
+        remote_rtcp_address: Option<SocketAddr>,
+        remote_crypto: &[SrtpCrypto],
+    ) -> io::Result<(Self, Vec<SrtpCrypto>)> {
+        let rtp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+
+        // TODO: choose ports from a port range, and ideally have rtp and rtcp have adjacent ports
+
+        let rtcp_socket = if remote_rtcp_address.is_some() {
+            Some(Arc::new(UdpSocket::bind("0.0.0.0:0").await?))
+        } else {
+            None
+        };
+
+        // Find best suite to use
+        use sdp_types::SrtpSuite::*;
+
+        let choice1 = remote_crypto
+            .iter()
+            .find(|c| c.suite == AES_256_CM_HMAC_SHA1_80 && !c.keys.is_empty());
+        let choice2 = remote_crypto
+            .iter()
+            .find(|c| c.suite == AES_256_CM_HMAC_SHA1_32 && !c.keys.is_empty());
+        let choice3 = remote_crypto
+            .iter()
+            .find(|c| c.suite == AES_CM_128_HMAC_SHA1_80 && !c.keys.is_empty());
+        let choice4 = remote_crypto
+            .iter()
+            .find(|c| c.suite == AES_CM_128_HMAC_SHA1_32 && !c.keys.is_empty());
+
+        let crypto = choice1
+            .or(choice2)
+            .or(choice3)
+            .or(choice4)
+            .ok_or_else(|| io::Error::other("No compatible srtp suite found"))?;
+
+        let recv_key = BASE64_STANDARD
+            .decode(&crypto.keys[0].key_and_salt)
+            .map_err(io::Error::other)?;
+
+        let suite = srtp_suite_to_policy(&crypto.suite).unwrap();
+
+        let mut send_key = vec![0u8; suite.key_len()];
+        rand::thread_rng().fill_bytes(&mut send_key);
+
+        let inbound = srtp::Session::with_inbound_template(srtp::StreamPolicy {
+            rtp: suite,
+            rtcp: suite,
+            key: &recv_key,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let outbound = srtp::Session::with_outbound_template(srtp::StreamPolicy {
+            rtp: suite,
+            rtcp: suite,
+            key: &send_key,
+            ..Default::default()
+        })
+        .unwrap();
+
+        Ok((
+            Self {
+                rtp_socket,
+                rtcp_socket,
+                remote_rtp_address,
+                remote_rtcp_address,
+                state: State::SrtpEstablished { inbound, outbound },
+            },
+            vec![SrtpCrypto {
+                tag: crypto.tag,
+                suite: crypto.suite.clone(),
+                keys: vec![SrtpKeyingMaterial {
+                    key_and_salt: BASE64_STANDARD.encode(&send_key).into(),
+                    lifetime: None,
+                    mki: None,
+                }],
+                params: vec![],
+            }],
+        ))
+    }
+
+    pub async fn dtls_srtp(
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: Option<SocketAddr>,
         remote_fingerprints: Vec<Fingerprint>,
@@ -61,7 +147,7 @@ impl DirectDtlsSrtpTransport {
 
         let mut fingerprint = vec![];
         let state = match setup {
-            DtlsSetup::Connect => State::Connecting(DtlsSrtpConnector::new(
+            DtlsSetup::Connect => State::DtlsConnecting(DtlsSrtpConnector::new(
                 rtp_socket.clone(),
                 remote_rtp_address,
                 remote_fingerprints
@@ -72,7 +158,7 @@ impl DirectDtlsSrtpTransport {
             DtlsSetup::Accept => {
                 let acceptor = DtlsSrtpAcceptor::new(rtp_socket.clone(), remote_rtp_address)?;
                 fingerprint.push(acceptor.fingerprint());
-                State::Accepting(acceptor)
+                State::DtlsAccepting(acceptor)
             }
         };
 
@@ -99,20 +185,28 @@ impl DirectDtlsSrtpTransport {
     }
 }
 
-impl RtpTransport for DirectDtlsSrtpTransport {
+impl RtpTransport for DirectSrtpTransport {
     async fn recv(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
         // Loop until the DTLS-SRTP session has been established
         let inbound = loop {
             match &mut self.state {
-                State::Connecting(connector) => {
+                State::DtlsConnecting(connector) => {
                     let (inbound, outbound) = connector.connect().await?;
-                    self.state = State::Established { inbound, outbound }
+
+                    self.state = State::SrtpEstablished {
+                        inbound: inbound.into_session(),
+                        outbound: outbound.into_session(),
+                    }
                 }
-                State::Accepting(acceptor) => {
+                State::DtlsAccepting(acceptor) => {
                     let (inbound, outbound) = acceptor.accept().await?;
-                    self.state = State::Established { inbound, outbound }
+
+                    self.state = State::SrtpEstablished {
+                        inbound: inbound.into_session(),
+                        outbound: outbound.into_session(),
+                    }
                 }
-                State::Established { inbound, .. } => break inbound,
+                State::SrtpEstablished { inbound, .. } => break inbound,
             };
         };
 
@@ -164,7 +258,7 @@ impl RtpTransport for DirectDtlsSrtpTransport {
     }
 
     async fn send_rtp(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
-        let State::Established { outbound, .. } = &mut self.state else {
+        let State::SrtpEstablished { outbound, .. } = &mut self.state else {
             return Err(io::Error::other("dtls-srtp not ready"));
         };
 
@@ -178,33 +272,27 @@ impl RtpTransport for DirectDtlsSrtpTransport {
     }
 
     async fn send_rtcp(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
-        let State::Established { outbound, .. } = &mut self.state else {
+        let State::SrtpEstablished { outbound, .. } = &mut self.state else {
             return Err(io::Error::other("dtls-srtp not ready"));
         };
 
-        if let Some(rtcp_socket) = &self.rtcp_socket {
-            outbound.protect_rtcp(buf).map_err(io::Error::other)?;
+        outbound.protect_rtcp(buf).map_err(io::Error::other)?;
 
-            rtcp_socket
-                .send_to(
-                    buf,
-                    self.remote_rtcp_address.unwrap_or(self.remote_rtp_address),
-                )
-                .await?;
+        let socket = self.rtcp_socket.as_ref().unwrap_or(&self.rtp_socket);
+        let target = self.remote_rtcp_address.unwrap_or(self.remote_rtp_address);
 
-            Ok(())
-        } else {
-            self.send_rtp(buf).await
-        }
+        socket.send_to(buf, target).await?;
+
+        Ok(())
     }
 
     fn is_ready(&self) -> bool {
-        matches!(self.state, State::Established { .. })
+        matches!(self.state, State::SrtpEstablished { .. })
     }
 }
 
 async fn try_recv(
-    inbound: &mut InboundSession,
+    inbound: &mut srtp::Session,
     socket: &UdpSocket,
     buf: &mut Vec<u8>,
 ) -> io::Result<bool> {
@@ -266,5 +354,19 @@ fn to_ssl_digest(algo: &FingerprintAlgorithm) -> Option<MessageDigest> {
         FingerprintAlgorithm::MD5 => Some(MessageDigest::md5()),
         FingerprintAlgorithm::MD2 => None,
         FingerprintAlgorithm::Other(..) => None,
+    }
+}
+
+fn srtp_suite_to_policy(suite: &SrtpSuite) -> Option<CryptoPolicy> {
+    match suite {
+        SrtpSuite::AES_CM_128_HMAC_SHA1_80 => Some(CryptoPolicy::aes_cm_128_hmac_sha1_80()),
+        SrtpSuite::AES_CM_128_HMAC_SHA1_32 => Some(CryptoPolicy::aes_cm_128_hmac_sha1_32()),
+        SrtpSuite::AES_192_CM_HMAC_SHA1_80 => Some(CryptoPolicy::aes_cm_192_hmac_sha1_80()),
+        SrtpSuite::AES_192_CM_HMAC_SHA1_32 => Some(CryptoPolicy::aes_cm_192_hmac_sha1_32()),
+        SrtpSuite::AES_256_CM_HMAC_SHA1_80 => Some(CryptoPolicy::aes_cm_256_hmac_sha1_80()),
+        SrtpSuite::AES_256_CM_HMAC_SHA1_32 => Some(CryptoPolicy::aes_cm_256_hmac_sha1_32()),
+        SrtpSuite::AEAD_AES_128_GCM => Some(CryptoPolicy::aes_gcm_128_16_auth()),
+        SrtpSuite::AEAD_AES_256_GCM => Some(CryptoPolicy::aes_gcm_256_16_auth()),
+        _ => None,
     }
 }
