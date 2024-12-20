@@ -2,9 +2,9 @@ use crate::RtpPacket;
 use std::{
     cmp,
     collections::{btree_map::Entry, BTreeMap},
+    fmt,
 };
 
-#[derive(Debug)]
 pub(crate) struct JitterBuffer {
     /// maximum number of entries
     max_entries: usize,
@@ -20,6 +20,19 @@ pub(crate) struct JitterBuffer {
     pub(crate) received: u64,
     /// num packets not received
     pub(crate) lost: u64,
+}
+
+impl fmt::Debug for JitterBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JitterBuffer")
+            .field("max_entries", &self.max_entries)
+            .field("entries", &"self.entries.len()")
+            .field("state", &self.state)
+            .field("dropped", &self.dropped)
+            .field("received", &self.received)
+            .field("lost", &self.lost)
+            .finish()
+    }
 }
 
 impl Default for JitterBuffer {
@@ -46,7 +59,6 @@ struct State {
     last_timestamp: u64,
 }
 
-#[derive(Debug)]
 struct JbEntry {
     timestamp: u64,
     packet: RtpPacket,

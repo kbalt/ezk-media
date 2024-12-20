@@ -1,0 +1,27 @@
+[package]
+name = "ezk-session"
+version = "0.1.0"
+description = "SDP based media sessions, suitable for SIP applications & more"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ezk.workspace = true
+ezk-rtp.workspace = true
+# stun-types = "0.1"
+stun-types = { git = "https://github.com/kbalt/ezk", package = "ezk-stun-types" }
+# sdp-types = { package = "ezk-sdp-types", version = "0.4" }
+sdp-types = { git = "https://github.com/kbalt/ezk", package = "ezk-sdp-types" }
+log = "0.4"
+thiserror = "2"
+rand = "0.8"
+tokio = { version = "1", features = ["net"] }
+futures-util = "0.3"
+bytesstr = "1.0.2"
+slotmap = "1.0.7"
+srtp = "0.7"
+openssl = "0.10"
+tokio-openssl = "0.6"
+base64 = "0.22"
