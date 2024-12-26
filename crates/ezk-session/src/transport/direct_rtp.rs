@@ -1,21 +1,24 @@
-use super::RtpTransport;
-use std::{io, net::SocketAddr, sync::Arc};
-use stun_types::{
-    attributes::XorMappedAddress,
-    builder::MessageBuilder,
-    header::{Class, Method},
-    is_stun_message,
-    parse::ParsedMessage,
-    IsStunMessageInfo,
-};
+use super::{RtpTransport, WhichTransport, RECV_BUFFER_SIZE};
+use std::{io, net::SocketAddr};
 use tokio::{net::UdpSocket, select};
 
 pub struct DirectRtpTransport {
-    rtp_socket: Arc<UdpSocket>,
-    rtcp_socket: Option<Arc<UdpSocket>>,
+    rtp_socket: Socket,
+    rtcp_socket: Option<Socket>,
+}
 
-    remote_rtp_address: SocketAddr,
-    remote_rtcp_address: Option<SocketAddr>,
+struct Socket {
+    socket: UdpSocket,
+    recv_buf: Vec<u8>,
+    target: SocketAddr,
+}
+
+impl Socket {
+    async fn recv(&mut self) -> io::Result<SocketAddr> {
+        let (len, source) = self.socket.recv_from(&mut self.recv_buf).await?;
+        self.recv_buf.truncate(len);
+        Ok(source)
+    }
 }
 
 impl DirectRtpTransport {
@@ -24,10 +27,19 @@ impl DirectRtpTransport {
         remote_rtcp_address: Option<SocketAddr>,
     ) -> io::Result<Self> {
         // TODO: choose ports from a port range, and ideally have rtp and rtcp have adjacent ports
-        let rtp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
-        let rtcp_socket = if remote_rtcp_address.is_some() {
-            Some(Arc::new(UdpSocket::bind("0.0.0.0:0").await?))
+        let rtp_socket = Socket {
+            socket: UdpSocket::bind("0.0.0.0:0").await?,
+            recv_buf: vec![0u8; RECV_BUFFER_SIZE],
+            target: remote_rtp_address,
+        };
+
+        let rtcp_socket = if let Some(remote_rtcp_address) = remote_rtcp_address {
+            Some(Socket {
+                socket: UdpSocket::bind("0.0.0.0:0").await?,
+                recv_buf: vec![0u8; RECV_BUFFER_SIZE],
+                target: remote_rtcp_address,
+            })
         } else {
             None
         };
@@ -35,59 +47,57 @@ impl DirectRtpTransport {
         Ok(Self {
             rtp_socket,
             rtcp_socket,
-            remote_rtp_address,
-            remote_rtcp_address,
         })
     }
 
     pub fn local_rtp_port(&self) -> u16 {
-        self.rtp_socket.local_addr().unwrap().port()
+        self.rtp_socket.socket.local_addr().unwrap().port()
     }
 
     pub fn local_rtcp_port(&self) -> Option<u16> {
         let rtcp_socket = self.rtcp_socket.as_ref()?;
 
-        Some(rtcp_socket.local_addr().unwrap().port())
+        Some(rtcp_socket.socket.local_addr().unwrap().port())
     }
 }
 
 impl RtpTransport for DirectRtpTransport {
-    async fn recv(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
-        if let Some(rtcp_socket) = &self.rtcp_socket {
+    type Event = WhichTransport;
+
+    async fn poll_event(&mut self) -> io::Result<Self::Event> {
+        if let Some(rtcp_socket) = &mut self.rtcp_socket {
             // Poll both rtp_socket & rtcp_socket for readyness and try_read once available
-            loop {
-                let result = select! {
-                    result = self.rtp_socket.readable() => {
-                        result?;
-                        try_recv(&self.rtp_socket, buf).await
-                    },
-                    result = rtcp_socket.readable() => {
-                        result?;
-                        try_recv(rtcp_socket, buf).await
-                    },
-                };
-
-                if let Some(len) = result? {
-                    buf.truncate(len);
-                    return Ok(());
-                }
+            select! {
+                result = self.rtp_socket.recv() => {
+                    result?;
+                    return Ok(WhichTransport::Rtp);
+                },
+                result = rtcp_socket.recv() => {
+                    result?;
+                    return Ok(WhichTransport::Rtcp);
+                },
             }
         }
 
-        loop {
-            // No rtcp_socket, just read from the rtp_socket
-            let (len, remote) = self.rtp_socket.recv_from(buf).await?;
+        // No rtcp_socket, just read from the rtp_socket
+        self.rtp_socket.recv().await?;
 
-            if !check_for_stun_binding_request(&self.rtp_socket, buf, remote).await? {
-                buf.truncate(len);
-                return Ok(());
-            }
-        }
+        Ok(WhichTransport::Rtp)
+    }
+
+    async fn handle_event(&mut self, event: Self::Event) -> io::Result<Option<&[u8]>> {
+        let socket = match event {
+            WhichTransport::Rtp => &mut self.rtp_socket,
+            WhichTransport::Rtcp => self.rtcp_socket.as_mut().unwrap(),
+        };
+
+        Ok(Some(&socket.recv_buf[..]))
     }
 
     async fn send_rtp(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
         self.rtp_socket
-            .send_to(buf, self.remote_rtp_address)
+            .socket
+            .send_to(buf, self.rtp_socket.target)
             .await?;
 
         Ok(())
@@ -95,12 +105,7 @@ impl RtpTransport for DirectRtpTransport {
 
     async fn send_rtcp(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
         if let Some(rtcp_socket) = &self.rtcp_socket {
-            rtcp_socket
-                .send_to(
-                    buf,
-                    self.remote_rtcp_address.unwrap_or(self.remote_rtp_address),
-                )
-                .await?;
+            rtcp_socket.socket.send_to(buf, rtcp_socket.target).await?;
 
             Ok(())
         } else {
@@ -113,42 +118,10 @@ impl RtpTransport for DirectRtpTransport {
     }
 }
 
-async fn try_recv(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<Option<usize>> {
-    let (len, remote) = match socket.try_recv_from(buf) {
-        Ok((len, remote)) => (len, remote),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-        Err(e) => return Err(e),
-    };
-
-    if check_for_stun_binding_request(socket, buf, remote).await? {
-        Ok(None)
-    } else {
-        Ok(Some(len))
+fn try_recv(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+    match socket.try_recv_from(buf) {
+        Ok((len, remote)) => Ok(Some((len, remote))),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e),
     }
-}
-
-async fn check_for_stun_binding_request(
-    socket: &UdpSocket,
-    buf: &[u8],
-    remote: SocketAddr,
-) -> io::Result<bool> {
-    let len = if let IsStunMessageInfo::Yes { len } = is_stun_message(buf) {
-        len
-    } else {
-        return Ok(false);
-    };
-
-    let Ok(e) = ParsedMessage::parse(buf[..len].to_vec()) else {
-        return Ok(false);
-    };
-
-    if e.class == Class::Request && e.method == Method::Binding {
-        let mut msg = MessageBuilder::new(Class::Success, Method::Binding, e.tsx_id);
-        msg.add_attr(&XorMappedAddress(remote)).unwrap();
-        let msg = msg.finish();
-        socket.send_to(&msg, remote).await?;
-        return Ok(true);
-    }
-
-    Ok(false)
 }

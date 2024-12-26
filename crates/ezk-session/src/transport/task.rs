@@ -1,10 +1,11 @@
-use super::{RtpTransport, RECV_BUFFER_SIZE};
+use super::{RtpTransport, WhichTransport, RECV_BUFFER_SIZE};
 use crate::{ActiveMediaId, RTP_MID_HDREXT_ID};
 use bytesstr::BytesStr;
 use ezk_rtp::rtcp_types::{self, Compound};
 use ezk_rtp::{parse_extensions, RtpExtensionsWriter, RtpPacket, RtpSession};
 use std::collections::HashMap;
 use std::future::{pending, poll_fn};
+use std::net::SocketAddr;
 use std::task::Poll;
 use std::time::Duration;
 use std::{fmt, io};
@@ -156,19 +157,16 @@ enum TaskState {
 impl<T: RtpTransport> TransportTask<T> {
     async fn run(mut self) {
         let mut rtcp_interval = interval_at(
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(5000),
             Duration::from_secs(5),
         );
 
-        let mut recv_buf = vec![0u8; RECV_BUFFER_SIZE];
-
         // TODO: expand the jitterbuffer API to know when to poll
-        let mut poll_jitterbuffer_interval = interval(Duration::from_millis(10));
+        let mut poll_jitterbuffer_interval = interval(Duration::from_secs(100));
 
         while let TaskState::Ok = self.state {
             // Reset send & receive buffers
             self.encode_buf.clear();
-            recv_buf.resize(RECV_BUFFER_SIZE, 0);
 
             select! {
                 // Wait for external commands
@@ -185,8 +183,8 @@ impl<T: RtpTransport> TransportTask<T> {
                 // Send out RTCP packets in a fixed interval
                 _ = rtcp_interval.tick() => self.send_rtcp().await,
 
-                // Receive RTP or RTCP packets from the rtp-socket
-                result = self.transport.recv(&mut recv_buf) => self.handle_recv(&recv_buf, result),
+                // Receive event from transport & handle it
+                result = self.transport.poll_event() => self.handle_recv(result).await,
             }
         }
 
@@ -316,11 +314,24 @@ impl<T: RtpTransport> TransportTask<T> {
         }
     }
 
-    fn handle_recv(&mut self, buf: &[u8], result: io::Result<()>) {
-        if let Err(e) = result {
-            log::warn!("Failed to read from udpsocket, {e}");
-            self.state = TaskState::ExitErr;
-            return;
+    async fn handle_recv(&mut self, result: io::Result<T::Event>) {
+        let event = match result {
+            Ok(event) => event,
+            Err(e) => {
+                log::warn!("Failed to recv from transport, {e}");
+                self.state = TaskState::ExitErr;
+                return;
+            }
+        };
+
+        let buf = match self.transport.handle_event(event).await {
+            Ok(Some(buf)) => buf,
+            Ok(None) => return,
+            Err(e) => {
+                log::warn!("Failed to handle_recv, {e}");
+                self.state = TaskState::ExitErr;
+                return;
+            }
         };
 
         if buf.len() < 2 {
@@ -340,7 +351,7 @@ impl<T: RtpTransport> TransportTask<T> {
                 }
             };
 
-            self.handle_rtcp_compound(rtcp_compound);
+            // self.handle_rtcp_compound(rtcp_compound);
         } else {
             // This is most likely a RTP packet
             let rtp_packet = match RtpPacket::parse(buf) {
@@ -356,6 +367,7 @@ impl<T: RtpTransport> TransportTask<T> {
     }
 
     fn handle_rtcp_compound(&mut self, rtcp_compound: Compound<'_>) {
+        println!("Received RTCP");
         for pkg in rtcp_compound {
             let packet = match pkg {
                 Ok(packet) => packet,

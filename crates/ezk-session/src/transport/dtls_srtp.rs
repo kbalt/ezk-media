@@ -5,7 +5,7 @@ use openssl::{
     hash::MessageDigest,
     pkey::{PKey, Private},
     rsa::Rsa,
-    ssl::{Ssl, SslAcceptor, SslMethod},
+    ssl::{ErrorCode, Ssl, SslAcceptor, SslMethod, SslStream, SslVerifyMode},
     x509::{
         extension::{BasicConstraints, KeyUsage, SubjectKeyIdentifier},
         X509NameBuilder, X509,
@@ -14,24 +14,28 @@ use openssl::{
 use sdp_types::{Fingerprint, FingerprintAlgorithm};
 use srtp::openssl::Config;
 use std::{
-    io,
-    net::SocketAddr,
+    collections::VecDeque,
+    io::{self, Cursor, Read, Write},
     pin::Pin,
-    sync::{Arc, OnceLock},
-    task::{Context, Poll},
+    sync::OnceLock,
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::UdpSocket,
-};
-use tokio_openssl::SslStream;
 
-pub(crate) struct DtlsSrtpAcceptor {
-    stream: Pin<Box<SslStream<UdpAsyncRW>>>,
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DtlsSetup {
+    Accept,
+    Connect,
 }
 
-impl DtlsSrtpAcceptor {
-    pub(crate) fn new(socket: Arc<UdpSocket>, remote_addr: SocketAddr) -> io::Result<Self> {
+pub(crate) struct DtlsSrtpSession {
+    stream: Pin<Box<SslStream<IoQueue>>>,
+    state: DtlsSetup,
+}
+
+impl DtlsSrtpSession {
+    pub(crate) fn new(
+        fingerprints: Vec<(MessageDigest, Vec<u8>)>,
+        state: DtlsSetup,
+    ) -> io::Result<Self> {
         let (cert, pkey) = get_ca_cert();
 
         let mut ctx = SslAcceptor::mozilla_modern(SslMethod::dtls())?;
@@ -44,15 +48,42 @@ impl DtlsSrtpAcceptor {
         let mut ssl = Ssl::new(&ctx)?;
         ssl.set_mtu(1200)?;
 
-        Ok(Self {
+        ssl.set_verify_callback(
+            SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+            move |_, x509_store| {
+                let Some(certificate) = x509_store.current_cert() else {
+                    return false;
+                };
+
+                for (digest, fingerprint) in &fingerprints {
+                    let Ok(peer_fingerprint) = certificate.digest(*digest) else {
+                        continue;
+                    };
+
+                    if peer_fingerprint.as_ref() == fingerprint {
+                        return true;
+                    }
+                }
+
+                false
+            },
+        );
+
+        let mut this = Self {
             stream: Box::pin(SslStream::new(
                 ssl,
-                UdpAsyncRW {
-                    socket,
-                    target: remote_addr,
+                IoQueue {
+                    to_read: None,
+                    out: VecDeque::new(),
                 },
             )?),
-        })
+            state,
+        };
+
+        // Put initial handshake into the IoQueue
+        assert!(this.handshake()?.is_none());
+
+        Ok(this)
     }
 
     pub(crate) fn fingerprint(&self) -> Fingerprint {
@@ -71,129 +102,75 @@ impl DtlsSrtpAcceptor {
         }
     }
 
-    pub async fn accept(
-        &mut self,
-    ) -> io::Result<(
-        srtp::openssl::InboundSession,
-        srtp::openssl::OutboundSession,
-    )> {
-        self.stream
-            .as_mut()
-            .accept()
-            .await
-            .map_err(io::Error::other)?;
-
-        let (inbound, outbound) =
-            srtp::openssl::session_pair(self.stream.ssl(), Config::default()).unwrap();
-
-        Ok((inbound, outbound))
-    }
-}
-
-pub(crate) struct DtlsSrtpConnector {
-    stream: Pin<Box<SslStream<UdpAsyncRW>>>,
-    fingerprints: Vec<(MessageDigest, Vec<u8>)>,
-}
-
-impl DtlsSrtpConnector {
-    pub(crate) fn new(
-        socket: Arc<UdpSocket>,
-        remote_addr: SocketAddr,
-        fingerprints: Vec<(MessageDigest, Vec<u8>)>,
-    ) -> io::Result<Self> {
-        let (cert, pkey) = get_ca_cert();
-
-        let mut ctx = SslAcceptor::mozilla_modern(SslMethod::dtls())?;
-        ctx.set_tlsext_use_srtp(srtp::openssl::SRTP_PROFILE_NAMES)?;
-        ctx.set_private_key(pkey)?;
-        ctx.set_certificate(cert)?;
-        ctx.check_private_key()?;
-        let ctx = ctx.build().into_context();
-
-        let mut ssl = Ssl::new(&ctx)?;
-        ssl.set_mtu(1200)?;
-
-        Ok(Self {
-            stream: Box::pin(SslStream::new(
-                ssl,
-                UdpAsyncRW {
-                    socket,
-                    target: remote_addr,
-                },
-            )?),
-            fingerprints,
-        })
+    pub(crate) fn receive(&mut self, dgram: Vec<u8>) {
+        assert!(self.stream.get_mut().to_read.is_none());
+        self.stream.get_mut().to_read = Some(Cursor::new(dgram));
     }
 
-    pub async fn connect(
+    pub(crate) fn handshake(
         &mut self,
-    ) -> io::Result<(
-        srtp::openssl::InboundSession,
-        srtp::openssl::OutboundSession,
-    )> {
-        self.stream
-            .as_mut()
-            .connect()
-            .await
-            .map_err(io::Error::other)?;
+    ) -> io::Result<
+        Option<(
+            srtp::openssl::InboundSession,
+            srtp::openssl::OutboundSession,
+        )>,
+    > {
+        let result = match self.state {
+            DtlsSetup::Connect => self.stream.as_mut().connect(),
+            DtlsSetup::Accept => self.stream.as_mut().accept(),
+        };
 
-        let peer_cert = self
-            .stream
-            .ssl()
-            .peer_certificate()
-            .ok_or_else(|| io::Error::other("no peer certificate after connect"))?;
-
-        for (digest, fingerprint) in &self.fingerprints {
-            let peer_fingerprint = peer_cert.digest(*digest)?;
-
-            if peer_fingerprint.as_ref() != fingerprint {
-                return Err(io::Error::other(
-                    "fingerprint mismatch when establishing dtls connection",
-                ));
+        if let Err(e) = result {
+            if e.code() == ErrorCode::WANT_READ {
+                return Ok(None);
+            } else {
+                return Err(io::Error::other(e));
             }
         }
 
         let (inbound, outbound) =
             srtp::openssl::session_pair(self.stream.ssl(), Config::default()).unwrap();
 
-        Ok((inbound, outbound))
+        Ok(Some((inbound, outbound)))
+    }
+
+    pub(crate) fn pop_to_send(&mut self) -> Option<Vec<u8>> {
+        self.stream.get_mut().out.pop_front()
     }
 }
 
-#[derive(Debug)]
-struct UdpAsyncRW {
-    socket: Arc<UdpSocket>,
-    target: SocketAddr,
+struct IoQueue {
+    to_read: Option<Cursor<Vec<u8>>>,
+    out: VecDeque<Vec<u8>>,
 }
 
-impl AsyncRead for UdpAsyncRW {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        self.socket.poll_recv_from(cx, buf).map_ok(|source| {
-            // TODO: delete me?
-            self.target = source;
-        })
+impl Read for IoQueue {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        println!("IO QUEUE READ {}", self.to_read.is_some());
+
+        let Some(to_read) = &mut self.to_read else {
+            return Err(io::ErrorKind::WouldBlock.into());
+        };
+
+        let result = to_read.read(buf)?;
+
+        if to_read.position() == to_read.get_ref().len() as u64 {
+            self.to_read = None;
+        }
+
+        Ok(result)
     }
 }
 
-impl AsyncWrite for UdpAsyncRW {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        self.socket.poll_send_to(cx, buf, self.target)
+impl Write for IoQueue {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        println!("IO QUEUE WRITE");
+        self.out.push_back(buf.to_vec());
+        Ok(buf.len())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Poll::Ready(Ok(()))
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

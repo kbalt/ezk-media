@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::{net::lookup_host, sync::mpsc, try_join};
 use transport::{
-    DirectRtpTransport, DirectSrtpTransport, DtlsSetup, IdentifyableBy, TransportTaskHandle,
+    DirectDtlsSrtpTransport, DirectRtpTransport, DtlsSetup, IdentifyableBy, TransportTaskHandle,
 };
 
 mod codecs;
@@ -374,14 +374,16 @@ impl SdpSession {
                     .find(|extmap| extmap.uri == RTP_MID_HDREXT)
                     .map(|extmap| extmap.id);
 
+                // TODO: how to properly communicate rtcp-mux on our side
+                let remote_rtcp_address =
+                    Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux);
+
                 let transport = match remote_media_desc.media.proto {
                     TransportProtocol::RtpAvp => {
                         // Create direct RTP transport
-                        let transport = DirectRtpTransport::new(
-                            remote_rtp_address,
-                            Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux),
-                        )
-                        .await?;
+                        let transport =
+                            DirectRtpTransport::new(remote_rtp_address, remote_rtcp_address)
+                                .await?;
 
                         Transport {
                             local_rtp_port: transport.local_rtp_port(),
@@ -391,20 +393,21 @@ impl SdpSession {
                         }
                     }
                     TransportProtocol::RtpSavp => {
-                        // Create direct SRTP transport
-                        let (transport, crypto) = DirectSrtpTransport::sdes_srtp(
-                            remote_rtp_address,
-                            Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux),
-                            &remote_media_desc.crypto,
-                        )
-                        .await?;
+                        // // Create direct SRTP transport
+                        // let (transport, crypto) = DirectDtlsSrtpTransport::sdes_srtp(
+                        //     remote_rtp_address,
+                        //     remote_rtcp_address,
+                        //     &remote_media_desc.crypto,
+                        // )
+                        // .await?;
 
-                        Transport {
-                            local_rtp_port: transport.local_rtp_port(),
-                            local_rtcp_port: transport.local_rtcp_port(),
-                            handle: TransportTaskHandle::new(transport, mid_rtp_id),
-                            kind: TransportKind::SdesSrtp(crypto),
-                        }
+                        // Transport {
+                        //     local_rtp_port: transport.local_rtp_port(),
+                        //     local_rtcp_port: transport.local_rtcp_port(),
+                        //     handle: TransportTaskHandle::new(transport, mid_rtp_id),
+                        //     kind: TransportKind::SdesSrtp(crypto),
+                        // }
+                        todo!()
                     }
                     TransportProtocol::UdpTlsRtpSavp => {
                         let setup = match remote_media_desc.setup {
@@ -420,9 +423,9 @@ impl SdpSession {
                             }
                         };
 
-                        let (transport, fingerprint) = DirectSrtpTransport::dtls_srtp(
+                        let (transport, fingerprint) = DirectDtlsSrtpTransport::new(
                             remote_rtp_address,
-                            Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux),
+                            remote_rtcp_address,
                             remote_media_desc.fingerprint.clone(),
                             setup,
                         )

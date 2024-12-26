@@ -1,7 +1,4 @@
-use super::{
-    dtls_srtp::{DtlsSrtpAcceptor, DtlsSrtpConnector},
-    PacketKind, RtpTransport, RECV_BUFFER_SIZE,
-};
+use super::{dtls_srtp::DtlsSrtpSession, PacketKind, RtpTransport, RECV_BUFFER_SIZE};
 use base64::{prelude::BASE64_STANDARD, Engine};
 use openssl::hash::MessageDigest;
 use rand::RngCore;
@@ -18,32 +15,20 @@ use stun_types::{
     header::{Class, Method},
     parse::ParsedMessage,
 };
-use tokio::{net::UdpSocket, select};
+use tokio::net::UdpSocket;
 
 pub struct DirectSrtpTransport {
-    rtp_socket: Arc<UdpSocket>,
-    rtcp_socket: Option<Arc<UdpSocket>>,
-
-    remote_rtp_address: SocketAddr,
-    remote_rtcp_address: Option<SocketAddr>,
-
-    state: State,
+    rtp_socket: Socket,
+    rtcp_socket: Option<Socket>,
 }
 
-enum State {
-    DtlsConnecting(DtlsSrtpConnector),
-    DtlsAccepting(DtlsSrtpAcceptor),
-    SrtpEstablished {
-        inbound: srtp::Session,
-        outbound: srtp::Session,
-    },
+struct Socket {
+    socket: UdpSocket,
+    dtls: DtlsSrtpSession,
+    srtp: Option<(srtp::Session, srtp::Session)>,
+    target: SocketAddr,
 }
 
-#[derive(Clone, Copy)]
-pub enum DtlsSetup {
-    Connect,
-    Accept,
-}
 
 impl DirectSrtpTransport {
     pub async fn sdes_srtp(
@@ -51,12 +36,12 @@ impl DirectSrtpTransport {
         remote_rtcp_address: Option<SocketAddr>,
         remote_crypto: &[SrtpCrypto],
     ) -> io::Result<(Self, Vec<SrtpCrypto>)> {
-        let rtp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
         // TODO: choose ports from a port range, and ideally have rtp and rtcp have adjacent ports
 
         let rtcp_socket = if remote_rtcp_address.is_some() {
-            Some(Arc::new(UdpSocket::bind("0.0.0.0:0").await?))
+            Some(UdpSocket::bind("0.0.0.0:0").await?)
         } else {
             None
         };
@@ -110,11 +95,18 @@ impl DirectSrtpTransport {
 
         Ok((
             Self {
-                rtp_socket,
-                rtcp_socket,
-                remote_rtp_address,
-                remote_rtcp_address,
-                state: State::SrtpEstablished { inbound, outbound },
+                rtp_socket: Socket {
+                    socket: rtp_socket,
+                    dtls: None,
+                    srtp: Some((inbound, outbound)),
+                    target: remote_rtp_address,
+                },
+                rtcp_socket: remote_rtcp_address.map(|remote_rtcp_address| Socket {
+                    socket: rtcp_socket.unwrap(),
+                    dtls: None,
+                    srtp: None,
+                    target: remote_rtcp_address,
+                }),
             },
             vec![SrtpCrypto {
                 tag: crypto.tag,
@@ -135,122 +127,143 @@ impl DirectSrtpTransport {
         remote_fingerprints: Vec<Fingerprint>,
         setup: DtlsSetup,
     ) -> io::Result<(Self, Vec<Fingerprint>)> {
-        let rtp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let remote_fingerprints: Vec<_> = remote_fingerprints
+            .into_iter()
+            .filter_map(|e| Some((to_ssl_digest(&e.algorithm)?, e.fingerprint)))
+            .collect();
 
-        // TODO: choose ports from a port range, and ideally have rtp and rtcp have adjacent ports
+        // Setup RTP socket
+        let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let rtp_dtls = DtlsSrtpSession::new(remote_fingerprints.clone(), setup)?;
+        let fingerprint = vec![rtp_dtls.fingerprint()];
 
-        let rtcp_socket = if remote_rtcp_address.is_some() {
-            Some(Arc::new(UdpSocket::bind("0.0.0.0:0").await?))
-        } else {
-            None
+        let rtp_socket = Socket {
+            socket: rtp_socket,
+            state: rtp_state,
+            target: remote_rtp_address,
         };
 
-        let mut fingerprint = vec![];
-        let state = match setup {
-            DtlsSetup::Connect => State::DtlsConnecting(DtlsSrtpConnector::new(
-                rtp_socket.clone(),
-                remote_rtp_address,
-                remote_fingerprints
-                    .into_iter()
-                    .filter_map(|e| Some((to_ssl_digest(&e.algorithm)?, e.fingerprint)))
-                    .collect(),
-            )?),
-            DtlsSetup::Accept => {
-                let acceptor = DtlsSrtpAcceptor::new(rtp_socket.clone(), remote_rtp_address)?;
-                fingerprint.push(acceptor.fingerprint());
-                State::DtlsAccepting(acceptor)
-            }
+        // Setup RTCP socket if required
+        let rtcp_socket = if let Some(remote_rtcp_address) = remote_rtcp_address {
+            let rtcp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+            let rtcp_acceptor = DtlsSrtpSession::new(remote_fingerprints, setup)?;
+            let rtcp_state = State::DtlsHandshaking(rtcp_acceptor);
+
+            Some(Socket {
+                socket: rtcp_socket,
+                state: rtcp_state,
+                target: remote_rtcp_address,
+            })
+        } else {
+            None
         };
 
         Ok((
             Self {
                 rtp_socket,
                 rtcp_socket,
-                remote_rtp_address,
-                remote_rtcp_address,
-                state,
             },
             fingerprint,
         ))
     }
 
     pub fn local_rtp_port(&self) -> u16 {
-        self.rtp_socket.local_addr().unwrap().port()
+        self.rtp_socket.socket.local_addr().unwrap().port()
     }
 
     pub fn local_rtcp_port(&self) -> Option<u16> {
         let rtcp_socket = self.rtcp_socket.as_ref()?;
-
-        Some(rtcp_socket.local_addr().unwrap().port())
+        Some(rtcp_socket.socket.local_addr().unwrap().port())
     }
 }
 
 impl RtpTransport for DirectSrtpTransport {
     async fn recv(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
-        // Loop until the DTLS-SRTP session has been established
-        let inbound = loop {
-            match &mut self.state {
-                State::DtlsConnecting(connector) => {
-                    let (inbound, outbound) = connector.connect().await?;
-
-                    self.state = State::SrtpEstablished {
-                        inbound: inbound.into_session(),
-                        outbound: outbound.into_session(),
-                    }
-                }
-                State::DtlsAccepting(acceptor) => {
-                    let (inbound, outbound) = acceptor.accept().await?;
-
-                    self.state = State::SrtpEstablished {
-                        inbound: inbound.into_session(),
-                        outbound: outbound.into_session(),
-                    }
-                }
-                State::SrtpEstablished { inbound, .. } => break inbound,
-            };
-        };
-
-        if let Some(rtcp_socket) = &self.rtcp_socket {
-            // Poll both rtp_socket & rtcp_socket for readyness and try_read once available
-            loop {
-                select! {
-                    result = self.rtp_socket.readable() => {
-                        result?;
-                        if try_recv(inbound, &self.rtp_socket, buf).await? {
-                            return Ok(())
-                        }
-                    },
-                    result = rtcp_socket.readable() => {
-                        result?;
-                        if try_recv(inbound, rtcp_socket, buf).await? {
-                            return Ok(())
-                        }
-                    },
-                }
-            }
-        }
+        // if let Some(rtcp_socket) = &self.rtcp_socket {
+        //     // Poll both rtp_socket & rtcp_socket for readyness and try_read once available
+        //     loop {
+        //         select! {
+        //             result = self.rtp_socket.readable() => {
+        //                 result?;
+        //                 if try_recv(inbound, &self.rtp_socket, buf).await? {
+        //                     return Ok(())
+        //                 }
+        //             },
+        //             result = rtcp_socket.readable() => {
+        //                 result?;
+        //                 if try_recv(inbound, rtcp_socket, buf).await? {
+        //                     return Ok(())
+        //                 }
+        //             },
+        //         }
+        //     }
+        // }
 
         loop {
-            // No rtcp_socket, just read from the rtp_socket
-            let (len, remote) = self.rtp_socket.recv_from(buf).await?;
+            if let State::DtlsHandshaking(rtp_acceptor) = &mut self.rtp_socket.state {
+                rtp_acceptor.handshake()?;
+
+                while let Some(to_send) = rtp_acceptor.pop_to_send() {
+                    self.rtp_socket
+                        .socket
+                        .send_to(&to_send, self.rtp_socket.target)
+                        .await?;
+                }
+            }
+
+            buf.resize(RECV_BUFFER_SIZE, 0);
+            let (len, remote) = self.rtp_socket.socket.recv_from(buf).await?;
 
             buf.truncate(len);
 
             match PacketKind::identify(buf) {
                 PacketKind::Rtp => {
+                    let State::SrtpEstablished { inbound, .. } = &mut self.rtp_socket.state else {
+                        continue;
+                    };
                     inbound.unprotect(buf).map_err(io::Error::other)?;
                     return Ok(());
                 }
                 PacketKind::Rtcp => {
+                    let State::SrtpEstablished { inbound, .. } = &mut self.rtp_socket.state else {
+                        continue;
+                    };
                     inbound.unprotect_rtcp(buf).map_err(io::Error::other)?;
                     return Ok(());
                 }
                 PacketKind::Stun => {
-                    check_for_stun_binding_request(&self.rtp_socket, buf, remote).await?;
-                    buf.resize(RECV_BUFFER_SIZE, 0);
+                    // check_for_stun_binding_request(&self.rtp_socket, buf, remote).await?;
                 }
+                PacketKind::Dtls => match &mut self.rtp_socket.state {
+                    State::DtlsHandshaking(dtls_srtp_acceptor) => {
+                        if let Some((inbound, outbound)) =
+                            dtls_srtp_acceptor.handshake(buf.clone())?
+                        {
+                            while let Some(to_send) = dtls_srtp_acceptor.pop_to_send() {
+                                self.rtp_socket
+                                    .socket
+                                    .send_to(&to_send, self.rtp_socket.target)
+                                    .await?;
+                            }
+
+                            self.rtp_socket.state = State::SrtpEstablished {
+                                inbound: inbound.into_session(),
+                                outbound: outbound.into_session(),
+                            };
+                            continue;
+                        } else {
+                            while let Some(to_send) = dtls_srtp_acceptor.pop_to_send() {
+                                self.rtp_socket
+                                    .socket
+                                    .send_to(&to_send, self.rtp_socket.target)
+                                    .await?;
+                            }
+                        }
+                    }
+                    State::SrtpEstablished { inbound, outbound } => todo!(),
+                    State::UseRTPState => unreachable!(),
+                },
                 PacketKind::Unknown => {
-                    buf.resize(RECV_BUFFER_SIZE, 0);
                     continue;
                 }
             }
@@ -258,36 +271,38 @@ impl RtpTransport for DirectSrtpTransport {
     }
 
     async fn send_rtp(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
-        let State::SrtpEstablished { outbound, .. } = &mut self.state else {
+        let State::SrtpEstablished { outbound, .. } = &mut self.rtp_socket.state else {
             return Err(io::Error::other("dtls-srtp not ready"));
         };
 
         outbound.protect(buf).map_err(io::Error::other)?;
 
         self.rtp_socket
-            .send_to(buf, self.remote_rtp_address)
+            .socket
+            .send_to(buf, self.rtp_socket.target)
             .await?;
 
         Ok(())
     }
 
     async fn send_rtcp(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
-        let State::SrtpEstablished { outbound, .. } = &mut self.state else {
-            return Err(io::Error::other("dtls-srtp not ready"));
-        };
+        // let State::SrtpEstablished { outbound, .. } = &mut self.state else {
+        //     return Err(io::Error::other("dtls-srtp not ready"));
+        // };
 
-        outbound.protect_rtcp(buf).map_err(io::Error::other)?;
+        // outbound.protect_rtcp(buf).map_err(io::Error::other)?;
 
-        let socket = self.rtcp_socket.as_ref().unwrap_or(&self.rtp_socket);
-        let target = self.remote_rtcp_address.unwrap_or(self.remote_rtp_address);
+        // let socket = self.rtcp_socket.as_ref().unwrap_or(&self.rtp_socket);
+        // let target = self.remote_rtcp_address.unwrap_or(self.remote_rtp_address);
 
-        socket.send_to(buf, target).await?;
+        // socket.send_to(buf, target).await?;
 
         Ok(())
     }
 
     fn is_ready(&self) -> bool {
-        matches!(self.state, State::SrtpEstablished { .. })
+        // matches!(self.state, State::SrtpEstablished { .. })
+        false
     }
 }
 
@@ -322,6 +337,7 @@ async fn try_recv(
             buf.resize(RECV_BUFFER_SIZE, 0);
             Ok(false)
         }
+        PacketKind::Dtls => todo!(),
     }
 }
 
