@@ -1,4 +1,3 @@
-use crate::TransceiverBuilder;
 use sdp_types::MediaType;
 use std::borrow::Cow;
 
@@ -51,14 +50,9 @@ impl Codec {
 
 pub struct Codecs {
     pub(crate) media_type: MediaType,
-    pub(crate) codecs: Vec<CodecsEntry>,
+    pub(crate) codecs: Vec<Codec>,
     pub(crate) allow_rtx: bool,
     pub(crate) allow_dtmf: bool,
-}
-
-pub(crate) struct CodecsEntry {
-    pub(crate) codec: Codec,
-    pub(crate) build: Box<dyn FnMut(&mut TransceiverBuilder) + Send + Sync>,
 }
 
 impl Codecs {
@@ -81,23 +75,13 @@ impl Codecs {
         self
     }
 
-    pub fn with_codec<F>(mut self, codec: Codec, on_use: F) -> Self
-    where
-        F: FnMut(&mut TransceiverBuilder) + Send + Sync + 'static,
-    {
-        self.add_codec(codec, on_use);
+    pub fn with_codec(mut self, codec: Codec) -> Self {
+        self.add_codec(codec);
         self
     }
 
-    pub fn add_codec<F>(&mut self, codec: Codec, on_use: F) -> &mut Self
-    where
-        F: FnMut(&mut TransceiverBuilder) + Send + Sync + 'static,
-    {
-        self.codecs.push(CodecsEntry {
-            codec,
-            build: Box::new(on_use),
-        });
-
+    pub fn add_codec(&mut self, codec: Codec) -> &mut Self {
+        self.codecs.push(codec);
         self
     }
 }

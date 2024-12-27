@@ -1,6 +1,6 @@
 use bytesstr::BytesStr;
 use ezk_session::{Codec, Codecs};
-use sdp_types::{MediaType, SessionDescription};
+use sdp_types::{Direction, MediaType, SessionDescription};
 use sip_core::transport::udp::Udp;
 use sip_core::{Endpoint, IncomingRequest, Layer, LayerKey, MayTake, Result};
 use sip_types::header::typed::{Contact, ContentType};
@@ -38,18 +38,9 @@ impl Layer for InviteAcceptLayer {
 
         let mut sdp_session = ezk_session::SdpSession::new(ip);
         sdp_session.add_local_media(
-            Codecs::new(MediaType::Audio).with_codec(Codec::PCMA, |builder| {
-                builder.add_receiver(|mut s| {
-                    println!("got receiver pcma");
-
-                    tokio::spawn(async move {
-                        while s.recv().await.is_some() {}
-
-                        println!("break pcma");
-                    });
-                });
-            }),
+            Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),
             1,
+            Direction::RecvOnly,
         );
 
         let ip = local_ip_address::local_ip().unwrap();
@@ -63,7 +54,7 @@ impl Layer for InviteAcceptLayer {
             SessionDescription::parse(&BytesStr::from_utf8_bytes(invite.body.clone()).unwrap())
                 .unwrap();
 
-        sdp_session.receiver_offer(sdp_offer).await.unwrap();
+        sdp_session.receive_offer(sdp_offer).unwrap();
 
         let sdp_response = sdp_session.create_sdp_answer();
         let acceptor = Acceptor::new(dialog, self.invite_layer, invite).unwrap();
@@ -82,18 +73,9 @@ impl Layer for InviteAcceptLayer {
         let (mut session, _ack) = acceptor.respond_success(response).await.unwrap();
 
         sdp_session.add_local_media(
-            Codecs::new(MediaType::Video).with_codec(Codec::AV1, |builder| {
-                builder.add_receiver(|mut s| {
-                    println!("got receiver av1");
-
-                    tokio::spawn(async move {
-                        while s.recv().await.is_some() {}
-
-                        println!("break av1");
-                    });
-                });
-            }),
+            Codecs::new(MediaType::Video).with_codec(Codec::AV1),
             1,
+            Direction::RecvOnly,
         );
 
         loop {
@@ -109,7 +91,7 @@ impl Layer for InviteAcceptLayer {
                     )
                     .unwrap();
 
-                    sdp_session.receiver_offer(offer).await.unwrap();
+                    sdp_session.receive_offer(offer).unwrap();
 
                     response
                         .msg

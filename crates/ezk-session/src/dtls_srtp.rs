@@ -28,13 +28,13 @@ pub(crate) enum DtlsSetup {
 
 pub(crate) struct DtlsSrtpSession {
     stream: Pin<Box<SslStream<IoQueue>>>,
-    state: DtlsSetup,
+    setup: DtlsSetup,
 }
 
 impl DtlsSrtpSession {
     pub(crate) fn new(
         fingerprints: Vec<(MessageDigest, Vec<u8>)>,
-        state: DtlsSetup,
+        setup: DtlsSetup,
     ) -> io::Result<Self> {
         let (cert, pkey) = get_ca_cert();
 
@@ -77,7 +77,7 @@ impl DtlsSrtpSession {
                     out: VecDeque::new(),
                 },
             )?),
-            state,
+            setup,
         };
 
         // Put initial handshake into the IoQueue
@@ -115,7 +115,7 @@ impl DtlsSrtpSession {
             srtp::openssl::OutboundSession,
         )>,
     > {
-        let result = match self.state {
+        let result = match self.setup {
             DtlsSetup::Connect => self.stream.as_mut().connect(),
             DtlsSetup::Accept => self.stream.as_mut().accept(),
         };
@@ -226,4 +226,17 @@ fn make_ca_cert() -> Result<(X509, PKey<Private>), ErrorStack> {
     let cert = cert_builder.build();
 
     Ok((cert, key_pair))
+}
+
+pub(super) fn to_openssl_digest(algo: &FingerprintAlgorithm) -> Option<MessageDigest> {
+    match algo {
+        FingerprintAlgorithm::SHA1 => Some(MessageDigest::sha1()),
+        FingerprintAlgorithm::SHA224 => Some(MessageDigest::sha224()),
+        FingerprintAlgorithm::SHA256 => Some(MessageDigest::sha256()),
+        FingerprintAlgorithm::SHA384 => Some(MessageDigest::sha384()),
+        FingerprintAlgorithm::SHA512 => Some(MessageDigest::sha512()),
+        FingerprintAlgorithm::MD5 => Some(MessageDigest::md5()),
+        FingerprintAlgorithm::MD2 => None,
+        FingerprintAlgorithm::Other(..) => None,
+    }
 }

@@ -1,5 +1,5 @@
 use bytesstr::BytesStr;
-use dtls_srtp::DtlsSrtpSession;
+use dtls_srtp::{DtlsSetup, DtlsSrtpSession};
 use ezk_rtp::{RtpPacket, RtpSession};
 use local_media::LocalMedia;
 use sdp_types::{
@@ -22,6 +22,7 @@ mod local_media;
 mod sdes_srtp;
 mod transceiver_builder;
 mod transport;
+mod wrapper;
 
 pub use codecs::{Codec, Codecs};
 pub use transceiver_builder::TransceiverBuilder;
@@ -56,7 +57,7 @@ pub enum Instruction {
     CreateUdpSocket { transport_id: TransportId },
 
     /// Send data
-    SendData { data: Vec<u8>, socket: TransportId },
+    SendData { socket: TransportId, data: Vec<u8> },
 
     /// Receive RTP
     ReceiveRTP { packet: RtpPacket },
@@ -202,14 +203,15 @@ impl SdpSession {
     /// Register codecs for a media type with a limit of how many media session by can be created
     pub fn add_local_media(
         &mut self,
-        direction: Direction,
         codecs: Codecs,
         limit: usize,
+        direction: Direction,
     ) -> LocalMediaId {
         self.local_media.insert(LocalMedia {
             codecs,
             limit,
             use_count: 0,
+            direction: direction.into(),
         })
     }
 
@@ -217,7 +219,11 @@ impl SdpSession {
         self.local_media.remove(local_media_id);
     }
 
-    pub fn receiver_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
+    pub fn pop_instruction(&mut self) -> Option<Instruction> {
+        self.instructions.pop_front()
+    }
+
+    pub fn receive_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
         let mut new_state = vec![];
 
         for (m_line_index, remote_media_desc) in offer.media_descriptions.iter().enumerate() {
@@ -255,10 +261,9 @@ impl SdpSession {
                 resolve_rtp_and_rtcp_address(&offer, remote_media_desc)?;
 
             // Choose local media for this m-line
-            let Some((local_media_id, (codec, codec_pt))) =
+            let Some((local_media_id, (codec, codec_pt, negotiated_direction))) =
                 self.local_media.iter_mut().find_map(|(id, local_media)| {
-                    let config =
-                        local_media.maybe_use_for_offer(id, m_line_index, remote_media_desc)?;
+                    let config = local_media.maybe_use_for_offer(remote_media_desc)?;
 
                     Some((id, config))
                 })
@@ -291,7 +296,7 @@ impl SdpSession {
                 media_type: remote_media_desc.media.media_type,
                 rtp_session: RtpSession::new(rand::random(), codec.clock_rate),
                 mid: remote_media_desc.mid.clone(),
-                direction: DirectionBools { send, recv },
+                direction: negotiated_direction,
                 transport,
                 codec_pt,
                 codec,
@@ -318,7 +323,7 @@ impl SdpSession {
         Ok(())
     }
 
-    async fn update_active_media(
+    fn update_active_media(
         &mut self,
         requested_direction: DirectionBools,
         active_media: &mut ActiveMedia,
@@ -420,28 +425,28 @@ impl SdpSession {
                             }
                         };
 
-                        todo!()
+                        let remote_fingerprints: Vec<_> = remote_media_desc
+                            .fingerprint
+                            .iter()
+                            .filter_map(|e| {
+                                Some((
+                                    dtls_srtp::to_openssl_digest(&e.algorithm)?,
+                                    e.fingerprint.clone(),
+                                ))
+                            })
+                            .collect();
 
-                        // let (transport, fingerprint) = DirectDtlsSrtpTransport::new(
-                        //     remote_rtp_address,
-                        //     remote_rtcp_address,
-                        //     remote_media_desc.fingerprint.clone(),
-                        //     setup,
-                        // )
-                        // .await?;
+                        let dtls = DtlsSrtpSession::new(remote_fingerprints, setup)?;
 
-                        // Transport {
-                        //     local_rtp_port: transport.local_rtp_port(),
-                        //     local_rtcp_port: transport.local_rtcp_port(),
-                        //     handle: TransportTaskHandle::new(transport, mid_rtp_id),
-                        //     kind: TransportKind::DtlsSrtp(
-                        //         fingerprint,
-                        //         match setup {
-                        //             DtlsSetup::Connect => Setup::Active,
-                        //             DtlsSetup::Accept => Setup::Passive,
-                        //         },
-                        //     ),
-                        // }
+                        TransportKind::DtlsSrtp {
+                            fingerprint: vec![dtls.fingerprint()],
+                            setup: match setup {
+                                DtlsSetup::Accept => Setup::Passive,
+                                DtlsSetup::Connect => Setup::Active,
+                            },
+                            dtls,
+                            srtp: None,
+                        }
                     }
                     _ => return Ok(None),
                 };
@@ -527,7 +532,7 @@ impl SdpSession {
             let proto = match &transport.kind {
                 TransportKind::Rtp => TransportProtocol::RtpAvp,
                 TransportKind::SdesSrtp { crypto: c, .. } => {
-                    crypto.extend_from_slice(&c);
+                    crypto.extend_from_slice(c);
                     TransportProtocol::RtpSavp
                 }
                 TransportKind::DtlsSrtp {
@@ -535,7 +540,7 @@ impl SdpSession {
                     setup: s,
                     ..
                 } => {
-                    fingerprint.extend_from_slice(&f);
+                    fingerprint.extend_from_slice(f);
                     setup = Some(*s);
                     TransportProtocol::UdpTlsRtpSavp
                 }
