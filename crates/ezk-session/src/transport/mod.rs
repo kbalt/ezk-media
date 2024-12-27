@@ -1,13 +1,11 @@
 use std::{future::Future, io};
 
-mod direct_dtls_srtp;
+// mod direct_dtls_srtp;
 mod direct_rtp;
-mod dtls_srtp;
 mod task;
 
-pub(crate) use direct_dtls_srtp::DirectDtlsSrtpTransport;
+// pub(crate) use direct_dtls_srtp::DirectDtlsSrtpTransport;
 pub(crate) use direct_rtp::DirectRtpTransport;
-pub(crate) use dtls_srtp::DtlsSetup;
 pub(crate) use task::{IdentifyableBy, TransportTaskHandle};
 
 const RECV_BUFFER_SIZE: usize = 65535;

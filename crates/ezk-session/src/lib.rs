@@ -1,4 +1,6 @@
 use bytesstr::BytesStr;
+use dtls_srtp::DtlsSrtpSession;
+use ezk_rtp::{RtpPacket, RtpSession};
 use local_media::LocalMedia;
 use sdp_types::{
     Connection, Direction, ExtMap, Fingerprint, Fmtp, Group, IceOptions, Media, MediaDescription,
@@ -7,18 +9,17 @@ use sdp_types::{
 };
 use slotmap::SlotMap;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     mem::replace,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
 };
-use tokio::{net::lookup_host, sync::mpsc, try_join};
-use transport::{
-    DirectDtlsSrtpTransport, DirectRtpTransport, DtlsSetup, IdentifyableBy, TransportTaskHandle,
-};
+use transport::IdentifyableBy;
 
 mod codecs;
+mod dtls_srtp;
 mod local_media;
+mod sdes_srtp;
 mod transceiver_builder;
 mod transport;
 
@@ -42,7 +43,32 @@ impl ActiveMediaId {
 
 slotmap::new_key_type! {
     pub struct LocalMediaId;
-    struct TransportId;
+    pub struct TransportId;
+}
+
+pub enum Instruction {
+    /// Create 2 UdpSockets for a media session
+    ///
+    /// This is called when rtcp-mux is not available
+    CreateUdpSocketPair { transport_id: TransportId },
+
+    /// Create a single UdpSocket for a media session
+    CreateUdpSocket { transport_id: TransportId },
+
+    /// Send data
+    SendData { data: Vec<u8>, socket: TransportId },
+
+    /// Receive RTP
+    ReceiveRTP { packet: RtpPacket },
+
+    /// Added a track
+    TrackAdded {},
+}
+
+pub struct ReceiveData {
+    pub transport_id: TransportId,
+    pub source: SocketAddr,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +93,8 @@ pub struct SdpSession {
 
     // Transports
     transports: SlotMap<TransportId, Transport>,
+
+    instructions: VecDeque<Instruction>,
 }
 
 enum MediaEntry {
@@ -89,21 +117,29 @@ struct ActiveMedia {
 
     media_type: MediaType,
 
-    /// Optional mid
+    /// The RTP session for this media
+    rtp_session: RtpSession,
+
+    /// Optional mid, this is only one if both offer and answer have the mid attribute set
     mid: Option<BytesStr>,
+
+    /// SDP Send/Recv direction
     direction: DirectionBools,
 
+    /// Which transport is used by this media
     transport: TransportId,
-    remote_rtp_address: SocketAddr,
-    remote_rtcp_address: SocketAddr,
 
+    /// Which codec is negotiated
     codec_pt: u8,
     codec: Codec,
-    builder: TransceiverBuilder,
 }
 
 impl ActiveMedia {
-    fn matches(&self, desc: &MediaDescription) -> bool {
+    fn matches(
+        &self,
+        transports: &SlotMap<TransportId, Transport>,
+        desc: &MediaDescription,
+    ) -> bool {
         if self.media_type != desc.media.media_type {
             return false;
         }
@@ -112,21 +148,41 @@ impl ActiveMedia {
             return self_mid == desc_mid;
         }
 
-        self.remote_rtp_address.port() == desc.media.port
+        transports[self.transport].remote_rtp_address.port() == desc.media.port
     }
 }
 
 struct Transport {
-    local_rtp_port: u16,
+    local_rtp_port: Option<u16>,
     local_rtcp_port: Option<u16>,
-    handle: TransportTaskHandle,
+
+    remote_rtp_address: SocketAddr,
+    remote_rtcp_address: SocketAddr,
+
     kind: TransportKind,
+
+    mid_rtp_id: Option<u8>,
+}
+
+struct Entry {
+    rtp_session: RtpSession,
+    remote_identifyable_by: IdentifyableBy,
 }
 
 enum TransportKind {
     Rtp,
-    SdesSrtp(Vec<SrtpCrypto>),
-    DtlsSrtp(Vec<Fingerprint>, Setup),
+    SdesSrtp {
+        crypto: Vec<SrtpCrypto>,
+        inbound: srtp::Session,
+        outbound: srtp::Session,
+    },
+    DtlsSrtp {
+        fingerprint: Vec<Fingerprint>,
+        setup: Setup,
+
+        dtls: DtlsSrtpSession,
+        srtp: Option<(srtp::Session, srtp::Session)>,
+    },
 }
 
 impl SdpSession {
@@ -139,11 +195,17 @@ impl SdpSession {
             next_active_media_id: ActiveMediaId(0),
             state: Vec::new(),
             transports: SlotMap::with_key(),
+            instructions: VecDeque::new(),
         }
     }
 
     /// Register codecs for a media type with a limit of how many media session by can be created
-    pub fn add_local_media(&mut self, codecs: Codecs, limit: usize) -> LocalMediaId {
+    pub fn add_local_media(
+        &mut self,
+        direction: Direction,
+        codecs: Codecs,
+        limit: usize,
+    ) -> LocalMediaId {
         self.local_media.insert(LocalMedia {
             codecs,
             limit,
@@ -155,7 +217,7 @@ impl SdpSession {
         self.local_media.remove(local_media_id);
     }
 
-    pub async fn receiver_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
+    pub fn receiver_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
         let mut new_state = vec![];
 
         for (m_line_index, remote_media_desc) in offer.media_descriptions.iter().enumerate() {
@@ -163,7 +225,9 @@ impl SdpSession {
 
             // First thing: Search the current state for an entry that matches this description - and update accordingly
             let matched_position = self.state.iter().position(|e| match e {
-                MediaEntry::Active(active_media) => active_media.matches(remote_media_desc),
+                MediaEntry::Active(active_media) => {
+                    active_media.matches(&self.transports, remote_media_desc)
+                }
                 MediaEntry::Rejected(media_type) => {
                     *media_type == remote_media_desc.media.media_type
                 }
@@ -172,8 +236,7 @@ impl SdpSession {
             if let Some(position) = matched_position {
                 // Remove the entry and only if its active, we don't consider creating a new media session
                 if let MediaEntry::Active(mut active_media) = self.state.remove(position) {
-                    self.update_active_media(requested_direction, &mut active_media)
-                        .await;
+                    self.update_active_media(requested_direction, &mut active_media);
                     new_state.push(MediaEntry::Active(active_media));
                     continue;
                 }
@@ -189,10 +252,10 @@ impl SdpSession {
 
             // resolve remote rtp & rtcp address
             let (remote_rtp_address, remote_rtcp_address) =
-                resolve_rtp_and_rtcp_address(&offer, remote_media_desc).await?;
+                resolve_rtp_and_rtcp_address(&offer, remote_media_desc)?;
 
             // Choose local media for this m-line
-            let Some((local_media_id, (mut builder, codec, codec_pt))) =
+            let Some((local_media_id, (codec, codec_pt))) =
                 self.local_media.iter_mut().find_map(|(id, local_media)| {
                     let config =
                         local_media.maybe_use_for_offer(id, m_line_index, remote_media_desc)?;
@@ -205,72 +268,33 @@ impl SdpSession {
                 continue;
             };
 
-            let do_send = builder.create_sender.is_some() && requested_direction.send;
-            let do_recv = builder.create_receiver.is_some() && requested_direction.recv;
-
             // Get or create transport for the m-line
-            let transport_id = self
-                .get_or_create_transport(
-                    &new_state,
-                    &offer,
-                    remote_media_desc,
-                    remote_rtp_address,
-                    remote_rtcp_address,
-                )
-                .await?;
+            let transport = self.get_or_create_transport(
+                &new_state,
+                &offer,
+                remote_media_desc,
+                remote_rtp_address,
+                remote_rtcp_address,
+            )?;
 
-            let Some(transport_id) = transport_id else {
+            let Some(transport) = transport else {
                 // No transport was found or created, reject media
                 new_state.push(MediaEntry::Rejected(remote_media_desc.media.media_type));
                 continue;
             };
 
-            let transport = &mut self.transports[transport_id];
-
             let active_media_id = self.next_active_media_id.step();
-
-            transport
-                .handle
-                .add_media_session(
-                    active_media_id,
-                    IdentifyableBy {
-                        mid: remote_media_desc.mid.clone(),
-                        ssrc: vec![], // TODO: read ssrc attributes
-                        pt: vec![codec_pt],
-                    },
-                    codec.clock_rate,
-                )
-                .await;
-
-            if do_send {
-                let create_sender = builder.create_sender.as_mut().unwrap();
-                let (tx, rx) = mpsc::channel(8);
-                transport.handle.set_sender(active_media_id, rx).await;
-                (create_sender)(tx);
-            }
-
-            if do_recv {
-                let create_receiver = builder.create_receiver.as_mut().unwrap();
-                let (tx, rx) = mpsc::channel(8);
-                transport.handle.set_receiver(active_media_id, tx).await;
-                (create_receiver)(rx);
-            }
 
             new_state.push(MediaEntry::Active(ActiveMedia {
                 id: active_media_id,
                 local_media_id,
                 media_type: remote_media_desc.media.media_type,
+                rtp_session: RtpSession::new(rand::random(), codec.clock_rate),
                 mid: remote_media_desc.mid.clone(),
-                direction: DirectionBools {
-                    send: do_send,
-                    recv: do_recv,
-                },
-                transport: transport_id,
-                remote_rtp_address,
-                remote_rtcp_address,
+                direction: DirectionBools { send, recv },
+                transport,
                 codec_pt,
                 codec,
-                builder,
             }));
         }
 
@@ -279,10 +303,6 @@ impl SdpSession {
 
         for entry in old_state {
             if let MediaEntry::Active(active) = entry {
-                let transport = &self.transports[active.transport];
-
-                transport.handle.remove_media_session(active.id).await;
-
                 self.local_media[active.local_media_id].use_count -= 1;
             }
         }
@@ -305,50 +325,50 @@ impl SdpSession {
     ) {
         let transport = &mut self.transports[active_media.transport];
 
-        // If remote wants to receive data, but we're not sending anything
-        if requested_direction.send && !active_media.direction.send {
-            if let Some(create_sender) = &mut active_media.builder.create_sender {
-                let (tx, rx) = mpsc::channel(8);
-                transport.handle.set_sender(active_media.id, rx).await;
-                create_sender(tx);
-            }
-        }
+        // // If remote wants to receive data, but we're not sending anything
+        // if requested_direction.send && !active_media.direction.send {
+        //     if let Some(create_sender) = &mut active_media.builder.create_sender {
+        //         let (tx, rx) = mpsc::channel(8);
+        //         transport.handle.set_sender(active_media.id, rx).await;
+        //         create_sender(tx);
+        //     }
+        // }
 
-        // If remote is not receiving anything and we're sending, we need to stop sending
-        if !requested_direction.send
-            && active_media.direction.send
-            && active_media.builder.create_sender.is_some()
-        {
-            transport.handle.remove_sender(active_media.id).await;
-        }
+        // // If remote is not receiving anything and we're sending, we need to stop sending
+        // if !requested_direction.send
+        //     && active_media.direction.send
+        //     && active_media.builder.create_sender.is_some()
+        // {
+        //     transport.handle.remove_sender(active_media.id).await;
+        // }
 
-        // If remote wants to send us something, but we're not receiving yet
-        if requested_direction.recv && !active_media.direction.recv {
-            if let Some(create_receiver) = &mut active_media.builder.create_receiver {
-                let (tx, rx) = mpsc::channel(8);
-                transport.handle.set_receiver(active_media.id, tx).await;
-                create_receiver(rx);
-            }
-        }
+        // // If remote wants to send us something, but we're not receiving yet
+        // if requested_direction.recv && !active_media.direction.recv {
+        //     if let Some(create_receiver) = &mut active_media.builder.create_receiver {
+        //         let (tx, rx) = mpsc::channel(8);
+        //         transport.handle.set_receiver(active_media.id, tx).await;
+        //         create_receiver(rx);
+        //     }
+        // }
 
-        // If remote is not sending anything and we're received, we need to stop receiving
-        if !requested_direction.recv
-            && active_media.direction.recv
-            && active_media.builder.create_receiver.is_some()
-        {
-            transport.handle.remove_receiver(active_media.id).await;
-        }
+        // // If remote is not sending anything and we're received, we need to stop receiving
+        // if !requested_direction.recv
+        //     && active_media.direction.recv
+        //     && active_media.builder.create_receiver.is_some()
+        // {
+        //     transport.handle.remove_receiver(active_media.id).await;
+        // }
 
-        active_media.direction.send =
-            requested_direction.send && active_media.builder.create_sender.is_some();
-        active_media.direction.recv =
-            requested_direction.recv && active_media.builder.create_receiver.is_some();
+        // active_media.direction.send =
+        //     requested_direction.send && active_media.builder.create_sender.is_some();
+        // active_media.direction.recv =
+        //     requested_direction.recv && active_media.builder.create_receiver.is_some();
     }
 
     /// Get or create a transport for the given media description
     ///
     /// If the transport type is unknown or cannot be created Ok(None) is returned. The media section must then be declined.
-    async fn get_or_create_transport(
+    fn get_or_create_transport(
         &mut self,
         new_state: &[MediaEntry],
         offer: &SessionDescription,
@@ -374,40 +394,17 @@ impl SdpSession {
                     .find(|extmap| extmap.uri == RTP_MID_HDREXT)
                     .map(|extmap| extmap.id);
 
-                // TODO: how to properly communicate rtcp-mux on our side
-                let remote_rtcp_address =
-                    Some(remote_rtcp_address).filter(|_| !remote_media_desc.rtcp_mux);
-
-                let transport = match remote_media_desc.media.proto {
-                    TransportProtocol::RtpAvp => {
-                        // Create direct RTP transport
-                        let transport =
-                            DirectRtpTransport::new(remote_rtp_address, remote_rtcp_address)
-                                .await?;
-
-                        Transport {
-                            local_rtp_port: transport.local_rtp_port(),
-                            local_rtcp_port: transport.local_rtcp_port(),
-                            handle: TransportTaskHandle::new(transport, mid_rtp_id),
-                            kind: TransportKind::Rtp,
-                        }
-                    }
+                let kind = match remote_media_desc.media.proto {
+                    TransportProtocol::RtpAvp => TransportKind::Rtp,
                     TransportProtocol::RtpSavp => {
-                        // // Create direct SRTP transport
-                        // let (transport, crypto) = DirectDtlsSrtpTransport::sdes_srtp(
-                        //     remote_rtp_address,
-                        //     remote_rtcp_address,
-                        //     &remote_media_desc.crypto,
-                        // )
-                        // .await?;
+                        let (crypto, inbound, outbound) =
+                            sdes_srtp::negotiate_sdes_srtp(&remote_media_desc.crypto)?;
 
-                        // Transport {
-                        //     local_rtp_port: transport.local_rtp_port(),
-                        //     local_rtcp_port: transport.local_rtcp_port(),
-                        //     handle: TransportTaskHandle::new(transport, mid_rtp_id),
-                        //     kind: TransportKind::SdesSrtp(crypto),
-                        // }
-                        todo!()
+                        TransportKind::SdesSrtp {
+                            crypto,
+                            inbound,
+                            outbound,
+                        }
                     }
                     TransportProtocol::UdpTlsRtpSavp => {
                         let setup = match remote_media_desc.setup {
@@ -423,31 +420,50 @@ impl SdpSession {
                             }
                         };
 
-                        let (transport, fingerprint) = DirectDtlsSrtpTransport::new(
-                            remote_rtp_address,
-                            remote_rtcp_address,
-                            remote_media_desc.fingerprint.clone(),
-                            setup,
-                        )
-                        .await?;
+                        todo!()
 
-                        Transport {
-                            local_rtp_port: transport.local_rtp_port(),
-                            local_rtcp_port: transport.local_rtcp_port(),
-                            handle: TransportTaskHandle::new(transport, mid_rtp_id),
-                            kind: TransportKind::DtlsSrtp(
-                                fingerprint,
-                                match setup {
-                                    DtlsSetup::Connect => Setup::Active,
-                                    DtlsSetup::Accept => Setup::Passive,
-                                },
-                            ),
-                        }
+                        // let (transport, fingerprint) = DirectDtlsSrtpTransport::new(
+                        //     remote_rtp_address,
+                        //     remote_rtcp_address,
+                        //     remote_media_desc.fingerprint.clone(),
+                        //     setup,
+                        // )
+                        // .await?;
+
+                        // Transport {
+                        //     local_rtp_port: transport.local_rtp_port(),
+                        //     local_rtcp_port: transport.local_rtcp_port(),
+                        //     handle: TransportTaskHandle::new(transport, mid_rtp_id),
+                        //     kind: TransportKind::DtlsSrtp(
+                        //         fingerprint,
+                        //         match setup {
+                        //             DtlsSetup::Connect => Setup::Active,
+                        //             DtlsSetup::Accept => Setup::Passive,
+                        //         },
+                        //     ),
+                        // }
                     }
                     _ => return Ok(None),
                 };
 
-                Ok(Some(self.transports.insert(transport)))
+                let transport_id = self.transports.insert(Transport {
+                    local_rtp_port: None,
+                    local_rtcp_port: None,
+                    remote_rtp_address,
+                    remote_rtcp_address,
+                    kind,
+                    mid_rtp_id,
+                });
+
+                if remote_media_desc.rtcp_mux {
+                    self.instructions
+                        .push_back(Instruction::CreateUdpSocketPair { transport_id });
+                } else {
+                    self.instructions
+                        .push_back(Instruction::CreateUdpSocket { transport_id });
+                }
+
+                Ok(Some(transport_id))
             }
         }
     }
@@ -510,12 +526,16 @@ impl SdpSession {
 
             let proto = match &transport.kind {
                 TransportKind::Rtp => TransportProtocol::RtpAvp,
-                TransportKind::SdesSrtp(c) => {
-                    crypto.extend_from_slice(c);
+                TransportKind::SdesSrtp { crypto: c, .. } => {
+                    crypto.extend_from_slice(&c);
                     TransportProtocol::RtpSavp
                 }
-                TransportKind::DtlsSrtp(f, s) => {
-                    fingerprint.extend_from_slice(f);
+                TransportKind::DtlsSrtp {
+                    fingerprint: f,
+                    setup: s,
+                    ..
+                } => {
+                    fingerprint.extend_from_slice(&f);
                     setup = Some(*s);
                     TransportProtocol::UdpTlsRtpSavp
                 }
@@ -524,7 +544,7 @@ impl SdpSession {
             MediaDescription {
                 media: Media {
                     media_type: active.media_type,
-                    port: transport.local_rtp_port,
+                    port: transport.local_rtp_port.unwrap(),
                     ports_num: None,
                     proto,
                     fmts: vec![active.codec_pt],
@@ -536,7 +556,7 @@ impl SdpSession {
                     port,
                     address: None,
                 }),
-                rtcp_mux: active.remote_rtp_address == active.remote_rtcp_address,
+                rtcp_mux: transport.remote_rtp_address == transport.remote_rtcp_address,
                 mid: active.mid.clone(),
                 rtpmap: vec![rtpmap],
                 fmtp: fmtps.collect(),
@@ -607,7 +627,7 @@ impl SdpSession {
     }
 }
 
-async fn resolve_rtp_and_rtcp_address(
+fn resolve_rtp_and_rtcp_address(
     offer: &SessionDescription,
     remote_media_description: &MediaDescription,
 ) -> Result<(SocketAddr, SocketAddr), Error> {
@@ -623,10 +643,8 @@ async fn resolve_rtp_and_rtcp_address(
     let (remote_rtcp_address, remote_rtcp_port) =
         rtcp_address_and_port(remote_media_description, connection);
 
-    let (remote_rtp_address, remote_rtcp_address) = try_join!(
-        resolve_tagged_address(&remote_rtp_address, remote_rtp_port),
-        resolve_tagged_address(&remote_rtcp_address, remote_rtcp_port),
-    )?;
+    let remote_rtp_address = resolve_tagged_address(&remote_rtp_address, remote_rtp_port)?;
+    let remote_rtcp_address = resolve_tagged_address(&remote_rtcp_address, remote_rtcp_port)?;
 
     Ok((remote_rtp_address, remote_rtcp_address))
 }
@@ -657,18 +675,19 @@ fn rtcp_address_and_port(
     )
 }
 
-async fn resolve_tagged_address(address: &TaggedAddress, port: u16) -> io::Result<SocketAddr> {
+fn resolve_tagged_address(address: &TaggedAddress, port: u16) -> io::Result<SocketAddr> {
+    // TODO: do not resolve here directly
     match address {
         TaggedAddress::IP4(ipv4_addr) => Ok(SocketAddr::from((*ipv4_addr, port))),
-        TaggedAddress::IP4FQDN(bytes_str) => lookup_host((bytes_str.as_str(), port))
-            .await?
+        TaggedAddress::IP4FQDN(bytes_str) => (bytes_str.as_str(), port)
+            .to_socket_addrs()?
             .find(SocketAddr::is_ipv4)
             .ok_or_else(|| {
                 io::Error::other(format!("Failed to find IPv4 address for {bytes_str}"))
             }),
         TaggedAddress::IP6(ipv6_addr) => Ok(SocketAddr::from((*ipv6_addr, port))),
-        TaggedAddress::IP6FQDN(bytes_str) => lookup_host((bytes_str.as_str(), port))
-            .await?
+        TaggedAddress::IP6FQDN(bytes_str) => (bytes_str.as_str(), port)
+            .to_socket_addrs()?
             .find(SocketAddr::is_ipv6)
             .ok_or_else(|| {
                 io::Error::other(format!("Failed to find IPv6 address for {bytes_str}"))

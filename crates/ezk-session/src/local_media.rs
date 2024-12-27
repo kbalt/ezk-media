@@ -13,7 +13,7 @@ impl LocalMedia {
         self_id: LocalMediaId,
         m_line_index: usize,
         desc: &MediaDescription,
-    ) -> Option<(TransceiverBuilder, Codec, u8)> {
+    ) -> Option<(Codec, u8)> {
         if self.limit == self.use_count || self.codecs.media_type != desc.media.media_type {
             return None;
         }
@@ -66,7 +66,7 @@ impl LocalMedia {
                 }
 
                 self.use_count += 1; // TODO: decrement this
-                return Some((builder, entry.codec.clone(), codec_pt));
+                return Some((entry.codec.clone(), codec_pt));
             }
         }
 
