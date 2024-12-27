@@ -1,5 +1,5 @@
 use bytesstr::BytesStr;
-use ezk_session::{Codec, Codecs};
+use ezk_session::{Codec, Codecs, AsyncSdpSession};
 use sdp_types::{Direction, MediaType, SessionDescription};
 use sip_core::transport::udp::Udp;
 use sip_core::{Endpoint, IncomingRequest, Layer, LayerKey, MayTake, Result};
@@ -36,7 +36,7 @@ impl Layer for InviteAcceptLayer {
         let start = Instant::now();
         let ip = local_ip_address::local_ip().unwrap();
 
-        let mut sdp_session = ezk_session::SdpSession::new(ip);
+        let mut sdp_session = AsyncSdpSession::new(ip);
         sdp_session.add_local_media(
             Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),
             1,
@@ -54,7 +54,7 @@ impl Layer for InviteAcceptLayer {
             SessionDescription::parse(&BytesStr::from_utf8_bytes(invite.body.clone()).unwrap())
                 .unwrap();
 
-        sdp_session.receive_offer(sdp_offer).unwrap();
+        sdp_session.receive_sdp_offer(sdp_offer).unwrap();
 
         let sdp_response = sdp_session.create_sdp_answer();
         let acceptor = Acceptor::new(dialog, self.invite_layer, invite).unwrap();
@@ -91,7 +91,7 @@ impl Layer for InviteAcceptLayer {
                     )
                     .unwrap();
 
-                    sdp_session.receive_offer(offer).unwrap();
+                    sdp_session.receive_sdp_offer(offer).unwrap();
 
                     response
                         .msg

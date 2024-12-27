@@ -17,7 +17,7 @@ use std::{
     collections::VecDeque,
     io::{self, Cursor, Read, Write},
     pin::Pin,
-    sync::OnceLock,
+    sync::OnceLock, time::Duration,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +100,10 @@ impl DtlsSrtpSession {
             algorithm: FingerprintAlgorithm::SHA256,
             fingerprint,
         }
+    }
+
+    pub(crate) fn timeout(&mut self) -> Option<Duration> {
+        self.stream.ssl().event_timeout()
     }
 
     pub(crate) fn receive(&mut self, dgram: Vec<u8>) {

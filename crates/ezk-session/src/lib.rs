@@ -26,6 +26,7 @@ mod wrapper;
 
 pub use codecs::{Codec, Codecs};
 pub use transceiver_builder::TransceiverBuilder;
+pub use wrapper::SdpSession as AsyncSdpSession;
 
 // TODO: have this not be hardcoded
 const RTP_MID_HDREXT_ID: u8 = 1;
@@ -47,17 +48,30 @@ slotmap::new_key_type! {
     pub struct TransportId;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SocketId(TransportId, SocketUse);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SocketUse {
+    Rtp,
+    Rtcp,
+}
+
 pub enum Instruction {
     /// Create 2 UdpSockets for a media session
     ///
     /// This is called when rtcp-mux is not available
-    CreateUdpSocketPair { transport_id: TransportId },
+    CreateUdpSocketPair { socket_ids: [SocketId; 2] },
 
     /// Create a single UdpSocket for a media session
-    CreateUdpSocket { transport_id: TransportId },
+    CreateUdpSocket { socket_id: SocketId },
 
     /// Send data
-    SendData { socket: TransportId, data: Vec<u8> },
+    SendData {
+        socket: SocketId,
+        data: Vec<u8>,
+        target: SocketAddr,
+    },
 
     /// Receive RTP
     ReceiveRTP { packet: RtpPacket },
@@ -223,7 +237,16 @@ impl SdpSession {
         self.instructions.pop_front()
     }
 
-    pub fn receive_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
+    pub fn set_socket_port(&mut self, socket_id: SocketId, port: u16) {
+        let transport = &mut self.transports[socket_id.0];
+
+        match socket_id.1 {
+            SocketUse::Rtp => transport.local_rtp_port = Some(port),
+            SocketUse::Rtcp => transport.local_rtcp_port = Some(port),
+        }
+    }
+
+    pub fn receive_sdp_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
         let mut new_state = vec![];
 
         for (m_line_index, remote_media_desc) in offer.media_descriptions.iter().enumerate() {
@@ -416,7 +439,8 @@ impl SdpSession {
                             Some(Setup::Active) => DtlsSetup::Accept,
                             Some(Setup::Passive) => DtlsSetup::Connect,
                             Some(Setup::ActPass) => {
-                                // For now always play the server
+                                // Use passive when accepting an offer so both sides will have the DTLS fingerprint
+                                // before any request is sent
                                 DtlsSetup::Accept
                             }
                             Some(Setup::HoldConn) | None => {
@@ -462,10 +486,16 @@ impl SdpSession {
 
                 if remote_media_desc.rtcp_mux {
                     self.instructions
-                        .push_back(Instruction::CreateUdpSocketPair { transport_id });
+                        .push_back(Instruction::CreateUdpSocketPair {
+                            socket_ids: [
+                                SocketId(transport_id, SocketUse::Rtp),
+                                SocketId(transport_id, SocketUse::Rtcp),
+                            ],
+                        });
                 } else {
-                    self.instructions
-                        .push_back(Instruction::CreateUdpSocket { transport_id });
+                    self.instructions.push_back(Instruction::CreateUdpSocket {
+                        socket_id: SocketId(transport_id, SocketUse::Rtp),
+                    });
                 }
 
                 Ok(Some(transport_id))
