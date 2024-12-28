@@ -6,13 +6,13 @@ use std::{
 };
 use tokio::{io::ReadBuf, net::UdpSocket};
 
-pub struct SdpSession {
+pub struct AsyncSdpSession {
     inner: super::SdpSession,
 
     sockets: HashMap<SocketId, UdpSocket>,
 }
 
-impl SdpSession {
+impl AsyncSdpSession {
     pub fn new(address: IpAddr) -> Self {
         Self {
             inner: super::SdpSession::new(address),

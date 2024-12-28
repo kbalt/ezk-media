@@ -23,7 +23,7 @@ mod wrapper;
 
 pub use codecs::{Codec, Codecs};
 pub use transceiver_builder::TransceiverBuilder;
-pub use wrapper::SdpSession as AsyncSdpSession;
+pub use wrapper::AsyncSdpSession;
 
 // TODO: have this not be hardcoded
 const RTP_MID_HDREXT_ID: u8 = 1;
@@ -674,6 +674,43 @@ impl SdpSession {
             socket: SocketId(media.transport, SocketUse::Rtp),
             data: encode_buf,
             target: transport.remote_rtp_address,
+        });
+    }
+
+    fn send_rtcp(&mut self, media_id: ActiveMediaId) {
+        let media = self
+            .state
+            .iter_mut()
+            .filter_map(MediaEntry::active_mut)
+            .find(|m| m.id == media_id)
+            .unwrap();
+
+        let mut encode_buf = vec![0u8; 65535];
+
+        let len = match media.rtp_session.write_rtcp_report(&mut encode_buf) {
+            Ok(len) => len,
+            Err(e) => {
+                log::warn!("Failed to write RTCP packet, {e:?}");
+                return;
+            }
+        };
+
+        encode_buf.truncate(len);
+
+        let transport = &mut self.transports[media.transport];
+
+        transport.protect_rtcp(&mut encode_buf);
+
+        let socket_use = if transport.local_rtcp_port.is_some() {
+            SocketUse::Rtp
+        } else {
+            SocketUse::Rtcp
+        };
+
+        self.instructions.push_back(Instruction::SendData {
+            socket: SocketId(media.transport, socket_use),
+            data: encode_buf,
+            target: transport.remote_rtcp_address,
         });
     }
 }

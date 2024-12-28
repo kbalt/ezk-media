@@ -155,7 +155,7 @@ impl Transport {
         source: SocketAddr,
         socket_id: SocketId,
     ) -> ReceivedPacket {
-        match PacketKind::identify(&data) {
+        match PacketKind::identify(data) {
             PacketKind::Rtp => {
                 // Handle incoming RTP packet
                 if let TransportKind::SdesSrtp { inbound, .. }
