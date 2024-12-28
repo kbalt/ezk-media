@@ -1,5 +1,5 @@
 use bytesstr::BytesStr;
-use ezk_session::{Codec, Codecs, AsyncSdpSession};
+use ezk_session::{AsyncSdpSession, Codec, Codecs};
 use sdp_types::{Direction, MediaType, SessionDescription};
 use sip_core::transport::udp::Udp;
 use sip_core::{Endpoint, IncomingRequest, Layer, LayerKey, MayTake, Result};
@@ -54,7 +54,7 @@ impl Layer for InviteAcceptLayer {
             SessionDescription::parse(&BytesStr::from_utf8_bytes(invite.body.clone()).unwrap())
                 .unwrap();
 
-        sdp_session.receive_sdp_offer(sdp_offer).unwrap();
+        sdp_session.receive_sdp_offer(sdp_offer).await.unwrap();
 
         let sdp_response = sdp_session.create_sdp_answer();
         let acceptor = Acceptor::new(dialog, self.invite_layer, invite).unwrap();
@@ -79,7 +79,12 @@ impl Layer for InviteAcceptLayer {
         );
 
         loop {
-            match session.drive().await.unwrap() {
+            let e = tokio::select! {
+                _ = sdp_session.run() => {continue},
+                e = session.drive() => {e}
+            };
+
+            match e.unwrap() {
                 Event::RefreshNeeded(event) => {
                     event.process_default().await.unwrap();
                 }
@@ -91,7 +96,7 @@ impl Layer for InviteAcceptLayer {
                     )
                     .unwrap();
 
-                    sdp_session.receive_sdp_offer(offer).unwrap();
+                    sdp_session.receive_sdp_offer(offer).await.unwrap();
 
                     response
                         .msg

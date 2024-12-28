@@ -6,6 +6,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+build = "build.rs"
 
 [dependencies]
 ezk.workspace = true
@@ -23,4 +24,5 @@ bytesstr = "1.0.2"
 slotmap = "1.0.7"
 srtp = "0.7"
 openssl = "0.10"
+openssl-sys = "0.9"
 base64 = "0.22"

@@ -1,25 +1,22 @@
 use bytesstr::BytesStr;
-use dtls_srtp::{DtlsSetup, DtlsSrtpSession};
-use ezk_rtp::{RtpPacket, RtpSession};
+use ezk_rtp::{parse_extensions, rtcp_types::Compound, RtpExtensionsWriter, RtpPacket, RtpSession};
 use local_media::LocalMedia;
 use sdp_types::{
-    Connection, Direction, ExtMap, Fingerprint, Fmtp, Group, IceOptions, Media, MediaDescription,
-    MediaType, Origin, Rtcp, RtpMap, SessionDescription, Setup, SrtpCrypto, TaggedAddress, Time,
-    TransportProtocol,
+    Connection, Direction, ExtMap, Fmtp, Group, IceOptions, Media, MediaDescription, MediaType,
+    Origin, Rtcp, RtpMap, SessionDescription, TaggedAddress, Time, TransportProtocol,
 };
 use slotmap::SlotMap;
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     io,
     mem::replace,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
 };
-use transport::IdentifyableBy;
+use transport::{ReceivedPacket, Transport};
 
 mod codecs;
-mod dtls_srtp;
 mod local_media;
-mod sdes_srtp;
 mod transceiver_builder;
 mod transport;
 mod wrapper;
@@ -124,6 +121,13 @@ impl MediaEntry {
             MediaEntry::Rejected(..) => None,
         }
     }
+
+    fn active_mut(&mut self) -> Option<&mut ActiveMedia> {
+        match self {
+            MediaEntry::Active(active_media) => Some(active_media),
+            MediaEntry::Rejected(..) => None,
+        }
+    }
 }
 
 struct ActiveMedia {
@@ -165,39 +169,6 @@ impl ActiveMedia {
 
         transports[self.transport].remote_rtp_address.port() == desc.media.port
     }
-}
-
-struct Transport {
-    local_rtp_port: Option<u16>,
-    local_rtcp_port: Option<u16>,
-
-    remote_rtp_address: SocketAddr,
-    remote_rtcp_address: SocketAddr,
-
-    kind: TransportKind,
-
-    mid_rtp_id: Option<u8>,
-}
-
-struct Entry {
-    rtp_session: RtpSession,
-    remote_identifyable_by: IdentifyableBy,
-}
-
-enum TransportKind {
-    Rtp,
-    SdesSrtp {
-        crypto: Vec<SrtpCrypto>,
-        inbound: srtp::Session,
-        outbound: srtp::Session,
-    },
-    DtlsSrtp {
-        fingerprint: Vec<Fingerprint>,
-        setup: Setup,
-
-        dtls: DtlsSrtpSession,
-        srtp: Option<(srtp::Session, srtp::Session)>,
-    },
 }
 
 impl SdpSession {
@@ -263,7 +234,7 @@ impl SdpSession {
             });
 
             if let Some(position) = matched_position {
-                // Remove the entry and only if its active, we don't consider creating a new media session
+                // Remove the entry and only if its active, don't consider trying to creating a new media session
                 if let MediaEntry::Active(mut active_media) = self.state.remove(position) {
                     self.update_active_media(requested_direction, &mut active_media);
                     new_state.push(MediaEntry::Active(active_media));
@@ -271,7 +242,7 @@ impl SdpSession {
                 }
             }
 
-            // Reject any invalid/inactive m-lines
+            // Reject any invalid/inactive media descriptions
             if remote_media_desc.direction == Direction::Inactive
                 || remote_media_desc.media.port == 0
             {
@@ -283,13 +254,14 @@ impl SdpSession {
             let (remote_rtp_address, remote_rtcp_address) =
                 resolve_rtp_and_rtcp_address(&offer, remote_media_desc)?;
 
-            // Choose local media for this m-line
-            let Some((local_media_id, (codec, codec_pt, negotiated_direction))) =
-                self.local_media.iter_mut().find_map(|(id, local_media)| {
-                    let config = local_media.maybe_use_for_offer(remote_media_desc)?;
+            // Choose local media for this media description
+            let chosen_media = self.local_media.iter_mut().find_map(|(id, local_media)| {
+                local_media
+                    .maybe_use_for_offer(remote_media_desc)
+                    .map(|config| (id, config))
+            });
 
-                    Some((id, config))
-                })
+            let Some((local_media_id, (codec, codec_pt, negotiated_direction))) = chosen_media
             else {
                 // no local media found for this
                 new_state.push(MediaEntry::Rejected(remote_media_desc.media.media_type));
@@ -416,73 +388,25 @@ impl SdpSession {
 
             None => {
                 // Not bundled or no transport for the group created yet
-                let mid_rtp_id = remote_media_desc
-                    .extmap
-                    .iter()
-                    .find(|extmap| extmap.uri == RTP_MID_HDREXT)
-                    .map(|extmap| extmap.id);
 
-                let kind = match remote_media_desc.media.proto {
-                    TransportProtocol::RtpAvp => TransportKind::Rtp,
-                    TransportProtocol::RtpSavp => {
-                        let (crypto, inbound, outbound) =
-                            sdes_srtp::negotiate_sdes_srtp(&remote_media_desc.crypto)?;
-
-                        TransportKind::SdesSrtp {
-                            crypto,
-                            inbound,
-                            outbound,
-                        }
+                let transport = match remote_media_desc.media.proto {
+                    TransportProtocol::RtpAvp => {
+                        Transport::rtp(remote_media_desc, remote_rtp_address, remote_rtcp_address)
                     }
-                    TransportProtocol::UdpTlsRtpSavp => {
-                        let setup = match remote_media_desc.setup {
-                            Some(Setup::Active) => DtlsSetup::Accept,
-                            Some(Setup::Passive) => DtlsSetup::Connect,
-                            Some(Setup::ActPass) => {
-                                // Use passive when accepting an offer so both sides will have the DTLS fingerprint
-                                // before any request is sent
-                                DtlsSetup::Accept
-                            }
-                            Some(Setup::HoldConn) | None => {
-                                // Missing or invalid setup specified, just silently fail here
-                                return Ok(None);
-                            }
-                        };
-
-                        let remote_fingerprints: Vec<_> = remote_media_desc
-                            .fingerprint
-                            .iter()
-                            .filter_map(|e| {
-                                Some((
-                                    dtls_srtp::to_openssl_digest(&e.algorithm)?,
-                                    e.fingerprint.clone(),
-                                ))
-                            })
-                            .collect();
-
-                        let dtls = DtlsSrtpSession::new(remote_fingerprints, setup)?;
-
-                        TransportKind::DtlsSrtp {
-                            fingerprint: vec![dtls.fingerprint()],
-                            setup: match setup {
-                                DtlsSetup::Accept => Setup::Passive,
-                                DtlsSetup::Connect => Setup::Active,
-                            },
-                            dtls,
-                            srtp: None,
-                        }
-                    }
+                    TransportProtocol::RtpSavp => Transport::sdes_srtp(
+                        remote_media_desc,
+                        remote_rtp_address,
+                        remote_rtcp_address,
+                    )?,
+                    TransportProtocol::UdpTlsRtpSavp => Transport::dtls_srtp(
+                        remote_media_desc,
+                        remote_rtp_address,
+                        remote_rtcp_address,
+                    )?,
                     _ => return Ok(None),
                 };
 
-                let transport_id = self.transports.insert(Transport {
-                    local_rtp_port: None,
-                    local_rtcp_port: None,
-                    remote_rtp_address,
-                    remote_rtcp_address,
-                    kind,
-                    mid_rtp_id,
-                });
+                let transport_id = self.transports.insert(transport);
 
                 if remote_media_desc.rtcp_mux {
                     self.instructions
@@ -555,33 +479,14 @@ impl SdpSession {
 
             let transport = &self.transports[active.transport];
 
-            let mut fingerprint = vec![];
-            let mut crypto = vec![];
-            let mut setup = None;
-
-            let proto = match &transport.kind {
-                TransportKind::Rtp => TransportProtocol::RtpAvp,
-                TransportKind::SdesSrtp { crypto: c, .. } => {
-                    crypto.extend_from_slice(c);
-                    TransportProtocol::RtpSavp
-                }
-                TransportKind::DtlsSrtp {
-                    fingerprint: f,
-                    setup: s,
-                    ..
-                } => {
-                    fingerprint.extend_from_slice(f);
-                    setup = Some(*s);
-                    TransportProtocol::UdpTlsRtpSavp
-                }
-            };
-
-            MediaDescription {
+            let mut media_desc = MediaDescription {
                 media: Media {
                     media_type: active.media_type,
-                    port: transport.local_rtp_port.unwrap(),
+                    port: transport
+                        .local_rtp_port
+                        .expect("Did not set port for RTP socket"),
                     ports_num: None,
-                    proto,
+                    proto: transport.sdp_type(),
                     fmts: vec![active.codec_pt],
                 },
                 connection: None,
@@ -599,14 +504,18 @@ impl SdpSession {
                 ice_pwd: None,
                 ice_candidates: vec![],
                 ice_end_of_candidates: false,
-                crypto,
+                crypto: vec![],
                 extmap,
                 extmap_allow_mixed: false,
                 ssrc: vec![],
-                setup,
-                fingerprint,
+                setup: None,
+                fingerprint: vec![],
                 attributes: vec![],
-            }
+            };
+
+            transport.populate_offer(&mut media_desc);
+
+            media_desc
         });
 
         // Create bundle group attributes
@@ -659,6 +568,113 @@ impl SdpSession {
             attributes: vec![],
             media_descriptions: media.collect(),
         }
+    }
+
+    pub fn receive(&mut self, socket_id: SocketId, data: &mut Cow<[u8]>, source: SocketAddr) {
+        let transport = &mut self.transports[socket_id.0];
+
+        match transport.receive(&mut self.instructions, data, source, socket_id) {
+            ReceivedPacket::Rtp => {
+                let rtp_packet = match RtpPacket::parse(data) {
+                    Ok(rtp_packet) => rtp_packet,
+                    Err(e) => {
+                        log::debug!("Failed to parse RTP packet, {e:?}");
+                        return;
+                    }
+                };
+
+                let pkg = rtp_packet.get();
+
+                // Parse the mid from the rtp-packet's extensions
+                let mid = transport.mid_rtp_id.zip(pkg.extension()).and_then(
+                    |(mid_rtp_id, (profile, data))| {
+                        parse_extensions(profile, data)
+                            .find(|(id, _)| *id == mid_rtp_id)
+                            .map(|(_, mid)| mid)
+                    },
+                );
+
+                let entry = self
+                    .state
+                    .iter_mut()
+                    .filter_map(MediaEntry::active_mut)
+                    .filter(|m| m.transport == socket_id.0)
+                    .find(|e| match (&e.mid, mid) {
+                        (Some(a), Some(b)) => a.as_bytes() == b,
+                        _ => false,
+                    });
+
+                let entry = if let Some(entry) = entry {
+                    Some(entry)
+                } else {
+                    self.state
+                        .iter_mut()
+                        .filter_map(MediaEntry::active_mut)
+                        .filter(|m| m.transport == socket_id.0)
+                        .find(|e| e.codec_pt == pkg.payload_type())
+                };
+
+                if let Some(entry) = entry {
+                    entry.rtp_session.recv_rtp(rtp_packet);
+                }
+            }
+            ReceivedPacket::Rtcp => {
+                let rtcp_compound = match Compound::parse(data) {
+                    Ok(rtcp_compound) => rtcp_compound,
+                    Err(e) => {
+                        log::debug!("Failed to parse incoming RTCP packet, {e}");
+                        return;
+                    }
+                };
+            }
+            ReceivedPacket::TransportSpecific => {
+                // ignore
+            }
+        }
+    }
+
+    pub fn send_rtp(&mut self, media_id: ActiveMediaId, mut packet: RtpPacket) {
+        let media = self
+            .state
+            .iter_mut()
+            .filter_map(MediaEntry::active_mut)
+            .find(|m| m.id == media_id)
+            .unwrap();
+
+        let mut packet_mut = packet.get_mut();
+
+        let mut encode_buf = Vec::new();
+
+        // TODO: rewrite extension handling, this is very messy right now
+        {
+            // Set missing packet header fields
+            packet_mut.set_ssrc(media.rtp_session.ssrc());
+            let mut builder = packet_mut.as_builder();
+
+            let mut extension_data = vec![];
+            if let Some(mid) = &media.mid {
+                let profile = RtpExtensionsWriter::new(&mut extension_data, mid.len() <= 16)
+                    .with(RTP_MID_HDREXT_ID, mid.as_bytes())
+                    .finish();
+
+                builder = builder.extension(profile, &extension_data);
+            }
+
+            builder
+                .write_into_vec(&mut encode_buf)
+                .expect("buffer of 65535 bytes must be large enough");
+        }
+
+        media.rtp_session.send_rtp(&packet);
+
+        let transport = &mut self.transports[media.transport];
+        transport.protect_rtp(&mut encode_buf);
+
+        self.instructions.push_back(Instruction::SendData {
+            socket: SocketId(media.transport, SocketUse::Rtp),
+            data: encode_buf,
+            target: transport.remote_rtp_address,
+        });
     }
 }
 

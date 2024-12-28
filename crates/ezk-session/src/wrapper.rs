@@ -1,9 +1,10 @@
+use crate::{Codecs, Instruction, LocalMediaId, SocketId};
 use sdp_types::{Direction, SessionDescription};
-use slotmap::SecondaryMap;
-use std::{collections::HashMap, future::poll_fn, io, net::IpAddr, task::Poll};
+use std::{
+    borrow::Cow, collections::HashMap, future::poll_fn, io, mem::MaybeUninit, net::IpAddr,
+    task::Poll,
+};
 use tokio::{io::ReadBuf, net::UdpSocket};
-
-use crate::{Codecs, Instruction, LocalMediaId, SocketId, TransportId};
 
 pub struct SdpSession {
     inner: super::SdpSession,
@@ -82,10 +83,13 @@ impl SdpSession {
         Ok(())
     }
 
-    async fn run(&mut self) -> io::Result<()> {
-        let mut buf = vec![0u8; 65535];
-        let mut buf = ReadBuf::new(&mut buf);
+    pub async fn run(&mut self) -> io::Result<()> {
+        let mut buf = vec![MaybeUninit::uninit(); 65535];
+        let mut buf = ReadBuf::uninit(&mut buf);
+
         loop {
+            buf.set_filled(0);
+
             let (socket_id, result) = poll_fn(|cx| {
                 for (socket_id, socket) in &self.sockets {
                     let Poll::Ready(result) = socket.poll_recv_from(cx, &mut buf) else {
@@ -99,7 +103,12 @@ impl SdpSession {
             })
             .await;
 
-            
+            let source = result?;
+
+            self.inner
+                .receive(*socket_id, &mut Cow::Borrowed(buf.filled()), source);
+
+            self.handle_instructions().await.unwrap();
         }
     }
 }

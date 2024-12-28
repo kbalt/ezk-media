@@ -17,7 +17,8 @@ use std::{
     collections::VecDeque,
     io::{self, Cursor, Read, Write},
     pin::Pin,
-    sync::OnceLock, time::Duration,
+    sync::OnceLock,
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -102,8 +103,9 @@ impl DtlsSrtpSession {
         }
     }
 
+    #[cfg(openssl320)]
     pub(crate) fn timeout(&mut self) -> Option<Duration> {
-        self.stream.ssl().event_timeout()
+        self.stream.ssl().event_timeout().unwrap()
     }
 
     pub(crate) fn receive(&mut self, dgram: Vec<u8>) {
@@ -150,8 +152,6 @@ struct IoQueue {
 
 impl Read for IoQueue {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        println!("IO QUEUE READ {}", self.to_read.is_some());
-
         let Some(to_read) = &mut self.to_read else {
             return Err(io::ErrorKind::WouldBlock.into());
         };
@@ -168,7 +168,6 @@ impl Read for IoQueue {
 
 impl Write for IoQueue {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        println!("IO QUEUE WRITE");
         self.out.push_back(buf.to_vec());
         Ok(buf.len())
     }
