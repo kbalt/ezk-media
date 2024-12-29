@@ -1,7 +1,7 @@
-use crate::{Error, Instruction, SocketId, RTP_MID_HDREXT};
+use crate::{Error, Event, SocketId, TransportId, RTP_MID_HDREXT};
 use dtls_srtp::{DtlsSetup, DtlsSrtpSession};
 use sdp_types::{Fingerprint, MediaDescription, Setup, SrtpCrypto, TransportProtocol};
-use std::{borrow::Cow, collections::VecDeque, io, net::SocketAddr};
+use std::{borrow::Cow, collections::VecDeque, io, net::SocketAddr, time::Duration};
 
 mod dtls_srtp;
 mod packet_kind;
@@ -148,9 +148,35 @@ impl Transport {
         }
     }
 
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        match &self.kind {
+            TransportKind::Rtp => None,
+            TransportKind::SdesSrtp { .. } => None,
+            TransportKind::DtlsSrtp { dtls, .. } => dtls.timeout(),
+        }
+    }
+
+    pub(crate) fn poll(&mut self, id: TransportId, events: &mut VecDeque<Event>) {
+        match &mut self.kind {
+            TransportKind::Rtp => {}
+            TransportKind::SdesSrtp { .. } => {}
+            TransportKind::DtlsSrtp { dtls, .. } => {
+                dtls.handshake().unwrap();
+
+                while let Some(data) = dtls.pop_to_send() {
+                    events.push_back(Event::SendData {
+                        socket: SocketId(id, crate::SocketUse::Rtp),
+                        data,
+                        target: self.remote_rtp_address,
+                    });
+                }
+            }
+        }
+    }
+
     pub(crate) fn receive(
         &mut self,
-        instructions: &mut VecDeque<Instruction>,
+        events: &mut VecDeque<Event>,
         data: &mut Cow<[u8]>,
         source: SocketAddr,
         socket_id: SocketId,
@@ -194,7 +220,7 @@ impl Transport {
                     }
 
                     while let Some(data) = dtls.pop_to_send() {
-                        instructions.push_back(Instruction::SendData {
+                        events.push_back(Event::SendData {
                             socket: socket_id,
                             data,
                             target: source,
@@ -211,7 +237,7 @@ impl Transport {
         }
     }
 
-    pub fn protect_rtp(&mut self, packet: &mut Vec<u8>) {
+    pub(crate) fn protect_rtp(&mut self, packet: &mut Vec<u8>) {
         if let TransportKind::SdesSrtp { outbound, .. }
         | TransportKind::DtlsSrtp {
             srtp: Some((_, outbound)),
@@ -222,7 +248,7 @@ impl Transport {
         }
     }
 
-    pub fn protect_rtcp(&mut self, packet: &mut Vec<u8>) {
+    pub(crate) fn protect_rtcp(&mut self, packet: &mut Vec<u8>) {
         if let TransportKind::SdesSrtp { outbound, .. }
         | TransportKind::DtlsSrtp {
             srtp: Some((_, outbound)),

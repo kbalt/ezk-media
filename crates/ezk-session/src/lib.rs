@@ -8,10 +8,12 @@ use sdp_types::{
 use slotmap::SlotMap;
 use std::{
     borrow::Cow,
+    cmp::min,
     collections::{HashMap, VecDeque},
     io,
     mem::replace,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
+    time::Duration,
 };
 use transport::{ReceivedPacket, Transport};
 
@@ -54,7 +56,7 @@ enum SocketUse {
     Rtcp,
 }
 
-pub enum Instruction {
+pub enum Event {
     /// Create 2 UdpSockets for a media session
     ///
     /// This is called when rtcp-mux is not available
@@ -75,6 +77,11 @@ pub enum Instruction {
 
     /// Added a track
     TrackAdded {},
+}
+
+pub enum TransportState {
+    Connected,
+    Disconnected,
 }
 
 pub struct ReceiveData {
@@ -106,7 +113,7 @@ pub struct SdpSession {
     // Transports
     transports: SlotMap<TransportId, Transport>,
 
-    instructions: VecDeque<Instruction>,
+    events: VecDeque<Event>,
 }
 
 enum MediaEntry {
@@ -181,7 +188,7 @@ impl SdpSession {
             next_active_media_id: ActiveMediaId(0),
             state: Vec::new(),
             transports: SlotMap::with_key(),
-            instructions: VecDeque::new(),
+            events: VecDeque::new(),
         }
     }
 
@@ -204,8 +211,8 @@ impl SdpSession {
         self.local_media.remove(local_media_id);
     }
 
-    pub fn pop_instruction(&mut self) -> Option<Instruction> {
-        self.instructions.pop_front()
+    pub fn pop_event(&mut self) -> Option<Event> {
+        self.events.pop_front()
     }
 
     pub fn set_socket_port(&mut self, socket_id: SocketId, port: u16) {
@@ -409,15 +416,14 @@ impl SdpSession {
                 let transport_id = self.transports.insert(transport);
 
                 if remote_media_desc.rtcp_mux {
-                    self.instructions
-                        .push_back(Instruction::CreateUdpSocketPair {
-                            socket_ids: [
-                                SocketId(transport_id, SocketUse::Rtp),
-                                SocketId(transport_id, SocketUse::Rtcp),
-                            ],
-                        });
+                    self.events.push_back(Event::CreateUdpSocketPair {
+                        socket_ids: [
+                            SocketId(transport_id, SocketUse::Rtp),
+                            SocketId(transport_id, SocketUse::Rtcp),
+                        ],
+                    });
                 } else {
-                    self.instructions.push_back(Instruction::CreateUdpSocket {
+                    self.events.push_back(Event::CreateUdpSocket {
                         socket_id: SocketId(transport_id, SocketUse::Rtp),
                     });
                 }
@@ -570,10 +576,46 @@ impl SdpSession {
         }
     }
 
+    /// Returns a duration after which [`poll`](Self::poll) must be called
+    pub fn timeout(&self) -> Option<Duration> {
+        let mut timeout = None;
+
+        for transport in self.transports.values() {
+            match (&mut timeout, transport.timeout()) {
+                (None, Some(new)) => timeout = Some(new),
+                (Some(prev), Some(new)) => *prev = min(*prev, new),
+                _ => {}
+            }
+        }
+
+        for media in self.state.iter().filter_map(MediaEntry::active) {
+            match (&mut timeout, media.rtp_session.pop_rtp_after(None)) {
+                (None, Some(new)) => timeout = Some(new),
+                (Some(prev), Some(new)) => *prev = min(*prev, new),
+                _ => {}
+            }
+        }
+
+        timeout
+    }
+
+    /// Poll for new events. Call [`pop_event`](Self::pop_event) to handle them.
+    pub fn poll(&mut self) {
+        for (transport_id, transport) in &mut self.transports {
+            transport.poll(transport_id, &mut self.events);
+        }
+
+        for media in self.state.iter_mut().filter_map(MediaEntry::active_mut) {
+            if let Some(rtp_packet) = media.rtp_session.pop_rtp(None) {
+                println!("POPPED RTP")
+            }
+        }
+    }
+
     pub fn receive(&mut self, socket_id: SocketId, data: &mut Cow<[u8]>, source: SocketAddr) {
         let transport = &mut self.transports[socket_id.0];
 
-        match transport.receive(&mut self.instructions, data, source, socket_id) {
+        match transport.receive(&mut self.events, data, source, socket_id) {
             ReceivedPacket::Rtp => {
                 let rtp_packet = match RtpPacket::parse(data) {
                     Ok(rtp_packet) => rtp_packet,
@@ -670,7 +712,7 @@ impl SdpSession {
         let transport = &mut self.transports[media.transport];
         transport.protect_rtp(&mut encode_buf);
 
-        self.instructions.push_back(Instruction::SendData {
+        self.events.push_back(Event::SendData {
             socket: SocketId(media.transport, SocketUse::Rtp),
             data: encode_buf,
             target: transport.remote_rtp_address,
@@ -707,7 +749,7 @@ impl SdpSession {
             SocketUse::Rtcp
         };
 
-        self.instructions.push_back(Instruction::SendData {
+        self.events.push_back(Event::SendData {
             socket: SocketId(media.transport, socket_use),
             data: encode_buf,
             target: transport.remote_rtcp_address,

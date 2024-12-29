@@ -104,8 +104,13 @@ impl DtlsSrtpSession {
     }
 
     #[cfg(openssl320)]
-    pub(crate) fn timeout(&mut self) -> Option<Duration> {
+    pub(crate) fn timeout(&self) -> Option<Duration> {
         self.stream.ssl().event_timeout().unwrap()
+    }
+
+    #[cfg(not(openssl320))]
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        Some(Duration::from_millis(100))
     }
 
     pub(crate) fn receive(&mut self, dgram: Vec<u8>) {
