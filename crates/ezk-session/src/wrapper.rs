@@ -8,7 +8,6 @@ use std::{
     mem::MaybeUninit,
     net::IpAddr,
     task::Poll,
-    time::Duration,
 };
 use tokio::{
     io::ReadBuf,
@@ -62,8 +61,8 @@ impl AsyncSdpSession {
     }
 
     async fn handle_events(&mut self) -> Result<(), super::Error> {
-        while let Some(ins) = self.inner.pop_event() {
-            match ins {
+        while let Some(event) = self.inner.pop_event() {
+            match event {
                 Event::CreateUdpSocketPair { socket_ids } => {
                     let socket1 = UdpSocket::bind("0.0.0.0:0").await?;
                     let socket2 = UdpSocket::bind("0.0.0.0:0").await?;
@@ -89,8 +88,12 @@ impl AsyncSdpSession {
                 } => {
                     self.sockets[&socket].send_to(&data, target).await?;
                 }
-                Event::ReceiveRTP { packet } => {}
-                Event::TrackAdded {} => {}
+                Event::ConnectionState { media_id, state } => {
+                    println!("Connection state of {media_id:?} changed to {state:?}")
+                }
+                Event::ReceiveRTP { media_id, packet } => {
+                    println!("Received RTP on {media_id:?}");
+                }
             }
         }
 
@@ -100,8 +103,6 @@ impl AsyncSdpSession {
     pub async fn run(&mut self) -> io::Result<()> {
         let mut buf = vec![MaybeUninit::uninit(); 65535];
         let mut buf = ReadBuf::uninit(&mut buf);
-
-        let start = Instant::now();
 
         loop {
             self.inner.poll();

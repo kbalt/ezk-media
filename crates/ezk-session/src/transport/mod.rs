@@ -1,13 +1,25 @@
-use crate::{Error, Event, SocketId, TransportId, RTP_MID_HDREXT};
+use crate::{
+    rtp::RtpExtensionIds, ActiveMediaId, ConnectionState, Error, Event, Events, SocketId,
+    TransportId,
+};
 use dtls_srtp::{DtlsSetup, DtlsSrtpSession};
 use sdp_types::{Fingerprint, MediaDescription, Setup, SrtpCrypto, TransportProtocol};
-use std::{borrow::Cow, collections::VecDeque, io, net::SocketAddr, time::Duration};
+use std::{borrow::Cow, io, net::SocketAddr, time::Duration};
 
 mod dtls_srtp;
 mod packet_kind;
 mod sdes_srtp;
 
 pub(crate) use packet_kind::PacketKind;
+
+compile_error!("track transport events per transport and them convert them to user facing events on a track level");
+
+pub(crate) enum TransportEvent {
+    ConnectionState {
+        old: ConnectionState,
+        new: ConnectionState,
+    },
+}
 
 pub(crate) struct Transport {
     pub(crate) local_rtp_port: Option<u16>,
@@ -16,9 +28,11 @@ pub(crate) struct Transport {
     pub(crate) remote_rtp_address: SocketAddr,
     pub(crate) remote_rtcp_address: SocketAddr,
 
-    kind: TransportKind,
+    pub(crate) extension_ids: RtpExtensionIds,
 
-    pub(crate) mid_rtp_id: Option<u8>,
+    state: ConnectionState,
+
+    kind: TransportKind,
 }
 
 enum TransportKind {
@@ -38,6 +52,49 @@ enum TransportKind {
 }
 
 impl Transport {
+    pub(crate) fn create_from_offer(
+        events: &mut Events,
+        remote_media_desc: &MediaDescription,
+        remote_rtp_address: SocketAddr,
+        remote_rtcp_address: SocketAddr,
+        active_media_id: ActiveMediaId,
+    ) -> Result<Option<Self>, Error> {
+        match &remote_media_desc.media.proto {
+            TransportProtocol::RtpAvp => {
+                events.push(Event::ConnectionState {
+                    media_id: active_media_id,
+                    state: ConnectionState::Connected,
+                });
+
+                Ok(Some(Self::rtp(
+                    remote_media_desc,
+                    remote_rtp_address,
+                    remote_rtcp_address,
+                )))
+            }
+            TransportProtocol::RtpSavp => {
+                events.push(Event::ConnectionState {
+                    media_id: active_media_id,
+                    state: ConnectionState::Connected,
+                });
+
+                Some(Self::sdes_srtp(
+                    remote_media_desc,
+                    remote_rtp_address,
+                    remote_rtcp_address,
+                ))
+                .transpose()
+            }
+            TransportProtocol::UdpTlsRtpSavp => Some(Self::dtls_srtp(
+                remote_media_desc,
+                remote_rtp_address,
+                remote_rtcp_address,
+            ))
+            .transpose(),
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn rtp(
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
@@ -48,8 +105,9 @@ impl Transport {
             local_rtcp_port: None,
             remote_rtp_address,
             remote_rtcp_address,
+            extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
+            state: ConnectionState::Connected,
             kind: TransportKind::Rtp,
-            mid_rtp_id: rtp_mid_id(remote_media_desc),
         }
     }
 
@@ -66,12 +124,13 @@ impl Transport {
             local_rtcp_port: None,
             remote_rtp_address,
             remote_rtcp_address,
+            extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
+            state: ConnectionState::Connected,
             kind: TransportKind::SdesSrtp {
                 crypto,
                 inbound,
                 outbound,
             },
-            mid_rtp_id: rtp_mid_id(remote_media_desc),
         })
     }
 
@@ -80,6 +139,10 @@ impl Transport {
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
     ) -> Result<Self, Error> {
+        if !remote_media_desc.rtcp_mux {
+            return Err(io::Error::other("DTLS-SRTP without rtcp-mux is not supported").into());
+        }
+
         let setup = match remote_media_desc.setup {
             Some(Setup::Active) => DtlsSetup::Accept,
             Some(Setup::Passive) => DtlsSetup::Connect,
@@ -112,6 +175,8 @@ impl Transport {
             local_rtcp_port: None,
             remote_rtp_address,
             remote_rtcp_address,
+            extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
+            state: ConnectionState::Disconnected,
             kind: TransportKind::DtlsSrtp {
                 fingerprint: vec![dtls.fingerprint()],
                 setup: match setup {
@@ -121,7 +186,6 @@ impl Transport {
                 dtls,
                 srtp: None,
             },
-            mid_rtp_id: rtp_mid_id(remote_media_desc),
         })
     }
 
@@ -156,7 +220,7 @@ impl Transport {
         }
     }
 
-    pub(crate) fn poll(&mut self, id: TransportId, events: &mut VecDeque<Event>) {
+    pub(crate) fn poll(&mut self, id: TransportId, events: &mut Events) {
         match &mut self.kind {
             TransportKind::Rtp => {}
             TransportKind::SdesSrtp { .. } => {}
@@ -164,7 +228,7 @@ impl Transport {
                 dtls.handshake().unwrap();
 
                 while let Some(data) = dtls.pop_to_send() {
-                    events.push_back(Event::SendData {
+                    events.push(Event::SendData {
                         socket: SocketId(id, crate::SocketUse::Rtp),
                         data,
                         target: self.remote_rtp_address,
@@ -176,7 +240,7 @@ impl Transport {
 
     pub(crate) fn receive(
         &mut self,
-        events: &mut VecDeque<Event>,
+        events: &mut Events,
         data: &mut Cow<[u8]>,
         source: SocketAddr,
         socket_id: SocketId,
@@ -220,7 +284,7 @@ impl Transport {
                     }
 
                     while let Some(data) = dtls.pop_to_send() {
-                        events.push_back(Event::SendData {
+                        events.push(Event::SendData {
                             socket: socket_id,
                             data,
                             target: source,
@@ -265,12 +329,4 @@ pub(crate) enum ReceivedPacket {
     Rtp,
     Rtcp,
     TransportSpecific,
-}
-
-fn rtp_mid_id(remote_media_desc: &MediaDescription) -> Option<u8> {
-    remote_media_desc
-        .extmap
-        .iter()
-        .find(|extmap| extmap.uri == RTP_MID_HDREXT)
-        .map(|extmap| extmap.id)
 }
