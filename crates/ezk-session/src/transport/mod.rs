@@ -1,10 +1,7 @@
-use crate::{
-    rtp::RtpExtensionIds, ActiveMediaId, ConnectionState, Error, Event, Events, SocketId,
-    TransportId,
-};
+use crate::{rtp::RtpExtensionIds, ConnectionState, Error, Event, Events, SocketId};
 use dtls_srtp::{DtlsSetup, DtlsSrtpSession};
 use sdp_types::{Fingerprint, MediaDescription, Setup, SrtpCrypto, TransportProtocol};
-use std::{borrow::Cow, io, net::SocketAddr, time::Duration};
+use std::{borrow::Cow, collections::VecDeque, io, net::SocketAddr, time::Duration};
 
 mod dtls_srtp;
 mod packet_kind;
@@ -12,13 +9,22 @@ mod sdes_srtp;
 
 pub(crate) use packet_kind::PacketKind;
 
-compile_error!("track transport events per transport and them convert them to user facing events on a track level");
-
 pub(crate) enum TransportEvent {
     ConnectionState {
         old: ConnectionState,
         new: ConnectionState,
     },
+    SendData {
+        socket: SocketUse,
+        data: Vec<u8>,
+        target: SocketAddr,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SocketUse {
+    Rtp,
+    Rtcp,
 }
 
 pub(crate) struct Transport {
@@ -31,8 +37,11 @@ pub(crate) struct Transport {
     pub(crate) extension_ids: RtpExtensionIds,
 
     state: ConnectionState,
-
     kind: TransportKind,
+
+    // Transport keep track of their own events separatly since they shouldn't be responsible for propagating these
+    // events to the media tracks/streams that are using them.
+    events: VecDeque<TransportEvent>,
 }
 
 enum TransportKind {
@@ -53,38 +62,30 @@ enum TransportKind {
 
 impl Transport {
     pub(crate) fn create_from_offer(
-        events: &mut Events,
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
-        active_media_id: ActiveMediaId,
     ) -> Result<Option<Self>, Error> {
         match &remote_media_desc.media.proto {
-            TransportProtocol::RtpAvp => {
-                events.push(Event::ConnectionState {
-                    media_id: active_media_id,
-                    state: ConnectionState::Connected,
-                });
-
-                Ok(Some(Self::rtp(
-                    remote_media_desc,
-                    remote_rtp_address,
-                    remote_rtcp_address,
-                )))
-            }
-            TransportProtocol::RtpSavp => {
-                events.push(Event::ConnectionState {
-                    media_id: active_media_id,
-                    state: ConnectionState::Connected,
-                });
-
-                Some(Self::sdes_srtp(
-                    remote_media_desc,
-                    remote_rtp_address,
-                    remote_rtcp_address,
-                ))
-                .transpose()
-            }
+            TransportProtocol::RtpAvp => Ok(Some(Self {
+                local_rtp_port: None,
+                local_rtcp_port: None,
+                remote_rtp_address,
+                remote_rtcp_address,
+                extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
+                state: ConnectionState::Connected,
+                kind: TransportKind::Rtp,
+                events: VecDeque::from([TransportEvent::ConnectionState {
+                    old: ConnectionState::New,
+                    new: ConnectionState::Connected,
+                }]),
+            })),
+            TransportProtocol::RtpSavp => Some(Self::sdes_srtp(
+                remote_media_desc,
+                remote_rtp_address,
+                remote_rtcp_address,
+            ))
+            .transpose(),
             TransportProtocol::UdpTlsRtpSavp => Some(Self::dtls_srtp(
                 remote_media_desc,
                 remote_rtp_address,
@@ -92,22 +93,6 @@ impl Transport {
             ))
             .transpose(),
             _ => Ok(None),
-        }
-    }
-
-    pub(crate) fn rtp(
-        remote_media_desc: &MediaDescription,
-        remote_rtp_address: SocketAddr,
-        remote_rtcp_address: SocketAddr,
-    ) -> Self {
-        Self {
-            local_rtp_port: None,
-            local_rtcp_port: None,
-            remote_rtp_address,
-            remote_rtcp_address,
-            extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
-            state: ConnectionState::Connected,
-            kind: TransportKind::Rtp,
         }
     }
 
@@ -131,6 +116,10 @@ impl Transport {
                 inbound,
                 outbound,
             },
+            events: VecDeque::from([TransportEvent::ConnectionState {
+                old: ConnectionState::New,
+                new: ConnectionState::Connected,
+            }]),
         })
     }
 
@@ -167,8 +156,20 @@ impl Transport {
             })
             .collect();
 
-        // TODO: connect will not work, since there's no initial handshake call
-        let dtls = DtlsSrtpSession::new(remote_fingerprints, setup)?;
+        let mut dtls = DtlsSrtpSession::new(remote_fingerprints, setup)?;
+
+        // Call handshake so that intial messages can be created
+        assert!(dtls.handshake().unwrap().is_none());
+
+        // Check for any send event from openssl
+        let mut events = VecDeque::new();
+        while let Some(data) = dtls.pop_to_send() {
+            events.push_back(TransportEvent::SendData {
+                socket: SocketUse::Rtp,
+                data,
+                target: remote_rtp_address,
+            });
+        }
 
         Ok(Self {
             local_rtp_port: None,
@@ -176,7 +177,7 @@ impl Transport {
             remote_rtp_address,
             remote_rtcp_address,
             extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
-            state: ConnectionState::Disconnected,
+            state: ConnectionState::New,
             kind: TransportKind::DtlsSrtp {
                 fingerprint: vec![dtls.fingerprint()],
                 setup: match setup {
@@ -186,6 +187,7 @@ impl Transport {
                 dtls,
                 srtp: None,
             },
+            events,
         })
     }
 
@@ -220,22 +222,26 @@ impl Transport {
         }
     }
 
-    pub(crate) fn poll(&mut self, id: TransportId, events: &mut Events) {
+    pub(crate) fn poll(&mut self) {
         match &mut self.kind {
             TransportKind::Rtp => {}
             TransportKind::SdesSrtp { .. } => {}
             TransportKind::DtlsSrtp { dtls, .. } => {
-                dtls.handshake().unwrap();
+                assert!(dtls.handshake().unwrap().is_none());
 
                 while let Some(data) = dtls.pop_to_send() {
-                    events.push(Event::SendData {
-                        socket: SocketId(id, crate::SocketUse::Rtp),
+                    self.events.push_back(TransportEvent::SendData {
+                        socket: SocketUse::Rtp,
                         data,
                         target: self.remote_rtp_address,
                     });
                 }
             }
         }
+    }
+
+    pub(crate) fn pop_event(&mut self) -> Option<TransportEvent> {
+        self.events.pop_front()
     }
 
     pub(crate) fn receive(
@@ -280,6 +286,13 @@ impl Transport {
                     dtls.receive(data.clone().into_owned());
 
                     if let Some((inbound, outbound)) = dtls.handshake().unwrap() {
+                        if self.state != ConnectionState::Connected {
+                            self.events.push_back(TransportEvent::ConnectionState {
+                                old: self.state,
+                                new: ConnectionState::Connected,
+                            });
+                        }
+
                         *srtp = Some((inbound.into_session(), outbound.into_session()));
                     }
 

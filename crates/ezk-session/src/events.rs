@@ -23,7 +23,8 @@ pub enum Event {
     /// This is emitted for every track even if they are bundled on the same transport
     ConnectionState {
         media_id: ActiveMediaId,
-        state: ConnectionState,
+        old: ConnectionState,
+        new: ConnectionState,
     },
 
     /// Receive RTP on a track
@@ -34,8 +35,8 @@ pub enum Event {
 }
 /// Connection state of a media track
 ///
-/// Each track has a connection state since tracks may not always be bundled on the same transport.
-#[derive(Debug)]
+/// Each track has its own connection state, since tracks may not always be bundled on the same transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     New,
     Connecting,

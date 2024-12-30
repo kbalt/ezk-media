@@ -88,8 +88,8 @@ impl AsyncSdpSession {
                 } => {
                     self.sockets[&socket].send_to(&data, target).await?;
                 }
-                Event::ConnectionState { media_id, state } => {
-                    println!("Connection state of {media_id:?} changed to {state:?}")
+                Event::ConnectionState { media_id, old, new } => {
+                    println!("Connection state of {media_id:?} changed from {old:?} to {new:?}");
                 }
                 Event::ReceiveRTP { media_id, packet } => {
                     println!("Received RTP on {media_id:?}");

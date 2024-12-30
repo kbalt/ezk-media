@@ -113,9 +113,9 @@ impl DtlsSrtpSession {
         Some(Duration::from_millis(100))
     }
 
-    pub(crate) fn receive(&mut self, dgram: Vec<u8>) {
+    pub(crate) fn receive(&mut self, data: Vec<u8>) {
         assert!(self.stream.get_mut().to_read.is_none());
-        self.stream.get_mut().to_read = Some(Cursor::new(dgram));
+        self.stream.get_mut().to_read = Some(Cursor::new(data));
     }
 
     pub(crate) fn handshake(

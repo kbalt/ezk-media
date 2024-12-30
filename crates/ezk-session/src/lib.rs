@@ -16,7 +16,7 @@ use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     time::Duration,
 };
-use transport::{ReceivedPacket, Transport};
+use transport::{ReceivedPacket, SocketUse, Transport, TransportEvent};
 
 mod codecs;
 mod events;
@@ -49,18 +49,6 @@ slotmap::new_key_type! {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SocketId(TransportId, SocketUse);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum SocketUse {
-    Rtp,
-    Rtcp,
-}
-
-pub struct ReceiveData {
-    pub transport_id: TransportId,
-    pub source: SocketAddr,
-    pub data: Vec<u8>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -295,6 +283,9 @@ impl SdpSession {
                 .any(|active| active.transport == id)
         });
 
+        // TODO: remove me
+        self.poll();
+
         Ok(())
     }
 
@@ -371,11 +362,9 @@ impl SdpSession {
                 // Not bundled or no transport for the group created yet
 
                 let Some(transport) = Transport::create_from_offer(
-                    &mut self.events,
                     remote_media_desc,
                     remote_rtp_address,
                     remote_rtcp_address,
-                    active_media_id,
                 )?
                 else {
                     return Ok(None);
@@ -561,7 +550,14 @@ impl SdpSession {
     /// Poll for new events. Call [`pop_event`](Self::pop_event) to handle them.
     pub fn poll(&mut self) {
         for (transport_id, transport) in &mut self.transports {
-            transport.poll(transport_id, &mut self.events);
+            transport.poll();
+
+            Self::propagate_transport_events(
+                &self.state,
+                &mut self.events,
+                transport_id,
+                transport,
+            );
         }
 
         for media in self.state.iter_mut().filter_map(MediaEntry::active_mut) {
@@ -570,6 +566,44 @@ impl SdpSession {
                     media_id: media.id,
                     packet: rtp_packet,
                 });
+            }
+        }
+    }
+
+    /// "Converts" the the transport's event to the session events
+    fn propagate_transport_events(
+        state: &[MediaEntry],
+        events: &mut Events,
+        transport_id: TransportId,
+        transport: &mut Transport,
+    ) {
+        while let Some(event) = transport.pop_event() {
+            match event {
+                TransportEvent::ConnectionState { old, new } => {
+                    // Emit the connection state event for every track that uses the transport
+                    for media in state
+                        .iter()
+                        .filter_map(MediaEntry::active)
+                        .filter(|m| m.transport == transport_id)
+                    {
+                        events.push(Event::ConnectionState {
+                            media_id: media.id,
+                            old,
+                            new,
+                        });
+                    }
+                }
+                TransportEvent::SendData {
+                    socket,
+                    data,
+                    target,
+                } => {
+                    events.push(Event::SendData {
+                        socket: SocketId(transport_id, socket),
+                        data,
+                        target,
+                    });
+                }
             }
         }
     }
