@@ -5,7 +5,7 @@ pub struct Options {
     pub bundle_policy: BundlePolicy,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum TransportType {
     Rtp,
     SdesSrtp,

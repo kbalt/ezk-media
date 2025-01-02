@@ -1,4 +1,4 @@
-use crate::{rtp::RtpExtensionIds, ConnectionState, Error, Event, Events, SocketId, TransportType};
+use crate::{rtp::RtpExtensionIds, ConnectionState, Error, TransportType};
 use dtls_srtp::{DtlsCertificate, DtlsSetup, DtlsSrtpSession};
 use sdp_types::{Fingerprint, MediaDescription, Setup, SrtpCrypto, TransportProtocol};
 use std::{borrow::Cow, collections::VecDeque, io, net::SocketAddr, time::Duration};
@@ -87,12 +87,28 @@ impl Transport {
                     new: ConnectionState::Connected,
                 }]),
             })),
-            TransportProtocol::RtpSavp => Some(Self::sdes_srtp(
-                remote_media_desc,
-                remote_rtp_address,
-                remote_rtcp_address,
-            ))
-            .transpose(),
+            TransportProtocol::RtpSavp => {
+                let (crypto, inbound, outbound) =
+                    sdes_srtp::negotiate_sdes_srtp(&remote_media_desc.crypto)?;
+
+                Ok(Some(Self {
+                    local_rtp_port: None,
+                    local_rtcp_port: None,
+                    remote_rtp_address,
+                    remote_rtcp_address,
+                    extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
+                    state: ConnectionState::Connected,
+                    kind: TransportKind::SdesSrtp {
+                        crypto,
+                        inbound,
+                        outbound,
+                    },
+                    events: VecDeque::from([TransportEvent::ConnectionState {
+                        old: ConnectionState::New,
+                        new: ConnectionState::Connected,
+                    }]),
+                }))
+            }
             TransportProtocol::UdpTlsRtpSavp => Some(Self::dtls_srtp(
                 state,
                 remote_media_desc,
@@ -102,33 +118,6 @@ impl Transport {
             .transpose(),
             _ => Ok(None),
         }
-    }
-
-    pub(crate) fn sdes_srtp(
-        remote_media_desc: &MediaDescription,
-        remote_rtp_address: SocketAddr,
-        remote_rtcp_address: SocketAddr,
-    ) -> Result<Self, Error> {
-        let (crypto, inbound, outbound) =
-            sdes_srtp::negotiate_sdes_srtp(&remote_media_desc.crypto)?;
-
-        Ok(Self {
-            local_rtp_port: None,
-            local_rtcp_port: None,
-            remote_rtp_address,
-            remote_rtcp_address,
-            extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
-            state: ConnectionState::Connected,
-            kind: TransportKind::SdesSrtp {
-                crypto,
-                inbound,
-                outbound,
-            },
-            events: VecDeque::from([TransportEvent::ConnectionState {
-                old: ConnectionState::New,
-                new: ConnectionState::Connected,
-            }]),
-        })
     }
 
     pub(crate) fn dtls_srtp(
@@ -269,10 +258,9 @@ impl Transport {
 
     pub(crate) fn receive(
         &mut self,
-        events: &mut Events,
         data: &mut Cow<[u8]>,
         source: SocketAddr,
-        socket_id: SocketId,
+        socket: SocketUse,
     ) -> ReceivedPacket {
         match PacketKind::identify(data) {
             PacketKind::Rtp => {
@@ -310,6 +298,7 @@ impl Transport {
 
                     if let Some((inbound, outbound)) = dtls.handshake().unwrap() {
                         if self.state != ConnectionState::Connected {
+                            self.state = ConnectionState::Connected;
                             self.events.push_back(TransportEvent::ConnectionState {
                                 old: self.state,
                                 new: ConnectionState::Connected,
@@ -320,8 +309,8 @@ impl Transport {
                     }
 
                     while let Some(data) = dtls.pop_to_send() {
-                        events.push(Event::SendData {
-                            socket: socket_id,
+                        self.events.push_back(TransportEvent::SendData {
+                            socket,
                             data,
                             target: source,
                         });
@@ -366,6 +355,8 @@ pub(crate) struct TransportBuilder {
     pub(crate) local_rtcp_port: Option<u16>,
 
     kind: TransportBuilderKind,
+
+    backlog: Vec<(Vec<u8>, SocketAddr, SocketUse)>,
 }
 
 enum TransportBuilderKind {
@@ -381,11 +372,13 @@ impl TransportBuilder {
                 local_rtp_port: None,
                 local_rtcp_port: None,
                 kind: TransportBuilderKind::Rtp,
+                backlog: vec![],
             },
             TransportType::SdesSrtp => Self {
                 local_rtp_port: None,
                 local_rtcp_port: None,
                 kind: TransportBuilderKind::SdesSrtp { crypto: todo!() },
+                backlog: vec![],
             },
             TransportType::DtlsSrtp => {
                 let cert = state
@@ -398,9 +391,22 @@ impl TransportBuilder {
                     kind: TransportBuilderKind::DtlsSrtp {
                         fingerprint: vec![cert.fingerprint()],
                     },
+                    backlog: vec![],
                 }
             }
         }
+    }
+
+    pub(crate) fn type_(&self) -> TransportType {
+        match self.kind {
+            TransportBuilderKind::Rtp => TransportType::Rtp,
+            TransportBuilderKind::SdesSrtp { .. } => TransportType::SdesSrtp,
+            TransportBuilderKind::DtlsSrtp { .. } => TransportType::DtlsSrtp,
+        }
+    }
+
+    pub(crate) fn receive(&mut self, data: Vec<u8>, source: SocketAddr, socket: SocketUse) {
+        self.backlog.push((data, source, socket));
     }
 
     pub(crate) fn build_from_answer(remote_media_desc: &MediaDescription) -> Transport {

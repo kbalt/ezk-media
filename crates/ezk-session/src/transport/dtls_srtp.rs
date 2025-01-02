@@ -28,7 +28,7 @@ pub(crate) enum DtlsSetup {
 
 pub(crate) struct DtlsSrtpSession {
     stream: Pin<Box<SslStream<IoQueue>>>,
-    setup: DtlsSetup,
+    state: Option<DtlsSetup>,
 }
 
 impl DtlsSrtpSession {
@@ -76,7 +76,7 @@ impl DtlsSrtpSession {
                     out: VecDeque::new(),
                 },
             )?),
-            setup,
+            state: Some(setup),
         };
 
         // Put initial handshake into the IoQueue
@@ -124,9 +124,16 @@ impl DtlsSrtpSession {
             srtp::openssl::OutboundSession,
         )>,
     > {
-        let result = match self.setup {
-            DtlsSetup::Connect => self.stream.as_mut().connect(),
-            DtlsSetup::Accept => self.stream.as_mut().accept(),
+        let result = match self.state {
+            Some(DtlsSetup::Connect) => self.stream.as_mut().connect(),
+            Some(DtlsSetup::Accept) => self.stream.as_mut().accept(),
+            None => {
+                assert!(
+                    self.stream.get_mut().to_read.is_none(),
+                    "IoQueue has something to read, but state is None"
+                );
+                return Ok(None);
+            }
         };
 
         if let Err(e) = result {
@@ -136,6 +143,8 @@ impl DtlsSrtpSession {
                 return Err(io::Error::other(e));
             }
         }
+
+        self.state = None;
 
         let (inbound, outbound) =
             srtp::openssl::session_pair(self.stream.ssl(), Config::default()).unwrap();

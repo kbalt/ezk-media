@@ -54,9 +54,8 @@ impl Layer for InviteAcceptLayer {
             SessionDescription::parse(&BytesStr::from_utf8_bytes(invite.body.clone()).unwrap())
                 .unwrap();
 
-        sdp_session.receive_sdp_offer(sdp_offer).await.unwrap();
+        let sdp_response = sdp_session.receive_sdp_offer(sdp_offer).await.unwrap();
 
-        let sdp_response = sdp_session.create_sdp_answer();
         let acceptor = Acceptor::new(dialog, self.invite_layer, invite).unwrap();
 
         let mut response = acceptor.create_response(Code::OK, None).await.unwrap();
@@ -96,14 +95,14 @@ impl Layer for InviteAcceptLayer {
                     )
                     .unwrap();
 
-                    sdp_session.receive_sdp_offer(offer).await.unwrap();
+                    let sdp_answer = sdp_session.receive_sdp_offer(offer).await.unwrap();
 
                     response
                         .msg
                         .headers
                         .insert_named(&ContentType(BytesStr::from_static("application/sdp")));
 
-                    response.msg.body = sdp_session.create_sdp_answer().to_string().into();
+                    response.msg.body = sdp_answer.to_string().into();
                     event.respond_success(response).await.unwrap();
                 }
                 Event::Bye(event) => {

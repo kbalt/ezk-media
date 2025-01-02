@@ -1,6 +1,7 @@
 use bytesstr::BytesStr;
 use ezk_rtp::{rtcp_types::Compound, RtpPacket, RtpSession};
 use local_media::LocalMedia;
+use rand::prelude::Distribution;
 use rtp::RtpExtensions;
 use sdp_types::{
     Connection, Direction, Fmtp, Group, IceOptions, Media, MediaDescription, MediaType, Origin,
@@ -91,7 +92,16 @@ pub struct SdpSession {
 
 enum TransportEntry {
     Transport(Transport),
-    TransportBuilder(TransceiverBuilder),
+    TransportBuilder(TransportBuilder),
+}
+
+impl TransportEntry {
+    fn type_(&self) -> TransportType {
+        match self {
+            TransportEntry::Transport(transport) => transport.type_(),
+            TransportEntry::TransportBuilder(transport_builder) => transport_builder.type_(),
+        }
+    }
 }
 
 struct ActiveMedia {
@@ -120,7 +130,7 @@ struct ActiveMedia {
 impl ActiveMedia {
     fn matches(
         &self,
-        transports: &SlotMap<TransportId, Transport>,
+        transports: &SlotMap<TransportId, TransportEntry>,
         desc: &MediaDescription,
     ) -> bool {
         if self.media_type != desc.media.media_type {
@@ -131,7 +141,11 @@ impl ActiveMedia {
             return self_mid == desc_mid;
         }
 
-        transports[self.transport].remote_rtp_address.port() == desc.media.port
+        if let TransportEntry::Transport(transport) = &transports[self.transport] {
+            transport.remote_rtp_address.port() == desc.media.port
+        } else {
+            false
+        }
     }
 }
 
@@ -145,7 +159,7 @@ struct PendingMedia {
     id: MediaId,
     local_media_id: LocalMediaId,
     media_type: MediaType,
-    mid: Option<BytesStr>,
+    mid: String,
     direction: DirectionBools,
     /// Transport to use when not bundling
     standalone_transport: Option<TransportId>,
@@ -153,10 +167,15 @@ struct PendingMedia {
     bundle_transport: TransportId,
 }
 
+pub struct SdpAnswerState(Vec<SdpResponseEntry>);
+
 /// Helper type to record the state of the SdpAnswer
 enum SdpResponseEntry {
     Active(MediaId),
-    Rejected(MediaType),
+    Rejected {
+        media_type: MediaType,
+        mid: Option<BytesStr>,
+    },
 }
 
 impl SdpSession {
@@ -196,16 +215,17 @@ impl SdpSession {
     }
 
     pub fn add_media(&mut self, local_media_id: LocalMediaId, direction: Direction) -> MediaId {
+        let media_id = self.next_media_id.step();
+
         let (standalone_transport, bundle_transport) = match self.options.bundle_policy {
             BundlePolicy::Balanced => unimplemented!(),
             BundlePolicy::MaxCompat => {
-                //
                 unimplemented!()
             }
             BundlePolicy::MaxBundle => {
-                // Force bundling
+                // Force bundling, only create a transport if none of the type we should be offering exists
 
-                // Find compatible transport
+                // TODO: if a "better" transport already exists use that instead?
                 let transport = self
                     .transports
                     .iter()
@@ -214,20 +234,32 @@ impl SdpSession {
                 let transport_id = if let Some((existing_transport, _)) = transport {
                     existing_transport
                 } else {
-                    TransportBuilder::new(&mut self.transport_state, self.options.offer_transport)
+                    self.transports
+                        .insert(TransportEntry::TransportBuilder(TransportBuilder::new(
+                            &mut self.transport_state,
+                            self.options.offer_transport,
+                        )))
                 };
+
+                (None, transport_id)
             }
         };
 
         self.pending.push(PendingChange::AddMedia(PendingMedia {
-            id: todo!(),
+            id: media_id,
             local_media_id,
-            media_type: todo!(),
-            mid: todo!(),
-            direction: todo!(),
-            standalone_transport: todo!(),
-            bundle_transport: todo!(),
-        }))
+            media_type: self.local_media[local_media_id].codecs.media_type,
+            mid: rand::distributions::Alphanumeric
+                .sample_iter(rand::thread_rng())
+                .map(char::from)
+                .take(20)
+                .collect::<String>(),
+            direction: direction.into(),
+            standalone_transport,
+            bundle_transport,
+        }));
+
+        media_id
     }
 
     pub fn pop_event(&mut self) -> Option<Event> {
@@ -235,15 +267,27 @@ impl SdpSession {
     }
 
     pub fn set_socket_port(&mut self, socket_id: SocketId, port: u16) {
-        let transport = &mut self.transports[socket_id.0];
+        let (local_rtp_port, local_rtcp_port) = match &mut self.transports[socket_id.0] {
+            TransportEntry::Transport(transport) => (
+                &mut transport.local_rtp_port,
+                &mut transport.local_rtcp_port,
+            ),
+            TransportEntry::TransportBuilder(transport_builder) => (
+                &mut transport_builder.local_rtp_port,
+                &mut transport_builder.local_rtcp_port,
+            ),
+        };
 
         match socket_id.1 {
-            SocketUse::Rtp => transport.local_rtp_port = Some(port),
-            SocketUse::Rtcp => transport.local_rtcp_port = Some(port),
+            SocketUse::Rtp => *local_rtp_port = Some(port),
+            SocketUse::Rtcp => *local_rtcp_port = Some(port),
         }
     }
 
-    pub fn receive_sdp_offer(&mut self, offer: SessionDescription) -> Result<(), Error> {
+    pub fn receive_sdp_offer(
+        &mut self,
+        offer: SessionDescription,
+    ) -> Result<SdpAnswerState, Error> {
         let mut new_state = vec![];
         let mut response = vec![];
 
@@ -257,7 +301,6 @@ impl SdpSession {
                 .position(|media| media.matches(&self.transports, remote_media_desc));
 
             if let Some(position) = matched_position {
-                // Remove the entry and only if its active, don't consider trying to creating a new media session
                 let mut media = self.state.remove(position);
                 self.update_media(requested_direction, &mut media);
                 response.push(SdpResponseEntry::Active(media.id));
@@ -269,9 +312,10 @@ impl SdpSession {
             if remote_media_desc.direction == Direction::Inactive
                 || remote_media_desc.media.port == 0
             {
-                response.push(SdpResponseEntry::Rejected(
-                    remote_media_desc.media.media_type,
-                ));
+                response.push(SdpResponseEntry::Rejected {
+                    media_type: remote_media_desc.media.media_type,
+                    mid: remote_media_desc.mid.clone(),
+                });
                 continue;
             }
 
@@ -289,9 +333,10 @@ impl SdpSession {
             let Some((local_media_id, (codec, codec_pt, negotiated_direction))) = chosen_media
             else {
                 // no local media found for this
-                response.push(SdpResponseEntry::Rejected(
-                    remote_media_desc.media.media_type,
-                ));
+                response.push(SdpResponseEntry::Rejected {
+                    media_type: remote_media_desc.media.media_type,
+                    mid: remote_media_desc.mid.clone(),
+                });
                 continue;
             };
 
@@ -308,9 +353,10 @@ impl SdpSession {
 
             let Some(transport) = transport else {
                 // No transport was found or created, reject media
-                response.push(SdpResponseEntry::Rejected(
-                    remote_media_desc.media.media_type,
-                ));
+                response.push(SdpResponseEntry::Rejected {
+                    media_type: remote_media_desc.media.media_type,
+                    mid: remote_media_desc.mid.clone(),
+                });
                 continue;
             };
 
@@ -336,13 +382,21 @@ impl SdpSession {
         }
 
         // Remove all transports that are not being used anymore
-        self.transports
-            .retain(|id, _| self.state.iter().any(|media| media.transport == id));
+        self.transports.retain(|id, _| {
+            // Is the transport in use by active media?
+            self.state.iter().any(|media| media.transport == id);
 
-        // TODO: remove me
-        self.poll();
+            // Is the transport in use by any pending changes?
+            self.pending.iter().any(|change| {
+                if let PendingChange::AddMedia(add_media) = change {
+                    add_media.bundle_transport == id || add_media.standalone_transport == Some(id)
+                } else {
+                    false
+                }
+            })
+        });
 
-        Ok(())
+        Ok(SdpAnswerState(response))
     }
 
     fn update_media(&mut self, requested_direction: DirectionBools, media: &mut ActiveMedia) {
@@ -461,18 +515,20 @@ impl SdpSession {
         })
     }
 
-    pub fn create_sdp_answer(&self, entries: Vec<SdpResponseEntry>) -> SessionDescription {
+    pub fn create_sdp_answer(&self, state: SdpAnswerState) -> SessionDescription {
         let mut media_descriptions = vec![];
 
-        for entry in entries {
+        for entry in state.0 {
             let active = match entry {
                 SdpResponseEntry::Active(media_id) => self
                     .state
                     .iter()
                     .find(|media| media.id == media_id)
                     .unwrap(),
-                SdpResponseEntry::Rejected(media_type) => {
-                    media_descriptions.push(MediaDescription::rejected(media_type));
+                SdpResponseEntry::Rejected { media_type, mid } => {
+                    let mut desc = MediaDescription::rejected(media_type);
+                    desc.mid = mid;
+                    media_descriptions.push(desc);
                     continue;
                 }
             };
@@ -610,7 +666,7 @@ impl SdpSession {
     /// Poll for new events. Call [`pop_event`](Self::pop_event) to handle them.
     pub fn poll(&mut self) {
         for (transport_id, transport) in &mut self.transports {
-            let TransportEntry::Transport(transport) = &transport else {
+            let TransportEntry::Transport(transport) = transport else {
                 panic!()
             };
 
@@ -671,7 +727,15 @@ impl SdpSession {
     pub fn receive(&mut self, socket_id: SocketId, data: &mut Cow<[u8]>, source: SocketAddr) {
         let transport = &mut self.transports[socket_id.0];
 
-        match transport.receive(&mut self.events, data, source, socket_id) {
+        let transport = match transport {
+            TransportEntry::Transport(transport) => transport,
+            TransportEntry::TransportBuilder(transport_builder) => {
+                transport_builder.receive(data.to_vec(), source, socket_id.1);
+                return;
+            }
+        };
+
+        match transport.receive(data, source, socket_id.1) {
             ReceivedPacket::Rtp => {
                 let rtp_packet = match RtpPacket::parse(data) {
                     Ok(rtp_packet) => rtp_packet,
@@ -727,7 +791,9 @@ impl SdpSession {
 
     pub fn send_rtp(&mut self, media_id: MediaId, mut packet: RtpPacket) {
         let media = self.state.iter_mut().find(|m| m.id == media_id).unwrap();
-        let transport = &mut self.transports[media.transport];
+        let TransportEntry::Transport(transport) = &mut self.transports[media.transport] else {
+            panic!()
+        };
 
         // Tell the RTP session that a packet is being sent
         media.rtp_session.send_rtp(&packet);
@@ -768,7 +834,9 @@ impl SdpSession {
 
         encode_buf.truncate(len);
 
-        let transport = &mut self.transports[media.transport];
+        let TransportEntry::Transport(transport) = &mut self.transports[media.transport] else {
+            panic!()
+        };
 
         transport.protect_rtcp(&mut encode_buf);
 

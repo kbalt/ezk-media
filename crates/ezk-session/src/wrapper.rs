@@ -50,14 +50,14 @@ impl AsyncSdpSession {
     pub async fn receive_sdp_offer(
         &mut self,
         offer: SessionDescription,
-    ) -> Result<(), super::Error> {
-        self.inner.receive_sdp_offer(offer)?;
+    ) -> Result<SessionDescription, super::Error> {
+        let state = self.inner.receive_sdp_offer(offer)?;
 
-        self.handle_events().await
-    }
+        self.inner.poll();
 
-    pub fn create_sdp_answer(&self) -> SessionDescription {
-        self.inner.create_sdp_answer()
+        self.handle_events().await?;
+
+        Ok(self.inner.create_sdp_answer(state))
     }
 
     async fn handle_events(&mut self) -> Result<(), super::Error> {
