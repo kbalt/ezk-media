@@ -17,7 +17,6 @@ use std::{
     collections::VecDeque,
     io::{self, Cursor, Read, Write},
     pin::Pin,
-    sync::OnceLock,
     time::Duration,
 };
 
@@ -34,15 +33,14 @@ pub(crate) struct DtlsSrtpSession {
 
 impl DtlsSrtpSession {
     pub(crate) fn new(
+        dtls_cert: &DtlsCertificate,
         fingerprints: Vec<(MessageDigest, Vec<u8>)>,
         setup: DtlsSetup,
     ) -> io::Result<Self> {
-        let (cert, pkey) = get_ca_cert();
-
         let mut ctx = SslAcceptor::mozilla_modern(SslMethod::dtls())?;
         ctx.set_tlsext_use_srtp(srtp::openssl::SRTP_PROFILE_NAMES)?;
-        ctx.set_private_key(pkey)?;
-        ctx.set_certificate(cert)?;
+        ctx.set_private_key(&dtls_cert.pkey)?;
+        ctx.set_certificate(&dtls_cert.cert)?;
         ctx.check_private_key()?;
         let ctx = ctx.build().into_context();
 
@@ -182,10 +180,24 @@ impl Write for IoQueue {
     }
 }
 
-// TODO: do I generate a pair for each session? Currently one cert per application, which expires after a year
-fn get_ca_cert() -> &'static (X509, PKey<Private>) {
-    static CA: OnceLock<(X509, PKey<Private>)> = OnceLock::new();
-    CA.get_or_init(|| make_ca_cert().unwrap())
+pub(super) struct DtlsCertificate {
+    cert: X509,
+    pkey: PKey<Private>,
+}
+
+impl DtlsCertificate {
+    pub(super) fn generate() -> Self {
+        let (cert, pkey) = make_ca_cert().unwrap();
+
+        Self { cert, pkey }
+    }
+
+    pub(super) fn fingerprint(&self) -> Fingerprint {
+        Fingerprint {
+            algorithm: FingerprintAlgorithm::SHA256,
+            fingerprint: self.cert.digest(MessageDigest::sha256()).unwrap().to_vec(),
+        }
+    }
 }
 
 fn make_ca_cert() -> Result<(X509, PKey<Private>), ErrorStack> {
@@ -212,10 +224,8 @@ fn make_ca_cert() -> Result<(X509, PKey<Private>), ErrorStack> {
     cert_builder.set_subject_name(&x509_name)?;
     cert_builder.set_issuer_name(&x509_name)?;
     cert_builder.set_pubkey(&key_pair)?;
-    let not_before = Asn1Time::days_from_now(0)?;
-    cert_builder.set_not_before(&not_before)?;
-    let not_after = Asn1Time::days_from_now(365)?;
-    cert_builder.set_not_after(&not_after)?;
+    cert_builder.set_not_before(&&Asn1Time::days_from_now(0)?)?;
+    cert_builder.set_not_after(&&Asn1Time::days_from_now(365)?)?;
 
     cert_builder.append_extension(BasicConstraints::new().critical().ca().build()?)?;
     cert_builder.append_extension(

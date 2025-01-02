@@ -1,5 +1,5 @@
-use crate::{rtp::RtpExtensionIds, ConnectionState, Error, Event, Events, SocketId};
-use dtls_srtp::{DtlsSetup, DtlsSrtpSession};
+use crate::{rtp::RtpExtensionIds, ConnectionState, Error, Event, Events, SocketId, TransportType};
+use dtls_srtp::{DtlsCertificate, DtlsSetup, DtlsSrtpSession};
 use sdp_types::{Fingerprint, MediaDescription, Setup, SrtpCrypto, TransportProtocol};
 use std::{borrow::Cow, collections::VecDeque, io, net::SocketAddr, time::Duration};
 
@@ -8,6 +8,12 @@ mod packet_kind;
 mod sdes_srtp;
 
 pub(crate) use packet_kind::PacketKind;
+
+#[derive(Default)]
+pub(crate) struct SessionTransportState {
+    /// DTLS certificate to use for all DTLS traffic in a session
+    dtls_cert: Option<DtlsCertificate>,
+}
 
 pub(crate) enum TransportEvent {
     ConnectionState {
@@ -62,6 +68,7 @@ enum TransportKind {
 
 impl Transport {
     pub(crate) fn create_from_offer(
+        state: &mut SessionTransportState,
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
@@ -87,6 +94,7 @@ impl Transport {
             ))
             .transpose(),
             TransportProtocol::UdpTlsRtpSavp => Some(Self::dtls_srtp(
+                state,
                 remote_media_desc,
                 remote_rtp_address,
                 remote_rtcp_address,
@@ -124,6 +132,7 @@ impl Transport {
     }
 
     pub(crate) fn dtls_srtp(
+        state: &mut SessionTransportState,
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
@@ -156,7 +165,13 @@ impl Transport {
             })
             .collect();
 
-        let mut dtls = DtlsSrtpSession::new(remote_fingerprints, setup)?;
+        let mut dtls = DtlsSrtpSession::new(
+            state
+                .dtls_cert
+                .get_or_insert_with(DtlsCertificate::generate),
+            remote_fingerprints,
+            setup,
+        )?;
 
         // Call handshake so that intial messages can be created
         assert!(dtls.handshake().unwrap().is_none());
@@ -196,6 +211,14 @@ impl Transport {
             TransportKind::Rtp => TransportProtocol::RtpAvp,
             TransportKind::SdesSrtp { .. } => TransportProtocol::RtpSavp,
             TransportKind::DtlsSrtp { .. } => TransportProtocol::UdpTlsRtpSavp,
+        }
+    }
+
+    pub(crate) fn type_(&self) -> TransportType {
+        match self.kind {
+            TransportKind::Rtp => TransportType::Rtp,
+            TransportKind::SdesSrtp { .. } => TransportType::SdesSrtp,
+            TransportKind::DtlsSrtp { .. } => TransportType::DtlsSrtp,
         }
     }
 
@@ -334,6 +357,54 @@ impl Transport {
         {
             outbound.protect_rtcp(packet).unwrap();
         }
+    }
+}
+
+/// Builder for a transport which has yet to be negotiated
+pub(crate) struct TransportBuilder {
+    pub(crate) local_rtp_port: Option<u16>,
+    pub(crate) local_rtcp_port: Option<u16>,
+
+    kind: TransportBuilderKind,
+}
+
+enum TransportBuilderKind {
+    Rtp,
+    SdesSrtp { crypto: Vec<SrtpCrypto> },
+    DtlsSrtp { fingerprint: Vec<Fingerprint> },
+}
+
+impl TransportBuilder {
+    pub(crate) fn new(state: &mut SessionTransportState, type_: TransportType) -> Self {
+        match type_ {
+            TransportType::Rtp => Self {
+                local_rtp_port: None,
+                local_rtcp_port: None,
+                kind: TransportBuilderKind::Rtp,
+            },
+            TransportType::SdesSrtp => Self {
+                local_rtp_port: None,
+                local_rtcp_port: None,
+                kind: TransportBuilderKind::SdesSrtp { crypto: todo!() },
+            },
+            TransportType::DtlsSrtp => {
+                let cert = state
+                    .dtls_cert
+                    .get_or_insert_with(DtlsCertificate::generate);
+
+                Self {
+                    local_rtp_port: None,
+                    local_rtcp_port: None,
+                    kind: TransportBuilderKind::DtlsSrtp {
+                        fingerprint: vec![cert.fingerprint()],
+                    },
+                }
+            }
+        }
+    }
+
+    pub(crate) fn build_from_answer(remote_media_desc: &MediaDescription) -> Transport {
+        todo!()
     }
 }
 

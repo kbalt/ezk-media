@@ -1,4 +1,4 @@
-use crate::{Codecs, Event, LocalMediaId, SocketId};
+use crate::{Codecs, Event, LocalMediaId, Options, SocketId};
 use sdp_types::{Direction, SessionDescription};
 use std::{
     borrow::Cow,
@@ -27,7 +27,7 @@ pub struct AsyncSdpSession {
 impl AsyncSdpSession {
     pub fn new(address: IpAddr) -> Self {
         Self {
-            inner: super::SdpSession::new(address),
+            inner: super::SdpSession::new(address, Options::default()),
             sockets: HashMap::new(),
             timeout: None,
         }

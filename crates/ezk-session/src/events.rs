@@ -1,4 +1,4 @@
-use crate::{ActiveMediaId, SocketId};
+use crate::{MediaId, SocketId};
 use ezk_rtp::RtpPacket;
 use std::{collections::VecDeque, net::SocketAddr};
 
@@ -22,14 +22,14 @@ pub enum Event {
     ///
     /// This is emitted for every track even if they are bundled on the same transport
     ConnectionState {
-        media_id: ActiveMediaId,
+        media_id: MediaId,
         old: ConnectionState,
         new: ConnectionState,
     },
 
     /// Receive RTP on a track
     ReceiveRTP {
-        media_id: ActiveMediaId,
+        media_id: MediaId,
         packet: RtpPacket,
     },
 }
