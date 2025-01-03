@@ -1,7 +1,8 @@
+#![warn(unreachable_pub)]
+
 use bytesstr::BytesStr;
 use ezk_rtp::{rtcp_types::Compound, RtpPacket, RtpSession};
 use local_media::LocalMedia;
-use rand::prelude::Distribution;
 use rtp::RtpExtensions;
 use sdp_types::{
     Connection, Direction, Fmtp, Group, IceOptions, Media, MediaDescription, MediaType, Origin,
@@ -18,7 +19,8 @@ use std::{
     time::Duration,
 };
 use transport::{
-    ReceivedPacket, SessionTransportState, SocketUse, Transport, TransportBuilder, TransportEvent,
+    NewTransport, ReceivedPacket, SessionTransportState, SocketUse, Transport, TransportBuilder,
+    TransportEvent,
 };
 
 mod codecs;
@@ -26,14 +28,12 @@ mod events;
 mod local_media;
 mod options;
 mod rtp;
-mod transceiver_builder;
 mod transport;
 mod wrapper;
 
 pub use codecs::{Codec, Codecs};
 pub use events::{ConnectionState, Event, Events};
 pub use options::{BundlePolicy, Options, RtcpMuxPolicy, TransportType};
-pub use transceiver_builder::TransceiverBuilder;
 pub use wrapper::AsyncSdpSession;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -53,7 +53,7 @@ slotmap::new_key_type! {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SocketId(TransportId, SocketUse);
+pub struct SocketId(pub TransportId, pub SocketUse);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -100,6 +100,33 @@ impl TransportEntry {
         match self {
             TransportEntry::Transport(transport) => transport.type_(),
             TransportEntry::TransportBuilder(transport_builder) => transport_builder.type_(),
+        }
+    }
+
+    #[track_caller]
+    fn unwrap(&self) -> &Transport {
+        match self {
+            TransportEntry::Transport(transport) => transport,
+            TransportEntry::TransportBuilder(..) => {
+                panic!("Tried to access incomplete transport")
+            }
+        }
+    }
+
+    #[track_caller]
+    fn unwrap_mut(&mut self) -> &mut Transport {
+        match self {
+            TransportEntry::Transport(transport) => transport,
+            TransportEntry::TransportBuilder(..) => {
+                panic!("Tried to access incomplete transport")
+            }
+        }
+    }
+
+    fn filter(&self) -> Option<&Transport> {
+        match self {
+            TransportEntry::Transport(transport) => Some(transport),
+            TransportEntry::TransportBuilder(..) => None,
         }
     }
 }
@@ -249,11 +276,7 @@ impl SdpSession {
             id: media_id,
             local_media_id,
             media_type: self.local_media[local_media_id].codecs.media_type,
-            mid: rand::distributions::Alphanumeric
-                .sample_iter(rand::thread_rng())
-                .map(char::from)
-                .take(20)
-                .collect::<String>(),
+            mid: media_id.0.to_string(),
             direction: direction.into(),
             standalone_transport,
             bundle_transport,
@@ -264,24 +287,6 @@ impl SdpSession {
 
     pub fn pop_event(&mut self) -> Option<Event> {
         self.events.pop()
-    }
-
-    pub fn set_socket_port(&mut self, socket_id: SocketId, port: u16) {
-        let (local_rtp_port, local_rtcp_port) = match &mut self.transports[socket_id.0] {
-            TransportEntry::Transport(transport) => (
-                &mut transport.local_rtp_port,
-                &mut transport.local_rtcp_port,
-            ),
-            TransportEntry::TransportBuilder(transport_builder) => (
-                &mut transport_builder.local_rtp_port,
-                &mut transport_builder.local_rtcp_port,
-            ),
-        };
-
-        match socket_id.1 {
-            SocketUse::Rtp => *local_rtp_port = Some(port),
-            SocketUse::Rtcp => *local_rtcp_port = Some(port),
-        }
     }
 
     pub fn receive_sdp_offer(
@@ -384,62 +389,29 @@ impl SdpSession {
         // Remove all transports that are not being used anymore
         self.transports.retain(|id, _| {
             // Is the transport in use by active media?
-            self.state.iter().any(|media| media.transport == id);
+            let in_use_by_active = self.state.iter().any(|media| media.transport == id);
 
             // Is the transport in use by any pending changes?
-            self.pending.iter().any(|change| {
+            let in_use_by_pending = self.pending.iter().any(|change| {
                 if let PendingChange::AddMedia(add_media) = change {
                     add_media.bundle_transport == id || add_media.standalone_transport == Some(id)
                 } else {
                     false
                 }
-            })
+            });
+
+            in_use_by_active || in_use_by_pending
         });
 
         Ok(SdpAnswerState(response))
     }
 
     fn update_media(&mut self, requested_direction: DirectionBools, media: &mut ActiveMedia) {
-        let transport = &mut self.transports[media.transport];
+        // let transport = self.transports[media.transport].unwrap_mut();
 
-        // // If remote wants to receive data, but we're not sending anything
-        // if requested_direction.send && !media.direction.send {
-        //     if let Some(create_sender) = &mut media.builder.create_sender {
-        //         let (tx, rx) = mpsc::channel(8);
-        //         transport.handle.set_sender(media.id, rx).await;
-        //         create_sender(tx);
-        //     }
-        // }
-
-        // // If remote is not receiving anything and we're sending, we need to stop sending
-        // if !requested_direction.send
-        //     && media.direction.send
-        //     && media.builder.create_sender.is_some()
-        // {
-        //     transport.handle.remove_sender(media.id).await;
-        // }
-
-        // // If remote wants to send us something, but we're not receiving yet
-        // if requested_direction.recv && !media.direction.recv {
-        //     if let Some(create_receiver) = &mut media.builder.create_receiver {
-        //         let (tx, rx) = mpsc::channel(8);
-        //         transport.handle.set_receiver(media.id, tx).await;
-        //         create_receiver(rx);
-        //     }
-        // }
-
-        // // If remote is not sending anything and we're received, we need to stop receiving
-        // if !requested_direction.recv
-        //     && media.direction.recv
-        //     && media.builder.create_receiver.is_some()
-        // {
-        //     transport.handle.remove_receiver(media.id).await;
-        // }
-
-        // media.direction.send =
-        //     requested_direction.send && media.builder.create_sender.is_some();
-        // media.direction.recv =
-        //     requested_direction.recv && media.builder.create_receiver.is_some();
+        if media.direction != requested_direction {
+            // todo: emit direction change event
+        }
     }
 
     /// Get or create a transport for the given media description
@@ -453,47 +425,28 @@ impl SdpSession {
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
     ) -> Result<Option<TransportId>, Error> {
-        match remote_media_desc
+        // See if there's a transport to be reused via BUNDLE group
+        if let Some(id) = remote_media_desc
             .mid
             .as_ref()
             .and_then(|mid| self.find_bundled_transport(new_state, offer, mid))
         {
-            Some(id) => {
-                // Bundled transport found, use that one
-                Ok(Some(id))
-            }
+            return Ok(Some(id));
+        }
 
-            None => {
-                // Not bundled or no transport for the group created yet
+        let transport = Transport::create_from_offer(
+            &mut self.transport_state,
+            remote_media_desc,
+            remote_rtp_address,
+            remote_rtcp_address,
+        )?;
 
-                let Some(transport) = Transport::create_from_offer(
-                    &mut self.transport_state,
-                    remote_media_desc,
-                    remote_rtp_address,
-                    remote_rtcp_address,
-                )?
-                else {
-                    return Ok(None);
-                };
+        if let Some(transport) = transport {
+            let transport_id = self.transports.insert(TransportEntry::Transport(transport));
 
-                let transport_id = self.transports.insert(TransportEntry::Transport(transport));
-
-                // TODO: This event should be created by the transport
-                if remote_media_desc.rtcp_mux {
-                    self.events.push(Event::CreateUdpSocketPair {
-                        socket_ids: [
-                            SocketId(transport_id, SocketUse::Rtp),
-                            SocketId(transport_id, SocketUse::Rtcp),
-                        ],
-                    });
-                } else {
-                    self.events.push(Event::CreateUdpSocket {
-                        socket_id: SocketId(transport_id, SocketUse::Rtp),
-                    });
-                }
-
-                Ok(Some(transport_id))
-            }
+            Ok(Some(transport_id))
+        } else {
+            Ok(None)
         }
     }
 
@@ -515,6 +468,11 @@ impl SdpSession {
         })
     }
 
+    /// Create an SDP Answer from a given state, which must be created by a previous call to [`SdpSession::receive_sdp_offer`].
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if any transport has not been assigned a port.
     pub fn create_sdp_answer(&self, state: SdpAnswerState) -> SessionDescription {
         let mut media_descriptions = vec![];
 
@@ -532,6 +490,7 @@ impl SdpSession {
                     continue;
                 }
             };
+
             let rtpmap = RtpMap {
                 payload: active.codec_pt,
                 encoding: active.codec.name.as_ref().into(),
@@ -544,9 +503,7 @@ impl SdpSession {
                 params: param.as_str().into(),
             });
 
-            let TransportEntry::Transport(transport) = &self.transports[active.transport] else {
-                panic!()
-            };
+            let transport = self.transports[active.transport].unwrap();
 
             let mut media_desc = MediaDescription {
                 media: Media {
@@ -636,15 +593,30 @@ impl SdpSession {
         }
     }
 
+    /// Returns an iterator over all transports that have not yet had their port assigned to
+    pub fn new_transports(&mut self) -> impl Iterator<Item = NewTransport<'_>> {
+        self.transports
+            .iter_mut()
+            .map(|(id, t)| match t {
+                TransportEntry::Transport(transport) => transport.as_new_transport(id),
+                TransportEntry::TransportBuilder(transport_builder) => {
+                    transport_builder.as_new_transport(id)
+                }
+            })
+            .filter(|nt| {
+                if nt.rtcp_mux {
+                    nt.rtp_port.is_none()
+                } else {
+                    nt.rtp_port.is_none() || nt.rtcp_port.is_none()
+                }
+            })
+    }
+
     /// Returns a duration after which [`poll`](Self::poll) must be called
     pub fn timeout(&self) -> Option<Duration> {
         let mut timeout = None;
 
-        for transport in self.transports.values() {
-            let TransportEntry::Transport(transport) = &transport else {
-                panic!()
-            };
-
+        for transport in self.transports.values().filter_map(TransportEntry::filter) {
             match (&mut timeout, transport.timeout()) {
                 (None, Some(new)) => timeout = Some(new),
                 (Some(prev), Some(new)) => *prev = min(*prev, new),
@@ -667,7 +639,7 @@ impl SdpSession {
     pub fn poll(&mut self) {
         for (transport_id, transport) in &mut self.transports {
             let TransportEntry::Transport(transport) = transport else {
-                panic!()
+                continue;
             };
 
             transport.poll();
@@ -791,9 +763,7 @@ impl SdpSession {
 
     pub fn send_rtp(&mut self, media_id: MediaId, mut packet: RtpPacket) {
         let media = self.state.iter_mut().find(|m| m.id == media_id).unwrap();
-        let TransportEntry::Transport(transport) = &mut self.transports[media.transport] else {
-            panic!()
-        };
+        let transport = self.transports[media.transport].unwrap_mut();
 
         // Tell the RTP session that a packet is being sent
         media.rtp_session.send_rtp(&packet);
@@ -834,9 +804,7 @@ impl SdpSession {
 
         encode_buf.truncate(len);
 
-        let TransportEntry::Transport(transport) = &mut self.transports[media.transport] else {
-            panic!()
-        };
+        let transport = self.transports[media.transport].unwrap_mut();
 
         transport.protect_rtcp(&mut encode_buf);
 
@@ -923,7 +891,7 @@ fn resolve_tagged_address(address: &TaggedAddress, port: u16) -> io::Result<Sock
 }
 
 // i'm too lazy to work with the direction type, so using this as a cop out
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct DirectionBools {
     send: bool,
     recv: bool,

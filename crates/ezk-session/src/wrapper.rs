@@ -1,4 +1,4 @@
-use crate::{Codecs, Event, LocalMediaId, Options, SocketId};
+use crate::{transport::SocketUse, Codecs, Event, LocalMediaId, Options, SocketId};
 use sdp_types::{Direction, SessionDescription};
 use std::{
     borrow::Cow,
@@ -53,9 +53,21 @@ impl AsyncSdpSession {
     ) -> Result<SessionDescription, super::Error> {
         let state = self.inner.receive_sdp_offer(offer)?;
 
-        self.inner.poll();
+        for new_transport in self.inner.new_transports() {
+            if new_transport.rtp_port.is_none() {
+                let socket = UdpSocket::bind("0.0.0.0:0").await?;
+                *new_transport.rtp_port = Some(socket.local_addr()?.port());
+                self.sockets
+                    .insert(SocketId(new_transport.id, SocketUse::Rtp), socket);
+            }
 
-        self.handle_events().await?;
+            if !new_transport.rtcp_mux && new_transport.rtcp_port.is_none() {
+                let socket = UdpSocket::bind("0.0.0.0:0").await?;
+                *new_transport.rtcp_port = Some(socket.local_addr()?.port());
+                self.sockets
+                    .insert(SocketId(new_transport.id, SocketUse::Rtcp), socket);
+            }
+        }
 
         Ok(self.inner.create_sdp_answer(state))
     }
@@ -63,24 +75,6 @@ impl AsyncSdpSession {
     async fn handle_events(&mut self) -> Result<(), super::Error> {
         while let Some(event) = self.inner.pop_event() {
             match event {
-                Event::CreateUdpSocketPair { socket_ids } => {
-                    let socket1 = UdpSocket::bind("0.0.0.0:0").await?;
-                    let socket2 = UdpSocket::bind("0.0.0.0:0").await?;
-
-                    self.inner
-                        .set_socket_port(socket_ids[0], socket1.local_addr()?.port());
-                    self.inner
-                        .set_socket_port(socket_ids[1], socket2.local_addr()?.port());
-
-                    self.sockets.insert(socket_ids[0], socket1);
-                    self.sockets.insert(socket_ids[1], socket2);
-                }
-                Event::CreateUdpSocket { socket_id } => {
-                    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-                    self.inner
-                        .set_socket_port(socket_id, socket.local_addr()?.port());
-                    self.sockets.insert(socket_id, socket);
-                }
                 Event::SendData {
                     socket,
                     data,

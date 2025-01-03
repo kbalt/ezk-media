@@ -1,4 +1,4 @@
-use crate::{rtp::RtpExtensionIds, ConnectionState, Error, TransportType};
+use crate::{rtp::RtpExtensionIds, ConnectionState, Error, TransportId, TransportType};
 use dtls_srtp::{DtlsCertificate, DtlsSetup, DtlsSrtpSession};
 use sdp_types::{Fingerprint, MediaDescription, Setup, SrtpCrypto, TransportProtocol};
 use std::{borrow::Cow, collections::VecDeque, io, net::SocketAddr, time::Duration};
@@ -25,12 +25,6 @@ pub(crate) enum TransportEvent {
         data: Vec<u8>,
         target: SocketAddr,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum SocketUse {
-    Rtp,
-    Rtcp,
 }
 
 pub(crate) struct Transport {
@@ -203,6 +197,15 @@ impl Transport {
         }
     }
 
+    pub(crate) fn as_new_transport(&mut self, id: TransportId) -> NewTransport<'_> {
+        NewTransport {
+            id,
+            rtcp_mux: false,
+            rtp_port: &mut self.local_rtp_port,
+            rtcp_port: &mut self.local_rtcp_port,
+        }
+    }
+
     pub(crate) fn type_(&self) -> TransportType {
         match self.kind {
             TransportKind::Rtp => TransportType::Rtp,
@@ -351,8 +354,8 @@ impl Transport {
 
 /// Builder for a transport which has yet to be negotiated
 pub(crate) struct TransportBuilder {
-    pub(crate) local_rtp_port: Option<u16>,
-    pub(crate) local_rtcp_port: Option<u16>,
+    local_rtp_port: Option<u16>,
+    local_rtcp_port: Option<u16>,
 
     kind: TransportBuilderKind,
 
@@ -397,6 +400,15 @@ impl TransportBuilder {
         }
     }
 
+    pub(crate) fn as_new_transport(&mut self, id: TransportId) -> NewTransport<'_> {
+        NewTransport {
+            id,
+            rtcp_mux: false,
+            rtp_port: &mut self.local_rtp_port,
+            rtcp_port: &mut self.local_rtcp_port,
+        }
+    }
+
     pub(crate) fn type_(&self) -> TransportType {
         match self.kind {
             TransportBuilderKind::Rtp => TransportType::Rtp,
@@ -419,4 +431,17 @@ pub(crate) enum ReceivedPacket {
     Rtp,
     Rtcp,
     TransportSpecific,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SocketUse {
+    Rtp,
+    Rtcp,
+}
+
+pub struct NewTransport<'a> {
+    pub id: TransportId,
+    pub rtcp_mux: bool,
+    pub rtp_port: &'a mut Option<u16>,
+    pub rtcp_port: &'a mut Option<u16>,
 }
