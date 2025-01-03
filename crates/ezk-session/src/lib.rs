@@ -237,10 +237,7 @@ impl SdpSession {
         })
     }
 
-    pub fn remove_local_media(&mut self, local_media_id: LocalMediaId) {
-        self.local_media.remove(local_media_id);
-    }
-
+    /// Request a new media session to be created
     pub fn add_media(&mut self, local_media_id: LocalMediaId, direction: Direction) -> MediaId {
         let media_id = self.next_media_id.step();
 
@@ -285,10 +282,12 @@ impl SdpSession {
         media_id
     }
 
-    pub fn pop_event(&mut self) -> Option<Event> {
-        self.events.pop()
-    }
-
+    /// Receive a SDP offer in this session.
+    ///
+    /// Returns an opaque response state object which can be used to create the actual response SDP.
+    /// Before the SDP response can be created, the user must check that there are no transports pending creation using [`new_transports`](Self::new_transports).
+    ///
+    /// The actual answer can be created using [`create_sdp_answer`](Self::create_sdp_answer).
     pub fn receive_sdp_offer(
         &mut self,
         offer: SessionDescription,
@@ -491,57 +490,7 @@ impl SdpSession {
                 }
             };
 
-            let rtpmap = RtpMap {
-                payload: active.codec_pt,
-                encoding: active.codec.name.as_ref().into(),
-                clock_rate: active.codec.clock_rate,
-                params: Default::default(),
-            };
-
-            let fmtps = active.codec.params.iter().map(|param| Fmtp {
-                format: active.codec_pt,
-                params: param.as_str().into(),
-            });
-
-            let transport = self.transports[active.transport].unwrap();
-
-            let mut media_desc = MediaDescription {
-                media: Media {
-                    media_type: active.media_type,
-                    port: transport
-                        .local_rtp_port
-                        .expect("Did not set port for RTP socket"),
-                    ports_num: None,
-                    proto: transport.sdp_type(),
-                    fmts: vec![active.codec_pt],
-                },
-                connection: None,
-                bandwidth: vec![],
-                direction: active.direction.into(),
-                rtcp: transport.local_rtcp_port.map(|port| Rtcp {
-                    port,
-                    address: None,
-                }),
-                rtcp_mux: transport.remote_rtp_address == transport.remote_rtcp_address,
-                mid: active.mid.clone(),
-                rtpmap: vec![rtpmap],
-                fmtp: fmtps.collect(),
-                ice_ufrag: None,
-                ice_pwd: None,
-                ice_candidates: vec![],
-                ice_end_of_candidates: false,
-                crypto: vec![],
-                extmap: transport.extension_ids.to_extmap(),
-                extmap_allow_mixed: false,
-                ssrc: vec![],
-                setup: None,
-                fingerprint: vec![],
-                attributes: vec![],
-            };
-
-            transport.populate_offer(&mut media_desc);
-
-            media_descriptions.push(media_desc);
+            media_descriptions.push(self.media_description_for_active(active, None));
         }
 
         // Create bundle group attributes
@@ -590,6 +539,143 @@ impl SdpSession {
             fingerprint: vec![],
             attributes: vec![],
             media_descriptions,
+        }
+    }
+
+    fn media_description_for_active(
+        &self,
+        active: &ActiveMedia,
+        override_direction: Option<Direction>,
+    ) -> MediaDescription {
+        let rtpmap = RtpMap {
+            payload: active.codec_pt,
+            encoding: active.codec.name.as_ref().into(),
+            clock_rate: active.codec.clock_rate,
+            params: Default::default(),
+        };
+
+        let fmtps = active.codec.params.iter().map(|param| Fmtp {
+            format: active.codec_pt,
+            params: param.as_str().into(),
+        });
+
+        let transport = self.transports[active.transport].unwrap();
+
+        let mut media_desc = MediaDescription {
+            media: Media {
+                media_type: active.media_type,
+                port: transport
+                    .local_rtp_port
+                    .expect("Did not set port for RTP socket"),
+                ports_num: None,
+                proto: transport.type_().sdp_type(),
+                fmts: vec![active.codec_pt],
+            },
+            connection: None,
+            bandwidth: vec![],
+            direction: override_direction.unwrap_or(active.direction.into()),
+            rtcp: transport.local_rtcp_port.map(|port| Rtcp {
+                port,
+                address: None,
+            }),
+            rtcp_mux: transport.remote_rtp_address == transport.remote_rtcp_address,
+            mid: active.mid.clone(),
+            rtpmap: vec![rtpmap],
+            fmtp: fmtps.collect(),
+            ice_ufrag: None,
+            ice_pwd: None,
+            ice_candidates: vec![],
+            ice_end_of_candidates: false,
+            crypto: vec![],
+            extmap: transport.extension_ids.to_extmap(),
+            extmap_allow_mixed: false,
+            ssrc: vec![],
+            setup: None,
+            fingerprint: vec![],
+            attributes: vec![],
+        };
+
+        transport.populate_offer(&mut media_desc);
+
+        media_desc
+    }
+
+    pub fn create_sdp_offer(&self) {
+        let mut media_descriptions = vec![];
+
+        // Put the current media sessions in the offer
+        for media in &self.state {
+            let mut override_direction = None;
+
+            // Apply requested changes
+            for change in &self.pending {
+                match change {
+                    PendingChange::AddMedia(..) => {}
+                    PendingChange::RemoveMedia(media_id) => {
+                        if media.id == *media_id {
+                            continue;
+                        }
+                    }
+                    PendingChange::ChangeDirection(media_id, direction) => {
+                        if media.id == *media_id {
+                            override_direction = Some(*direction);
+                        }
+                    }
+                }
+            }
+
+            media_descriptions.push(self.media_description_for_active(media, override_direction));
+        }
+
+        // Add all pending added media
+        for change in &self.pending {
+            match change {
+                PendingChange::AddMedia(pending_media) => {
+                    let local_media = &self.local_media[pending_media.local_media_id];
+                    let transport = &self.transports[pending_media.bundle_transport];
+
+                    let (local_rtp_port, local_rtcp_port) = match transport {
+                        TransportEntry::Transport(transport) => {
+                            (transport.local_rtp_port, transport.local_rtcp_port)
+                        }
+                        TransportEntry::TransportBuilder(transport_builder) => (
+                            transport_builder.local_rtp_port,
+                            transport_builder.local_rtcp_port,
+                        ),
+                    };
+
+                    MediaDescription {
+                        media: Media {
+                            media_type: local_media.codecs.media_type,
+                            port: local_rtp_port.expect("rtp port not set for t"),
+                            ports_num: None,
+                            proto: transport.type_().sdp_type(),
+                            fmts: vec![],
+                        },
+                        connection: todo!(),
+                        bandwidth: todo!(),
+                        direction: todo!(),
+                        rtcp: todo!(),
+                        rtcp_mux: todo!(),
+                        mid: todo!(),
+                        rtpmap: todo!(),
+                        fmtp: todo!(),
+                        ice_ufrag: todo!(),
+                        ice_pwd: todo!(),
+                        ice_candidates: todo!(),
+                        ice_end_of_candidates: todo!(),
+                        crypto: todo!(),
+                        extmap: todo!(),
+                        extmap_allow_mixed: todo!(),
+                        ssrc: todo!(),
+                        setup: todo!(),
+                        fingerprint: todo!(),
+                        attributes: todo!(),
+                    };
+                }
+                PendingChange::RemoveMedia(..) => {}
+                PendingChange::ChangeDirection(..) => {}
+            }
         }
     }
 
@@ -694,6 +780,10 @@ impl SdpSession {
                 }
             }
         }
+    }
+
+    pub fn pop_event(&mut self) -> Option<Event> {
+        self.events.pop()
     }
 
     pub fn receive(&mut self, socket_id: SocketId, data: &mut Cow<[u8]>, source: SocketAddr) {

@@ -189,14 +189,6 @@ impl Transport {
         })
     }
 
-    pub(crate) fn sdp_type(&self) -> TransportProtocol {
-        match &self.kind {
-            TransportKind::Rtp => TransportProtocol::RtpAvp,
-            TransportKind::SdesSrtp { .. } => TransportProtocol::RtpSavp,
-            TransportKind::DtlsSrtp { .. } => TransportProtocol::UdpTlsRtpSavp,
-        }
-    }
-
     pub(crate) fn as_new_transport(&mut self, id: TransportId) -> NewTransport<'_> {
         NewTransport {
             id,
@@ -354,8 +346,8 @@ impl Transport {
 
 /// Builder for a transport which has yet to be negotiated
 pub(crate) struct TransportBuilder {
-    local_rtp_port: Option<u16>,
-    local_rtcp_port: Option<u16>,
+    pub(crate) local_rtp_port: Option<u16>,
+    pub(crate) local_rtcp_port: Option<u16>,
 
     kind: TransportBuilderKind,
 

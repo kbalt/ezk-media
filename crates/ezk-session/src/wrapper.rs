@@ -43,10 +43,6 @@ impl AsyncSdpSession {
         self.inner.add_local_media(codecs, limit, direction)
     }
 
-    pub fn remove_local_media(&mut self, local_media_id: LocalMediaId) {
-        self.inner.remove_local_media(local_media_id);
-    }
-
     pub async fn receive_sdp_offer(
         &mut self,
         offer: SessionDescription,

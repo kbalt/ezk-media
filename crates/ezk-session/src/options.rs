@@ -1,3 +1,5 @@
+use sdp_types::TransportProtocol;
+
 #[derive(Debug, Default, Clone)]
 pub struct Options {
     pub offer_transport: TransportType,
@@ -11,6 +13,16 @@ pub enum TransportType {
     SdesSrtp,
     #[default]
     DtlsSrtp,
+}
+
+impl TransportType {
+    pub(crate) fn sdp_type(&self) -> TransportProtocol {
+        match self {
+            Self::Rtp => TransportProtocol::RtpAvp,
+            Self::SdesSrtp => TransportProtocol::RtpSavp,
+            Self::DtlsSrtp => TransportProtocol::UdpTlsRtpSavp,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
