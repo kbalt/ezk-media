@@ -35,7 +35,7 @@ pub enum RtcpMuxPolicy {
 #[derive(Debug, Default, Clone)]
 pub enum BundlePolicy {
     Balanced,
-    MaxCompat,
     #[default]
+    MaxCompat,
     MaxBundle,
 }

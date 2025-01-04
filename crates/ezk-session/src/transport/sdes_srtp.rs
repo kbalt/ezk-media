@@ -7,7 +7,7 @@ use sdp_types::{
 use srtp::CryptoPolicy;
 use std::io;
 
-pub(super) fn negotiate_sdes_srtp(
+pub(super) fn negotiate_from_offer(
     remote_crypto: &[SrtpCrypto],
 ) -> io::Result<(Vec<SrtpCrypto>, srtp::Session, srtp::Session)> {
     let choice1 = remote_crypto
@@ -68,6 +68,103 @@ pub(super) fn negotiate_sdes_srtp(
         inbound,
         outbound,
     ))
+}
+
+pub(super) struct SdesSrtpOffer {
+    keys: Vec<(SrtpSuite, Vec<u8>)>,
+}
+
+impl SdesSrtpOffer {
+    pub(super) fn new() -> Self {
+        let mut keys = vec![];
+
+        for suite in [
+            AES_256_CM_HMAC_SHA1_80,
+            AES_256_CM_HMAC_SHA1_32,
+            AES_CM_128_HMAC_SHA1_80,
+            AES_CM_128_HMAC_SHA1_32,
+        ] {
+            let policy = srtp_suite_to_policy(&suite).expect("only using known working suites");
+
+            let mut send_key = vec![0u8; policy.key_len()];
+            rand::thread_rng().fill_bytes(&mut send_key);
+
+            keys.push((suite, send_key))
+        }
+
+        Self { keys }
+    }
+
+    pub(super) fn extend_crypto(&self, crypto: &mut Vec<SrtpCrypto>) {
+        for (tag, (suite, key)) in self.keys.iter().enumerate() {
+            let send_key = BASE64_STANDARD.encode(key);
+
+            crypto.push(SrtpCrypto {
+                tag: (tag + 1) as u32,
+                suite: suite.clone(),
+                keys: vec![SrtpKeyingMaterial {
+                    key_and_salt: send_key.into(),
+                    lifetime: None,
+                    mki: None,
+                }],
+                params: vec![],
+            });
+        }
+    }
+
+    pub(super) fn receive_answer(
+        self,
+        remote_crypto: &[SrtpCrypto],
+    ) -> (SrtpCrypto, srtp::Session, srtp::Session) {
+        for (tag, (suite, send_key)) in self.keys.into_iter().enumerate() {
+            let tag = tag as u32 + 1;
+
+            for crypto in remote_crypto {
+                if crypto.tag != tag {
+                    continue;
+                }
+
+                if crypto.suite != suite {
+                    continue;
+                }
+
+                let recv_key = BASE64_STANDARD
+                    .decode(&crypto.keys[0].key_and_salt)
+                    .unwrap();
+
+                let crypto_attr = SrtpCrypto {
+                    tag,
+                    suite: suite.clone(),
+                    keys: vec![SrtpKeyingMaterial {
+                        key_and_salt: BASE64_STANDARD.encode(&send_key).into(),
+                        lifetime: None,
+                        mki: None,
+                    }],
+                    params: vec![],
+                };
+
+                let suite = srtp_suite_to_policy(&suite).unwrap();
+                let inbound = srtp::Session::with_inbound_template(srtp::StreamPolicy {
+                    rtp: suite,
+                    rtcp: suite,
+                    key: &recv_key,
+                    ..Default::default()
+                })
+                .unwrap();
+                let outbound = srtp::Session::with_outbound_template(srtp::StreamPolicy {
+                    rtp: suite,
+                    rtcp: suite,
+                    key: &send_key,
+                    ..Default::default()
+                })
+                .unwrap();
+
+                return (crypto_attr, inbound, outbound);
+            }
+        }
+
+        todo!("error, no suitable crypto attribute in response")
+    }
 }
 
 fn srtp_suite_to_policy(suite: &SrtpSuite) -> Option<CryptoPolicy> {

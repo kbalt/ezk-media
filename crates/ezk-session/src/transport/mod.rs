@@ -1,12 +1,15 @@
 use crate::{rtp::RtpExtensionIds, ConnectionState, Error, TransportId, TransportType};
+use core::panic;
 use dtls_srtp::{DtlsCertificate, DtlsSetup, DtlsSrtpSession};
 use sdp_types::{Fingerprint, MediaDescription, Setup, SrtpCrypto, TransportProtocol};
 use std::{borrow::Cow, collections::VecDeque, io, net::SocketAddr, time::Duration};
 
+mod builder;
 mod dtls_srtp;
 mod packet_kind;
 mod sdes_srtp;
 
+pub(crate) use builder::TransportBuilder;
 pub(crate) use packet_kind::PacketKind;
 
 #[derive(Default)]
@@ -34,6 +37,7 @@ pub(crate) struct Transport {
     pub(crate) remote_rtp_address: SocketAddr,
     pub(crate) remote_rtcp_address: SocketAddr,
 
+    // TODO: either split these up in send / receive ids or just make then receive and always use RtpExtensionIds::new() for send
     pub(crate) extension_ids: RtpExtensionIds,
 
     state: ConnectionState,
@@ -47,11 +51,13 @@ pub(crate) struct Transport {
 enum TransportKind {
     Rtp,
     SdesSrtp {
+        /// Local crypto attribute
         crypto: Vec<SrtpCrypto>,
         inbound: srtp::Session,
         outbound: srtp::Session,
     },
     DtlsSrtp {
+        /// Local DTLS certificate fingerprint attribute
         fingerprint: Vec<Fingerprint>,
         setup: Setup,
 
@@ -73,7 +79,7 @@ impl Transport {
                 local_rtcp_port: None,
                 remote_rtp_address,
                 remote_rtcp_address,
-                extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
+                extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                 state: ConnectionState::Connected,
                 kind: TransportKind::Rtp,
                 events: VecDeque::from([TransportEvent::ConnectionState {
@@ -83,14 +89,14 @@ impl Transport {
             })),
             TransportProtocol::RtpSavp => {
                 let (crypto, inbound, outbound) =
-                    sdes_srtp::negotiate_sdes_srtp(&remote_media_desc.crypto)?;
+                    sdes_srtp::negotiate_from_offer(&remote_media_desc.crypto)?;
 
                 Ok(Some(Self {
                     local_rtp_port: None,
                     local_rtcp_port: None,
                     remote_rtp_address,
                     remote_rtcp_address,
-                    extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
+                    extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                     state: ConnectionState::Connected,
                     kind: TransportKind::SdesSrtp {
                         crypto,
@@ -174,7 +180,7 @@ impl Transport {
             local_rtcp_port: None,
             remote_rtp_address,
             remote_rtcp_address,
-            extension_ids: RtpExtensionIds::from_offer(remote_media_desc),
+            extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
             state: ConnectionState::New,
             kind: TransportKind::DtlsSrtp {
                 fingerprint: vec![dtls.fingerprint()],
@@ -207,6 +213,8 @@ impl Transport {
     }
 
     pub(crate) fn populate_desc(&self, desc: &mut MediaDescription) {
+        desc.extmap.extend(self.extension_ids.to_extmap());
+
         match &self.kind {
             TransportKind::Rtp => {}
             TransportKind::SdesSrtp { crypto, .. } => {
@@ -322,112 +330,35 @@ impl Transport {
     }
 
     pub(crate) fn protect_rtp(&mut self, packet: &mut Vec<u8>) {
-        if let TransportKind::SdesSrtp { outbound, .. }
-        | TransportKind::DtlsSrtp {
-            srtp: Some((_, outbound)),
-            ..
-        } = &mut self.kind
-        {
-            outbound.protect(packet).unwrap();
+        match &mut self.kind {
+            TransportKind::DtlsSrtp { srtp: None, .. } => {
+                panic!("Tried to protect RTP on non-ready DTLS-SRTP transport");
+            }
+            TransportKind::SdesSrtp { outbound, .. }
+            | TransportKind::DtlsSrtp {
+                srtp: Some((_, outbound)),
+                ..
+            } => {
+                outbound.protect(packet).unwrap();
+            }
+            _ => (),
         }
     }
 
     pub(crate) fn protect_rtcp(&mut self, packet: &mut Vec<u8>) {
-        if let TransportKind::SdesSrtp { outbound, .. }
-        | TransportKind::DtlsSrtp {
-            srtp: Some((_, outbound)),
-            ..
-        } = &mut self.kind
-        {
-            outbound.protect_rtcp(packet).unwrap();
-        }
-    }
-}
-
-/// Builder for a transport which has yet to be negotiated
-pub(crate) struct TransportBuilder {
-    pub(crate) local_rtp_port: Option<u16>,
-    pub(crate) local_rtcp_port: Option<u16>,
-
-    kind: TransportBuilderKind,
-
-    backlog: Vec<(Vec<u8>, SocketAddr, SocketUse)>,
-}
-
-enum TransportBuilderKind {
-    Rtp,
-    SdesSrtp { crypto: Vec<SrtpCrypto> },
-    DtlsSrtp { fingerprint: Vec<Fingerprint> },
-}
-
-impl TransportBuilder {
-    pub(crate) fn new(state: &mut SessionTransportState, type_: TransportType) -> Self {
-        match type_ {
-            TransportType::Rtp => Self {
-                local_rtp_port: None,
-                local_rtcp_port: None,
-                kind: TransportBuilderKind::Rtp,
-                backlog: vec![],
-            },
-            TransportType::SdesSrtp => Self {
-                local_rtp_port: None,
-                local_rtcp_port: None,
-                kind: TransportBuilderKind::SdesSrtp { crypto: todo!() },
-                backlog: vec![],
-            },
-            TransportType::DtlsSrtp => {
-                let cert = state
-                    .dtls_cert
-                    .get_or_insert_with(DtlsCertificate::generate);
-
-                Self {
-                    local_rtp_port: None,
-                    local_rtcp_port: None,
-                    kind: TransportBuilderKind::DtlsSrtp {
-                        fingerprint: vec![cert.fingerprint()],
-                    },
-                    backlog: vec![],
-                }
+        match &mut self.kind {
+            TransportKind::DtlsSrtp { srtp: None, .. } => {
+                panic!("Tried to protect RTCP on non-ready DTLS-SRTP transport");
             }
-        }
-    }
-
-    pub(crate) fn as_new_transport(&mut self, id: TransportId) -> NewTransport<'_> {
-        NewTransport {
-            id,
-            rtcp_mux: false,
-            rtp_port: &mut self.local_rtp_port,
-            rtcp_port: &mut self.local_rtcp_port,
-        }
-    }
-
-    pub(crate) fn populate_desc(&self, desc: &mut MediaDescription) {
-        match &self.kind {
-            TransportBuilderKind::Rtp => {}
-            TransportBuilderKind::SdesSrtp { crypto, .. } => {
-                desc.crypto.extend_from_slice(crypto);
+            TransportKind::SdesSrtp { outbound, .. }
+            | TransportKind::DtlsSrtp {
+                srtp: Some((_, outbound)),
+                ..
+            } => {
+                outbound.protect_rtcp(packet).unwrap();
             }
-            TransportBuilderKind::DtlsSrtp { fingerprint, .. } => {
-                desc.setup = Some(Setup::ActPass);
-                desc.fingerprint.extend_from_slice(fingerprint);
-            }
+            _ => (),
         }
-    }
-
-    pub(crate) fn type_(&self) -> TransportType {
-        match self.kind {
-            TransportBuilderKind::Rtp => TransportType::Rtp,
-            TransportBuilderKind::SdesSrtp { .. } => TransportType::SdesSrtp,
-            TransportBuilderKind::DtlsSrtp { .. } => TransportType::DtlsSrtp,
-        }
-    }
-
-    pub(crate) fn receive(&mut self, data: Vec<u8>, source: SocketAddr, socket: SocketUse) {
-        self.backlog.push((data, source, socket));
-    }
-
-    pub(crate) fn build_from_answer(remote_media_desc: &MediaDescription) -> Transport {
-        todo!()
     }
 }
 

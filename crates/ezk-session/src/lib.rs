@@ -240,7 +240,12 @@ impl SdpSession {
         limit: usize,
         direction: Direction,
     ) -> LocalMediaId {
+        // Assign dynamic payload type numbers
         for codec in &mut codecs.codecs {
+            if codec.pt.is_some() {
+                continue;
+            }
+
             codec.pt = Some(self.next_pt);
 
             self.next_pt += 1;
@@ -608,7 +613,7 @@ impl SdpSession {
             ice_candidates: vec![],
             ice_end_of_candidates: false,
             crypto: vec![],
-            extmap: transport.extension_ids.to_extmap(),
+            extmap: vec![],
             extmap_allow_mixed: false,
             ssrc: vec![],
             setup: None,
@@ -716,7 +721,7 @@ impl SdpSession {
                 ice_candidates: vec![],
                 ice_end_of_candidates: false,
                 crypto: vec![],
-                extmap: vec![], // TODO: add extensions
+                extmap: vec![],
                 extmap_allow_mixed: true,
                 ssrc: vec![],
                 setup: None,

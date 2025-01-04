@@ -54,7 +54,11 @@ pub(crate) struct RtpExtensionIds {
 }
 
 impl RtpExtensionIds {
-    pub(crate) fn from_offer(offer: &MediaDescription) -> Self {
+    pub(crate) fn new() -> Self {
+        Self { mid: Some(1) }
+    }
+
+    pub(crate) fn from_desc(offer: &MediaDescription) -> Self {
         Self {
             mid: offer
                 .extmap
