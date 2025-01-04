@@ -20,7 +20,7 @@ impl LocalMedia {
         // Try choosing a codec
 
         for codec in &mut self.codecs.codecs {
-            let codec_pt = if let Some(static_pt) = codec.static_pt {
+            let codec_pt = if let Some(static_pt) = codec.pt {
                 if desc.media.fmts.contains(&static_pt) {
                     Some(static_pt)
                 } else {

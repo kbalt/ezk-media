@@ -74,6 +74,7 @@ pub struct SdpSession {
     transport_state: SessionTransportState,
 
     // Local configured media
+    next_pt: u8,
     local_media: SlotMap<LocalMediaId, LocalMedia>,
 
     /// Counter for local media ids
@@ -100,6 +101,15 @@ impl TransportEntry {
         match self {
             TransportEntry::Transport(transport) => transport.type_(),
             TransportEntry::TransportBuilder(transport_builder) => transport_builder.type_(),
+        }
+    }
+
+    fn populate_desc(&self, desc: &mut MediaDescription) {
+        match self {
+            TransportEntry::Transport(transport) => transport.populate_desc(desc),
+            TransportEntry::TransportBuilder(transport_builder) => {
+                transport_builder.populate_desc(desc);
+            }
         }
     }
 
@@ -213,11 +223,12 @@ impl SdpSession {
             version: u64::from(rand::random::<u16>()),
             address,
             transport_state: SessionTransportState::default(),
+            next_pt: 96,
             local_media: SlotMap::with_key(),
             next_media_id: MediaId(0),
             state: Vec::new(),
-            pending: Vec::new(),
             transports: SlotMap::with_key(),
+            pending: Vec::new(),
             events: Events::default(),
         }
     }
@@ -225,10 +236,20 @@ impl SdpSession {
     /// Register codecs for a media type with a limit of how many media session by can be created
     pub fn add_local_media(
         &mut self,
-        codecs: Codecs,
+        mut codecs: Codecs,
         limit: usize,
         direction: Direction,
     ) -> LocalMediaId {
+        for codec in &mut codecs.codecs {
+            codec.pt = Some(self.next_pt);
+
+            self.next_pt += 1;
+
+            if self.next_pt > 127 {
+                todo!("implement error when using too many codecs")
+            }
+        }
+
         self.local_media.insert(LocalMedia {
             codecs,
             limit,
@@ -595,12 +616,12 @@ impl SdpSession {
             attributes: vec![],
         };
 
-        transport.populate_offer(&mut media_desc);
+        transport.populate_desc(&mut media_desc);
 
         media_desc
     }
 
-    pub fn create_sdp_offer(&self) {
+    pub fn create_sdp_offer(&self) -> SessionDescription {
         let mut media_descriptions = vec![];
 
         // Put the current media sessions in the offer
@@ -629,53 +650,140 @@ impl SdpSession {
 
         // Add all pending added media
         for change in &self.pending {
-            match change {
-                PendingChange::AddMedia(pending_media) => {
-                    let local_media = &self.local_media[pending_media.local_media_id];
-                    let transport = &self.transports[pending_media.bundle_transport];
+            let PendingChange::AddMedia(pending_media) = change else {
+                continue;
+            };
 
-                    let (local_rtp_port, local_rtcp_port) = match transport {
-                        TransportEntry::Transport(transport) => {
-                            (transport.local_rtp_port, transport.local_rtcp_port)
-                        }
-                        TransportEntry::TransportBuilder(transport_builder) => (
-                            transport_builder.local_rtp_port,
-                            transport_builder.local_rtcp_port,
-                        ),
-                    };
+            let local_media = &self.local_media[pending_media.local_media_id];
+            let transport = &self.transports[pending_media.bundle_transport];
 
-                    MediaDescription {
-                        media: Media {
-                            media_type: local_media.codecs.media_type,
-                            port: local_rtp_port.expect("rtp port not set for t"),
-                            ports_num: None,
-                            proto: transport.type_().sdp_type(),
-                            fmts: vec![],
-                        },
-                        connection: todo!(),
-                        bandwidth: todo!(),
-                        direction: todo!(),
-                        rtcp: todo!(),
-                        rtcp_mux: todo!(),
-                        mid: todo!(),
-                        rtpmap: todo!(),
-                        fmtp: todo!(),
-                        ice_ufrag: todo!(),
-                        ice_pwd: todo!(),
-                        ice_candidates: todo!(),
-                        ice_end_of_candidates: todo!(),
-                        crypto: todo!(),
-                        extmap: todo!(),
-                        extmap_allow_mixed: todo!(),
-                        ssrc: todo!(),
-                        setup: todo!(),
-                        fingerprint: todo!(),
-                        attributes: todo!(),
-                    };
+            let (local_rtp_port, local_rtcp_port) = match transport {
+                TransportEntry::Transport(transport) => {
+                    (transport.local_rtp_port, transport.local_rtcp_port)
                 }
-                PendingChange::RemoveMedia(..) => {}
-                PendingChange::ChangeDirection(..) => {}
+                TransportEntry::TransportBuilder(transport_builder) => (
+                    transport_builder.local_rtp_port,
+                    transport_builder.local_rtcp_port,
+                ),
+            };
+
+            let mut rtpmap = vec![];
+            let mut fmtp = vec![];
+            let mut fmts = vec![];
+
+            for codec in &local_media.codecs.codecs {
+                let pt = codec.pt.expect("pt is set when adding the codec");
+
+                fmts.push(pt);
+
+                rtpmap.push(RtpMap {
+                    payload: pt,
+                    encoding: codec.name.as_ref().into(),
+                    clock_rate: codec.clock_rate,
+                    params: codec.channels.map(|c| c.to_string().into()),
+                });
+
+                // TODO: are multiple fmtps allowed?
+                for param in &codec.params {
+                    fmtp.push(Fmtp {
+                        format: pt,
+                        params: param.clone().into(),
+                    });
+                }
             }
+
+            let mut media_desc = MediaDescription {
+                media: Media {
+                    media_type: local_media.codecs.media_type,
+                    port: local_rtp_port.expect("rtp port not set for transport"),
+                    ports_num: None,
+                    proto: transport.type_().sdp_type(),
+                    fmts,
+                },
+                connection: None,
+                bandwidth: vec![],
+                direction: pending_media.direction.into(),
+                rtcp: local_rtcp_port.map(|port| Rtcp {
+                    port,
+                    address: None,
+                }),
+                rtcp_mux: local_rtcp_port.is_none(),
+                mid: Some(pending_media.mid.as_str().into()),
+                rtpmap,
+                fmtp,
+                ice_ufrag: None,
+                ice_pwd: None,
+                ice_candidates: vec![],
+                ice_end_of_candidates: false,
+                crypto: vec![],
+                extmap: vec![], // TODO: add extensions
+                extmap_allow_mixed: true,
+                ssrc: vec![],
+                setup: None,
+                fingerprint: vec![],
+                attributes: vec![],
+            };
+
+            transport.populate_desc(&mut media_desc);
+
+            media_descriptions.push(media_desc);
+        }
+
+        // Create bundle group attributes
+        let group = {
+            let mut bundle_groups: HashMap<TransportId, Vec<BytesStr>> = HashMap::new();
+
+            for media in self.state.iter() {
+                if let Some(mid) = media.mid.clone() {
+                    bundle_groups.entry(media.transport).or_default().push(mid);
+                }
+            }
+
+            for change in self.pending.iter() {
+                if let PendingChange::AddMedia(pending_media) = change {
+                    bundle_groups
+                        .entry(pending_media.bundle_transport)
+                        .or_default()
+                        .push(pending_media.mid.as_str().into());
+                }
+            }
+
+            bundle_groups
+                .into_values()
+                .filter(|c| c.len() > 1)
+                .map(|mids| Group {
+                    typ: BytesStr::from_static("BUNDLE"),
+                    mids,
+                })
+        };
+
+        SessionDescription {
+            origin: Origin {
+                username: "-".into(),
+                session_id: self.id.to_string().into(),
+                session_version: self.version.to_string().into(),
+                address: self.address.into(),
+            },
+            name: "-".into(),
+            connection: Some(Connection {
+                address: self.address.into(),
+                ttl: None,
+                num: None,
+            }),
+            bandwidth: vec![],
+            time: Time { start: 0, stop: 0 },
+            direction: Direction::SendRecv,
+            group: group.collect(),
+            extmap: vec![],
+            extmap_allow_mixed: true,
+            ice_lite: false,
+            ice_options: IceOptions::default(),
+            ice_ufrag: None,
+            ice_pwd: None,
+            setup: None,
+            fingerprint: vec![],
+            attributes: vec![],
+            media_descriptions,
         }
     }
 

@@ -5,7 +5,8 @@ use std::borrow::Cow;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Codec {
-    pub(crate) static_pt: Option<u8>,
+    /// Either set by the codec itself if it's static, or assigned later when added to a session
+    pub(crate) pt: Option<u8>,
     pub(crate) name: Cow<'static, str>,
     pub(crate) clock_rate: u32,
     pub(crate) channels: Option<u32>,
@@ -25,7 +26,7 @@ impl Codec {
 
     pub const fn new(name: &'static str, clock_rate: u32) -> Self {
         Self {
-            static_pt: None,
+            pt: None,
             name: Cow::Borrowed(name),
             clock_rate,
             channels: None,
@@ -34,7 +35,7 @@ impl Codec {
     }
 
     pub const fn with_static_pt(mut self, static_pt: u8) -> Self {
-        self.static_pt = Some(static_pt);
+        self.pt = Some(static_pt);
         self
     }
 

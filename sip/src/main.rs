@@ -71,11 +71,15 @@ impl Layer for InviteAcceptLayer {
 
         let (mut session, _ack) = acceptor.respond_success(response).await.unwrap();
 
-        sdp_session.add_local_media(
+        let v = sdp_session.add_local_media(
             Codecs::new(MediaType::Video).with_codec(Codec::AV1),
             1,
             Direction::RecvOnly,
         );
+
+        sdp_session.add_media(v, Direction::SendRecv);
+
+        println!("{}", sdp_session.create_offer().await);
 
         loop {
             let e = tokio::select! {

@@ -103,13 +103,13 @@ impl Transport {
                     }]),
                 }))
             }
-            TransportProtocol::UdpTlsRtpSavp => Some(Self::dtls_srtp(
+            TransportProtocol::UdpTlsRtpSavp => Self::dtls_srtp(
                 state,
                 remote_media_desc,
                 remote_rtp_address,
                 remote_rtcp_address,
-            ))
-            .transpose(),
+            )
+            .map(Some),
             _ => Ok(None),
         }
     }
@@ -206,17 +206,17 @@ impl Transport {
         }
     }
 
-    pub(crate) fn populate_offer(&self, offer: &mut MediaDescription) {
+    pub(crate) fn populate_desc(&self, desc: &mut MediaDescription) {
         match &self.kind {
             TransportKind::Rtp => {}
             TransportKind::SdesSrtp { crypto, .. } => {
-                offer.crypto.extend_from_slice(crypto);
+                desc.crypto.extend_from_slice(crypto);
             }
             TransportKind::DtlsSrtp {
                 fingerprint, setup, ..
             } => {
-                offer.setup = Some(*setup);
-                offer.fingerprint.extend_from_slice(fingerprint);
+                desc.setup = Some(*setup);
+                desc.fingerprint.extend_from_slice(fingerprint);
             }
         }
     }
@@ -398,6 +398,19 @@ impl TransportBuilder {
             rtcp_mux: false,
             rtp_port: &mut self.local_rtp_port,
             rtcp_port: &mut self.local_rtcp_port,
+        }
+    }
+
+    pub(crate) fn populate_desc(&self, desc: &mut MediaDescription) {
+        match &self.kind {
+            TransportBuilderKind::Rtp => {}
+            TransportBuilderKind::SdesSrtp { crypto, .. } => {
+                desc.crypto.extend_from_slice(crypto);
+            }
+            TransportBuilderKind::DtlsSrtp { fingerprint, .. } => {
+                desc.setup = Some(Setup::ActPass);
+                desc.fingerprint.extend_from_slice(fingerprint);
+            }
         }
     }
 

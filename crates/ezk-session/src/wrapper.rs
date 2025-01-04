@@ -1,4 +1,4 @@
-use crate::{transport::SocketUse, Codecs, Event, LocalMediaId, Options, SocketId};
+use crate::{transport::SocketUse, Codecs, Event, LocalMediaId, MediaId, Options, SocketId};
 use sdp_types::{Direction, SessionDescription};
 use std::{
     borrow::Cow,
@@ -43,12 +43,27 @@ impl AsyncSdpSession {
         self.inner.add_local_media(codecs, limit, direction)
     }
 
+    pub fn add_media(&mut self, local_media_id: LocalMediaId, direction: Direction) -> MediaId {
+        self.inner.add_media(local_media_id, direction)
+    }
+
+    pub async fn create_offer(&mut self) -> SessionDescription {
+        self.create_pending_sockets().await.unwrap();
+        self.inner.create_sdp_offer()
+    }
+
     pub async fn receive_sdp_offer(
         &mut self,
         offer: SessionDescription,
     ) -> Result<SessionDescription, super::Error> {
         let state = self.inner.receive_sdp_offer(offer)?;
 
+        self.create_pending_sockets().await?;
+
+        Ok(self.inner.create_sdp_answer(state))
+    }
+
+    async fn create_pending_sockets(&mut self) -> Result<(), crate::Error> {
         for new_transport in self.inner.new_transports() {
             if new_transport.rtp_port.is_none() {
                 let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -65,7 +80,7 @@ impl AsyncSdpSession {
             }
         }
 
-        Ok(self.inner.create_sdp_answer(state))
+        Ok(())
     }
 
     async fn handle_events(&mut self) -> Result<(), super::Error> {
