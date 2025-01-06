@@ -1,6 +1,7 @@
 #![warn(unreachable_pub)]
 
 use bytesstr::BytesStr;
+use events::{TransportChange, TransportRequiredChanges};
 use ezk_rtp::{rtcp_types::Compound, RtpPacket, RtpSession};
 use local_media::LocalMedia;
 use rtp::RtpExtensions;
@@ -19,8 +20,7 @@ use std::{
     time::Duration,
 };
 use transport::{
-    NewTransport, ReceivedPacket, SessionTransportState, SocketUse, Transport, TransportBuilder,
-    TransportEvent,
+    ReceivedPacket, SessionTransportState, SocketUse, Transport, TransportBuilder, TransportEvent,
 };
 
 mod codecs;
@@ -88,6 +88,7 @@ pub struct SdpSession {
     /// Pending changes which will be (maybe partially) applied once the offer/answer exchange has been completed
     pending: Vec<PendingChange>,
 
+    changes: Vec<TransportChange>,
     events: Events,
 }
 
@@ -137,6 +138,18 @@ impl TransportEntry {
         match self {
             TransportEntry::Transport(transport) => Some(transport),
             TransportEntry::TransportBuilder(..) => None,
+        }
+    }
+
+    fn ports(&self) -> (Option<u16>, Option<u16>) {
+        match self {
+            TransportEntry::Transport(transport) => {
+                (transport.local_rtp_port, transport.local_rtcp_port)
+            }
+            TransportEntry::TransportBuilder(transport_builder) => (
+                transport_builder.local_rtp_port,
+                transport_builder.local_rtcp_port,
+            ),
         }
     }
 }
@@ -229,6 +242,7 @@ impl SdpSession {
             state: Vec::new(),
             transports: SlotMap::with_key(),
             pending: Vec::new(),
+            changes: Vec::new(),
             events: Events::default(),
         }
     }
@@ -251,7 +265,7 @@ impl SdpSession {
             self.next_pt += 1;
 
             if self.next_pt > 127 {
-                todo!("implement error when using too many codecs")
+                todo!("implement error when overflowing the payload type")
             }
         }
 
@@ -267,28 +281,42 @@ impl SdpSession {
     pub fn add_media(&mut self, local_media_id: LocalMediaId, direction: Direction) -> MediaId {
         let media_id = self.next_media_id.step();
 
+        // TODO: if a "better" transport already exists, use that one instead?
+        let bundle_transport_id = self
+            .transports
+            .iter()
+            .find(|(_, t)| t.type_() == self.options.offer_transport)
+            .map(|(id, _)| id);
+
         let (standalone_transport, bundle_transport) = match self.options.bundle_policy {
-            BundlePolicy::Balanced => unimplemented!(),
             BundlePolicy::MaxCompat => {
-                unimplemented!()
+                let standalone_transport_id = self.transports.insert_with_key(|id| {
+                    TransportEntry::TransportBuilder(TransportBuilder::new(
+                        &mut self.transport_state,
+                        TransportRequiredChanges::new(id, &mut self.changes),
+                        self.options.offer_transport,
+                        self.options.rtcp_mux_policy,
+                    ))
+                });
+
+                (
+                    Some(standalone_transport_id),
+                    bundle_transport_id.unwrap_or(standalone_transport_id),
+                )
             }
             BundlePolicy::MaxBundle => {
-                // Force bundling, only create a transport if none of the type we should be offering exists
-
-                // TODO: if a "better" transport already exists use that instead?
-                let transport = self
-                    .transports
-                    .iter()
-                    .find(|(_, t)| t.type_() == self.options.offer_transport);
-
-                let transport_id = if let Some((existing_transport, _)) = transport {
+                // Force bundling, only create a transport if none exists yet
+                let transport_id = if let Some(existing_transport) = bundle_transport_id {
                     existing_transport
                 } else {
-                    self.transports
-                        .insert(TransportEntry::TransportBuilder(TransportBuilder::new(
+                    self.transports.insert_with_key(|id| {
+                        TransportEntry::TransportBuilder(TransportBuilder::new(
                             &mut self.transport_state,
+                            TransportRequiredChanges::new(id, &mut self.changes),
                             self.options.offer_transport,
-                        )))
+                            self.options.rtcp_mux_policy,
+                        ))
+                    })
                 };
 
                 (None, transport_id)
@@ -311,7 +339,7 @@ impl SdpSession {
     /// Receive a SDP offer in this session.
     ///
     /// Returns an opaque response state object which can be used to create the actual response SDP.
-    /// Before the SDP response can be created, the user must check that there are no transports pending creation using [`new_transports`](Self::new_transports).
+    /// Before the SDP response can be created, the user must make all necessary changes to the transports using [`transport_changes`](Self::transport_changes)
     ///
     /// The actual answer can be created using [`create_sdp_answer`](Self::create_sdp_answer).
     pub fn receive_sdp_offer(
@@ -411,7 +439,13 @@ impl SdpSession {
             self.local_media[media.local_media_id].use_count -= 1;
         }
 
-        // Remove all transports that are not being used anymore
+        self.remove_unused_transports();
+
+        Ok(SdpAnswerState(response))
+    }
+
+    /// Remove all transports that are not being used anymore
+    fn remove_unused_transports(&mut self) {
         self.transports.retain(|id, _| {
             // Is the transport in use by active media?
             let in_use_by_active = self.state.iter().any(|media| media.transport == id);
@@ -425,10 +459,13 @@ impl SdpSession {
                 }
             });
 
-            in_use_by_active || in_use_by_pending
+            if in_use_by_active || in_use_by_pending {
+                self.changes.push(TransportChange::Remove(id));
+                true
+            } else {
+                false
+            }
         });
-
-        Ok(SdpAnswerState(response))
     }
 
     fn update_media(&mut self, requested_direction: DirectionBools, media: &mut ActiveMedia) {
@@ -459,19 +496,26 @@ impl SdpSession {
             return Ok(Some(id));
         }
 
-        let transport = Transport::create_from_offer(
-            &mut self.transport_state,
-            remote_media_desc,
-            remote_rtp_address,
-            remote_rtcp_address,
-        )?;
+        // TODO: this is very messy, create_from_offer return Ok(None) if the transport is not supported
+        let maybe_transport_id =
+            self.transports
+                .try_insert_with_key(|id| -> Result<TransportEntry, Option<_>> {
+                    Transport::create_from_offer(
+                        &mut self.transport_state,
+                        TransportRequiredChanges::new(id, &mut self.changes),
+                        remote_media_desc,
+                        remote_rtp_address,
+                        remote_rtcp_address,
+                    )
+                    .map_err(Some)?
+                    .map(TransportEntry::Transport)
+                    .ok_or(None)
+                });
 
-        if let Some(transport) = transport {
-            let transport_id = self.transports.insert(TransportEntry::Transport(transport));
-
-            Ok(Some(transport_id))
-        } else {
-            Ok(None)
+        match maybe_transport_id {
+            Ok(id) => Ok(Some(id)),
+            Err(Some(err)) => Err(err),
+            Err(None) => Ok(None),
         }
     }
 
@@ -519,25 +563,6 @@ impl SdpSession {
             media_descriptions.push(self.media_description_for_active(active, None));
         }
 
-        // Create bundle group attributes
-        let group = {
-            let mut bundle_groups: HashMap<TransportId, Vec<BytesStr>> = HashMap::new();
-
-            for media in self.state.iter() {
-                if let Some(mid) = media.mid.clone() {
-                    bundle_groups.entry(media.transport).or_default().push(mid);
-                }
-            }
-
-            bundle_groups
-                .into_values()
-                .filter(|c| c.len() > 1)
-                .map(|mids| Group {
-                    typ: BytesStr::from_static("BUNDLE"),
-                    mids,
-                })
-        };
-
         SessionDescription {
             origin: Origin {
                 username: "-".into(),
@@ -554,7 +579,7 @@ impl SdpSession {
             bandwidth: vec![],
             time: Time { start: 0, stop: 0 },
             direction: Direction::SendRecv,
-            group: group.collect(),
+            group: self.build_bundle_groups(false),
             extmap: vec![],
             extmap_allow_mixed: true,
             ice_lite: false,
@@ -660,17 +685,11 @@ impl SdpSession {
             };
 
             let local_media = &self.local_media[pending_media.local_media_id];
-            let transport = &self.transports[pending_media.bundle_transport];
+            let transport = &self.transports[pending_media
+                .standalone_transport
+                .unwrap_or(pending_media.bundle_transport)];
 
-            let (local_rtp_port, local_rtcp_port) = match transport {
-                TransportEntry::Transport(transport) => {
-                    (transport.local_rtp_port, transport.local_rtcp_port)
-                }
-                TransportEntry::TransportBuilder(transport_builder) => (
-                    transport_builder.local_rtp_port,
-                    transport_builder.local_rtcp_port,
-                ),
-            };
+            let (local_rtp_port, local_rtcp_port) = transport.ports();
 
             let mut rtpmap = vec![];
             let mut fmtp = vec![];
@@ -734,34 +753,6 @@ impl SdpSession {
             media_descriptions.push(media_desc);
         }
 
-        // Create bundle group attributes
-        let group = {
-            let mut bundle_groups: HashMap<TransportId, Vec<BytesStr>> = HashMap::new();
-
-            for media in self.state.iter() {
-                if let Some(mid) = media.mid.clone() {
-                    bundle_groups.entry(media.transport).or_default().push(mid);
-                }
-            }
-
-            for change in self.pending.iter() {
-                if let PendingChange::AddMedia(pending_media) = change {
-                    bundle_groups
-                        .entry(pending_media.bundle_transport)
-                        .or_default()
-                        .push(pending_media.mid.as_str().into());
-                }
-            }
-
-            bundle_groups
-                .into_values()
-                .filter(|c| c.len() > 1)
-                .map(|mids| Group {
-                    typ: BytesStr::from_static("BUNDLE"),
-                    mids,
-                })
-        };
-
         SessionDescription {
             origin: Origin {
                 username: "-".into(),
@@ -778,7 +769,7 @@ impl SdpSession {
             bandwidth: vec![],
             time: Time { start: 0, stop: 0 },
             direction: Direction::SendRecv,
-            group: group.collect(),
+            group: self.build_bundle_groups(true),
             extmap: vec![],
             extmap_allow_mixed: true,
             ice_lite: false,
@@ -792,23 +783,58 @@ impl SdpSession {
         }
     }
 
-    /// Returns an iterator over all transports that have not yet had their port assigned to
-    pub fn new_transports(&mut self) -> impl Iterator<Item = NewTransport<'_>> {
-        self.transports
-            .iter_mut()
-            .map(|(id, t)| match t {
-                TransportEntry::Transport(transport) => transport.as_new_transport(id),
-                TransportEntry::TransportBuilder(transport_builder) => {
-                    transport_builder.as_new_transport(id)
+    fn build_bundle_groups(&self, include_pending_changes: bool) -> Vec<Group> {
+        let mut bundle_groups: HashMap<TransportId, Vec<BytesStr>> = HashMap::new();
+
+        for media in &self.state {
+            if let Some(mid) = media.mid.clone() {
+                bundle_groups.entry(media.transport).or_default().push(mid);
+            }
+        }
+
+        if include_pending_changes {
+            for change in &self.pending {
+                if let PendingChange::AddMedia(pending_media) = change {
+                    bundle_groups
+                        .entry(pending_media.bundle_transport)
+                        .or_default()
+                        .push(pending_media.mid.as_str().into());
                 }
+            }
+        }
+
+        bundle_groups
+            .into_values()
+            .filter(|c| c.len() > 1)
+            .map(|mids| Group {
+                typ: BytesStr::from_static("BUNDLE"),
+                mids,
             })
-            .filter(|nt| {
-                if nt.rtcp_mux {
-                    nt.rtp_port.is_none()
-                } else {
-                    nt.rtp_port.is_none() || nt.rtcp_port.is_none()
-                }
-            })
+            .collect()
+    }
+
+    /// Returns an iterator which contains all pending transport changes
+    pub fn transport_changes(&mut self) -> Vec<TransportChange> {
+        std::mem::take(&mut self.changes)
+    }
+
+    /// Set the RTP/RTCP ports of a transport
+    pub fn set_transport_ports(
+        &mut self,
+        transport_id: TransportId,
+        rtp_port: u16,
+        rtcp_port: Option<u16>,
+    ) {
+        match &mut self.transports[transport_id] {
+            TransportEntry::Transport(transport) => {
+                transport.local_rtp_port = Some(rtp_port);
+                transport.local_rtcp_port = rtcp_port;
+            }
+            TransportEntry::TransportBuilder(transport_builder) => {
+                transport_builder.local_rtp_port = Some(rtp_port);
+                transport_builder.local_rtcp_port = rtcp_port;
+            }
+        }
     }
 
     /// Returns a duration after which [`poll`](Self::poll) must be called

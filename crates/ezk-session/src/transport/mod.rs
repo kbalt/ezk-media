@@ -1,4 +1,6 @@
-use crate::{rtp::RtpExtensionIds, ConnectionState, Error, TransportId, TransportType};
+use crate::{
+    events::TransportRequiredChanges, rtp::RtpExtensionIds, ConnectionState, Error, TransportType,
+};
 use core::panic;
 use dtls_srtp::{DtlsCertificate, DtlsSetup, DtlsSrtpSession};
 use sdp_types::{Fingerprint, MediaDescription, Setup, SrtpCrypto, TransportProtocol};
@@ -43,7 +45,7 @@ pub(crate) struct Transport {
     state: ConnectionState,
     kind: TransportKind,
 
-    // Transport keep track of their own events separatly since they shouldn't be responsible for propagating these
+    // Transport keep track of their own events separately since they shouldn't be responsible for propagating these
     // events to the media tracks/streams that are using them.
     events: VecDeque<TransportEvent>,
 }
@@ -67,14 +69,22 @@ enum TransportKind {
 }
 
 impl Transport {
+    // TODO: rethink the return type here, this Result<Option<T>> business isn't really working out on the caller site
     pub(crate) fn create_from_offer(
         state: &mut SessionTransportState,
+        mut required_changes: TransportRequiredChanges<'_>,
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
     ) -> Result<Option<Self>, Error> {
-        match &remote_media_desc.media.proto {
-            TransportProtocol::RtpAvp => Ok(Some(Self {
+        if remote_media_desc.rtcp_mux {
+            required_changes.require_socket();
+        } else {
+            required_changes.require_socket_pair();
+        }
+
+        let transport = match &remote_media_desc.media.proto {
+            TransportProtocol::RtpAvp => Self {
                 local_rtp_port: None,
                 local_rtcp_port: None,
                 remote_rtp_address,
@@ -86,12 +96,12 @@ impl Transport {
                     old: ConnectionState::New,
                     new: ConnectionState::Connected,
                 }]),
-            })),
+            },
             TransportProtocol::RtpSavp => {
                 let (crypto, inbound, outbound) =
                     sdes_srtp::negotiate_from_offer(&remote_media_desc.crypto)?;
 
-                Ok(Some(Self {
+                Self {
                     local_rtp_port: None,
                     local_rtcp_port: None,
                     remote_rtp_address,
@@ -107,20 +117,21 @@ impl Transport {
                         old: ConnectionState::New,
                         new: ConnectionState::Connected,
                     }]),
-                }))
+                }
             }
-            TransportProtocol::UdpTlsRtpSavp => Self::dtls_srtp(
+            TransportProtocol::UdpTlsRtpSavp => Self::dtls_srtp_from_offer(
                 state,
                 remote_media_desc,
                 remote_rtp_address,
                 remote_rtcp_address,
-            )
-            .map(Some),
-            _ => Ok(None),
-        }
+            )?,
+            _ => return Ok(None),
+        };
+
+        Ok(Some(transport))
     }
 
-    pub(crate) fn dtls_srtp(
+    pub(crate) fn dtls_srtp_from_offer(
         state: &mut SessionTransportState,
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
@@ -193,15 +204,6 @@ impl Transport {
             },
             events,
         })
-    }
-
-    pub(crate) fn as_new_transport(&mut self, id: TransportId) -> NewTransport<'_> {
-        NewTransport {
-            id,
-            rtcp_mux: false,
-            rtp_port: &mut self.local_rtp_port,
-            rtcp_port: &mut self.local_rtcp_port,
-        }
     }
 
     pub(crate) fn type_(&self) -> TransportType {
@@ -300,13 +302,11 @@ impl Transport {
                     dtls.receive(data.clone().into_owned());
 
                     if let Some((inbound, outbound)) = dtls.handshake().unwrap() {
-                        if self.state != ConnectionState::Connected {
-                            self.state = ConnectionState::Connected;
-                            self.events.push_back(TransportEvent::ConnectionState {
-                                old: self.state,
-                                new: ConnectionState::Connected,
-                            });
-                        }
+                        Self::update_connection_state(
+                            &mut self.events,
+                            &mut self.state,
+                            ConnectionState::Connected,
+                        );
 
                         *srtp = Some((inbound.into_session(), outbound.into_session()));
                     }
@@ -360,6 +360,22 @@ impl Transport {
             _ => (),
         }
     }
+
+    // Set the a new connection state and emit an event if the state differs from the old one
+    fn update_connection_state(
+        events: &mut VecDeque<TransportEvent>,
+        state: &mut ConnectionState,
+        new: ConnectionState,
+    ) {
+        if *state != new {
+            events.push_back(TransportEvent::ConnectionState {
+                old: *state,
+                new: ConnectionState::Connected,
+            });
+
+            *state = ConnectionState::Connected;
+        }
+    }
 }
 
 #[must_use]
@@ -373,11 +389,4 @@ pub(crate) enum ReceivedPacket {
 pub enum SocketUse {
     Rtp,
     Rtcp,
-}
-
-pub struct NewTransport<'a> {
-    pub id: TransportId,
-    pub rtcp_mux: bool,
-    pub rtp_port: &'a mut Option<u16>,
-    pub rtcp_port: &'a mut Option<u16>,
 }

@@ -12,7 +12,6 @@ pub struct Codec {
     pub(crate) channels: Option<u32>,
     pub(crate) params: Vec<String>,
 }
-
 impl Codec {
     pub const PCMU: Self = Self::new("PCMU", 8000).with_static_pt(0);
     pub const PCMA: Self = Self::new("PCMA", 8000).with_static_pt(8);
@@ -35,6 +34,10 @@ impl Codec {
     }
 
     pub const fn with_static_pt(mut self, static_pt: u8) -> Self {
+        assert!(
+            static_pt < 64,
+            "static payload type must not be in the dynamic/rtcp range"
+        );
         self.pt = Some(static_pt);
         self
     }

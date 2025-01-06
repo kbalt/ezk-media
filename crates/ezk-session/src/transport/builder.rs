@@ -1,10 +1,10 @@
 use super::{
     dtls_srtp::{to_openssl_digest, DtlsCertificate, DtlsSetup, DtlsSrtpSession},
     sdes_srtp::{self, SdesSrtpOffer},
-    NewTransport, ReceivedPacket, SessionTransportState, SocketUse, Transport, TransportEvent,
-    TransportKind,
+    ReceivedPacket, SessionTransportState, SocketUse, Transport, TransportEvent, TransportKind,
+    TransportRequiredChanges,
 };
-use crate::{rtp::RtpExtensionIds, ConnectionState, TransportId, TransportType};
+use crate::{rtp::RtpExtensionIds, ConnectionState, RtcpMuxPolicy, TransportType};
 use core::panic;
 use sdp_types::{Fingerprint, MediaDescription, Setup};
 use std::{borrow::Cow, collections::VecDeque, net::SocketAddr};
@@ -27,7 +27,17 @@ enum TransportBuilderKind {
 }
 
 impl TransportBuilder {
-    pub(crate) fn new(state: &mut SessionTransportState, type_: TransportType) -> Self {
+    pub(crate) fn new(
+        state: &mut SessionTransportState,
+        mut required_changes: TransportRequiredChanges<'_>,
+        type_: TransportType,
+        rtcp_mux_policy: RtcpMuxPolicy,
+    ) -> Self {
+        match rtcp_mux_policy {
+            RtcpMuxPolicy::Negotiate => required_changes.require_socket_pair(),
+            RtcpMuxPolicy::Require => required_changes.require_socket(),
+        }
+
         let kind = match type_ {
             TransportType::Rtp => TransportBuilderKind::Rtp,
             TransportType::SdesSrtp => {
@@ -49,15 +59,6 @@ impl TransportBuilder {
             local_rtcp_port: None,
             kind,
             backlog: vec![],
-        }
-    }
-
-    pub(crate) fn as_new_transport(&mut self, id: TransportId) -> NewTransport<'_> {
-        NewTransport {
-            id,
-            rtcp_mux: false,
-            rtp_port: &mut self.local_rtp_port,
-            rtcp_port: &mut self.local_rtcp_port,
         }
     }
 
@@ -95,12 +96,19 @@ impl TransportBuilder {
     }
 
     pub(crate) fn build_from_answer(
-        self,
+        mut self,
         state: &mut SessionTransportState,
+        mut required_changes: TransportRequiredChanges<'_>,
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
     ) -> Transport {
+        // Remove RTCP socket if the answer has rtcp-mux set
+        if remote_media_desc.rtcp_mux && self.local_rtcp_port.is_some() {
+            required_changes.remove_rtcp_socket();
+            self.local_rtcp_port = None;
+        }
+
         let mut transport = match self.kind {
             TransportBuilderKind::Rtp => Transport {
                 local_rtp_port: self.local_rtp_port,
@@ -177,6 +185,7 @@ impl TransportBuilder {
             }
         };
 
+        // Feed the already received messages into the transport
         for (msg, source, socket) in self.backlog {
             match transport.receive(&mut Cow::Owned(msg), source, socket) {
                 ReceivedPacket::Rtp => todo!("handle early rtp"),

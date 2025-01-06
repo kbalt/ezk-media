@@ -25,16 +25,17 @@ impl TransportType {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RtcpMuxPolicy {
     #[default]
     Negotiate,
     Require,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum BundlePolicy {
-    Balanced,
+    // TODO: does Balanced really need to be a thing?
+    // Balanced,
     #[default]
     MaxCompat,
     MaxBundle,

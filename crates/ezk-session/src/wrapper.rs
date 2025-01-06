@@ -1,4 +1,7 @@
-use crate::{transport::SocketUse, Codecs, Event, LocalMediaId, MediaId, Options, SocketId};
+use crate::{
+    events::TransportChange, transport::SocketUse, Codecs, Event, LocalMediaId, MediaId, Options,
+    SocketId,
+};
 use sdp_types::{Direction, SessionDescription};
 use std::{
     borrow::Cow,
@@ -48,7 +51,7 @@ impl AsyncSdpSession {
     }
 
     pub async fn create_offer(&mut self) -> SessionDescription {
-        self.create_pending_sockets().await.unwrap();
+        self.handle_transport_changes().await.unwrap();
         self.inner.create_sdp_offer()
     }
 
@@ -58,25 +61,45 @@ impl AsyncSdpSession {
     ) -> Result<SessionDescription, super::Error> {
         let state = self.inner.receive_sdp_offer(offer)?;
 
-        self.create_pending_sockets().await?;
+        self.handle_transport_changes().await?;
 
         Ok(self.inner.create_sdp_answer(state))
     }
 
-    async fn create_pending_sockets(&mut self) -> Result<(), crate::Error> {
-        for new_transport in self.inner.new_transports() {
-            if new_transport.rtp_port.is_none() {
-                let socket = UdpSocket::bind("0.0.0.0:0").await?;
-                *new_transport.rtp_port = Some(socket.local_addr()?.port());
-                self.sockets
-                    .insert(SocketId(new_transport.id, SocketUse::Rtp), socket);
-            }
+    async fn handle_transport_changes(&mut self) -> Result<(), crate::Error> {
+        for change in self.inner.transport_changes() {
+            match change {
+                TransportChange::CreateSocket(transport_id) => {
+                    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+                    self.inner
+                        .set_transport_ports(transport_id, socket.local_addr()?.port(), None);
+                    self.sockets
+                        .insert(SocketId(transport_id, SocketUse::Rtp), socket);
+                }
+                TransportChange::CreateSocketPair(transport_id) => {
+                    let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+                    let rtcp_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
-            if !new_transport.rtcp_mux && new_transport.rtcp_port.is_none() {
-                let socket = UdpSocket::bind("0.0.0.0:0").await?;
-                *new_transport.rtcp_port = Some(socket.local_addr()?.port());
-                self.sockets
-                    .insert(SocketId(new_transport.id, SocketUse::Rtcp), socket);
+                    self.inner.set_transport_ports(
+                        transport_id,
+                        rtp_socket.local_addr()?.port(),
+                        Some(rtcp_socket.local_addr()?.port()),
+                    );
+
+                    self.sockets
+                        .insert(SocketId(transport_id, SocketUse::Rtp), rtp_socket);
+                    self.sockets
+                        .insert(SocketId(transport_id, SocketUse::Rtcp), rtcp_socket);
+                }
+                TransportChange::Remove(transport_id) => {
+                    self.sockets.remove(&SocketId(transport_id, SocketUse::Rtp));
+                    self.sockets
+                        .remove(&SocketId(transport_id, SocketUse::Rtcp));
+                }
+                TransportChange::RemoveRtcpSocket(transport_id) => {
+                    self.sockets
+                        .remove(&SocketId(transport_id, SocketUse::Rtcp));
+                }
             }
         }
 
@@ -110,6 +133,8 @@ impl AsyncSdpSession {
         let mut buf = ReadBuf::uninit(&mut buf);
 
         loop {
+            buf.set_filled(0);
+
             self.inner.poll();
             self.handle_events().await.unwrap();
 
