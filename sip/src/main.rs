@@ -6,11 +6,12 @@ use sip_core::{Endpoint, IncomingRequest, Layer, LayerKey, MayTake, Result};
 use sip_types::header::typed::{Contact, ContentType};
 use sip_types::uri::sip::SipUri;
 use sip_types::uri::NameAddr;
-use sip_types::{Code, Method};
+use sip_types::{Code, Method, Name};
 use sip_ua::dialog::{Dialog, DialogLayer};
 use sip_ua::invite::acceptor::Acceptor;
+use sip_ua::invite::prack::send_prack;
 use sip_ua::invite::session::Event;
-use sip_ua::invite::InviteLayer;
+use sip_ua::invite::{create_ack, InviteLayer};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -47,8 +48,13 @@ impl Layer for InviteAcceptLayer {
         let contact: SipUri = format!("sip:{ip}:5060").parse().unwrap();
         let contact = Contact::new(NameAddr::uri(contact));
 
-        let dialog =
-            Dialog::new_server(endpoint.clone(), self.dialog_layer, &invite, contact).unwrap();
+        let dialog = Dialog::new_server(
+            endpoint.clone(),
+            self.dialog_layer,
+            &invite,
+            contact.clone(),
+        )
+        .unwrap();
 
         let sdp_offer =
             SessionDescription::parse(&BytesStr::from_utf8_bytes(invite.body.clone()).unwrap())
@@ -71,15 +77,58 @@ impl Layer for InviteAcceptLayer {
 
         let (mut session, _ack) = acceptor.respond_success(response).await.unwrap();
 
-        let v = sdp_session.add_local_media(
-            Codecs::new(MediaType::Video).with_codec(Codec::AV1),
-            1,
-            Direction::RecvOnly,
-        );
+        {
+            sleep(Duration::from_secs(5)).await;
+            let v = sdp_session.add_local_media(
+                Codecs::new(MediaType::Video).with_codec(Codec::AV1),
+                1,
+                Direction::RecvOnly,
+            );
 
-        sdp_session.add_media(v, Direction::SendRecv);
+            sdp_session.add_media(v, Direction::SendRecv);
 
-        println!("{}", sdp_session.create_offer().await);
+            let offer = sdp_session.create_offer().await;
+
+            let mut request = session.dialog.create_request(Method::INVITE);
+
+            request.headers.insert_named(&contact);
+            request.headers.insert("Content-Type", "application/sdp");
+            request.body = offer.to_string().into();
+
+            let mut target_tp_info = session.dialog.target_tp_info.lock().await;
+
+            let mut tsx = endpoint
+                .send_invite(request, &mut target_tp_info)
+                .await
+                .unwrap();
+
+            drop(target_tp_info);
+
+            while let Ok(Some(msg)) = tsx.receive().await {
+                if let Ok(ct) = msg.headers.get_named::<ContentType>() {
+                    if ct.0 == "application/sdp" {
+                        println!("GOT RESPONSE");
+
+                        let sdp_response = BytesStr::from_utf8_bytes(msg.body).unwrap();
+                        let sdp_response = SessionDescription::parse(&sdp_response).unwrap();
+
+                        let mut ack = create_ack(&session.dialog, msg.base_headers.cseq.cseq)
+                            .await
+                            .unwrap();
+
+                        println!("CREATED ACK");
+
+                        endpoint.send_outgoing_request(&mut ack).await.unwrap();
+
+                        println!("SENT RESPONSE");
+
+                        sdp_session.receive_sdp_answer(sdp_response).await.unwrap();
+
+                        println!("RECEIVED ANSWER");
+                    }
+                }
+            }
+        }
 
         loop {
             let e = tokio::select! {

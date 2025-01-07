@@ -3,9 +3,9 @@ use sdp_types::{Direction, MediaDescription};
 
 pub(super) struct LocalMedia {
     pub(super) codecs: Codecs,
-    pub(super) limit: usize,
+    pub(super) limit: u32,
     pub(super) direction: DirectionBools,
-    pub(super) use_count: usize,
+    pub(super) use_count: u32,
 }
 
 impl LocalMedia {
@@ -17,12 +17,28 @@ impl LocalMedia {
             return None;
         }
 
-        // Try choosing a codec
+        self.choose_codec(desc)
+    }
 
+    pub(super) fn choose_codec_from_answer(
+        &mut self,
+        desc: &MediaDescription,
+    ) -> Option<(Codec, u8, DirectionBools)> {
+        if self.codecs.media_type != desc.media.media_type {
+            return None;
+        }
+
+        self.choose_codec(desc)
+    }
+
+    fn choose_codec(&mut self, desc: &MediaDescription) -> Option<(Codec, u8, DirectionBools)> {
+        // Try choosing a codec
         for codec in &mut self.codecs.codecs {
-            let codec_pt = if let Some(static_pt) = codec.pt {
-                if desc.media.fmts.contains(&static_pt) {
-                    Some(static_pt)
+            let pt = codec.pt.expect("pt is set when added to session");
+
+            let codec_pt = if codec.pt_is_static {
+                if desc.media.fmts.contains(&pt) {
+                    Some(pt)
                 } else {
                     None
                 }
@@ -36,30 +52,32 @@ impl LocalMedia {
                     .map(|rtpmap| rtpmap.payload)
             };
 
-            if let Some(codec_pt) = codec_pt {
-                let (do_send, do_receive) = match desc.direction.flipped() {
-                    Direction::SendRecv => (self.direction.send, self.direction.recv),
-                    Direction::RecvOnly => (false, self.direction.recv),
-                    Direction::SendOnly => (self.direction.send, false),
-                    Direction::Inactive => (false, false),
-                };
+            let Some(codec_pt) = codec_pt else {
+                continue;
+            };
 
-                if !(do_send || do_receive) {
-                    // There would be no sender or receiver
-                    return None;
-                }
+            let (do_send, do_receive) = match desc.direction.flipped() {
+                Direction::SendRecv => (self.direction.send, self.direction.recv),
+                Direction::RecvOnly => (false, self.direction.recv),
+                Direction::SendOnly => (self.direction.send, false),
+                Direction::Inactive => (false, false),
+            };
 
-                self.use_count += 1;
-
-                return Some((
-                    codec.clone(),
-                    codec_pt,
-                    DirectionBools {
-                        send: do_send,
-                        recv: do_receive,
-                    },
-                ));
+            if !(do_send || do_receive) {
+                // There would be no sender or receiver
+                return None;
             }
+
+            self.use_count += 1;
+
+            return Some((
+                codec.clone(),
+                codec_pt,
+                DirectionBools {
+                    send: do_send,
+                    recv: do_receive,
+                },
+            ));
         }
 
         None

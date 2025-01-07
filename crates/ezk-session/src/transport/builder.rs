@@ -27,6 +27,15 @@ enum TransportBuilderKind {
 }
 
 impl TransportBuilder {
+    pub(crate) fn placeholder() -> Self {
+        Self {
+            local_rtp_port: None,
+            local_rtcp_port: None,
+            kind: TransportBuilderKind::Rtp,
+            backlog: vec![],
+        }
+    }
+
     pub(crate) fn new(
         state: &mut SessionTransportState,
         mut required_changes: TransportRequiredChanges<'_>,

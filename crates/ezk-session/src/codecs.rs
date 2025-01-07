@@ -7,6 +7,7 @@ use std::borrow::Cow;
 pub struct Codec {
     /// Either set by the codec itself if it's static, or assigned later when added to a session
     pub(crate) pt: Option<u8>,
+    pub(crate) pt_is_static: bool,
     pub(crate) name: Cow<'static, str>,
     pub(crate) clock_rate: u32,
     pub(crate) channels: Option<u32>,
@@ -24,8 +25,9 @@ impl Codec {
     pub const AV1: Self = Self::new("AV1", 90_000);
 
     pub const fn new(name: &'static str, clock_rate: u32) -> Self {
-        Self {
+        Codec {
             pt: None,
+            pt_is_static: false,
             name: Cow::Borrowed(name),
             clock_rate,
             channels: None,
@@ -35,10 +37,11 @@ impl Codec {
 
     pub const fn with_static_pt(mut self, static_pt: u8) -> Self {
         assert!(
-            static_pt < 64,
+            static_pt < 35,
             "static payload type must not be in the dynamic/rtcp range"
         );
         self.pt = Some(static_pt);
+        self.pt_is_static = true;
         self
     }
 

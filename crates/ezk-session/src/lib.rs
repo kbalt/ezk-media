@@ -73,7 +73,7 @@ pub struct SdpSession {
     /// State shared between transports
     transport_state: SessionTransportState,
 
-    // Local configured media
+    // Local configured media codecs
     next_pt: u8,
     local_media: SlotMap<LocalMediaId, LocalMedia>,
 
@@ -205,6 +205,15 @@ enum PendingChange {
     ChangeDirection(MediaId, Direction),
 }
 
+impl PendingChange {
+    fn remove_media(&self) -> Option<MediaId> {
+        match self {
+            PendingChange::RemoveMedia(media_id) => Some(*media_id),
+            _ => None,
+        }
+    }
+}
+
 struct PendingMedia {
     id: MediaId,
     local_media_id: LocalMediaId,
@@ -215,6 +224,30 @@ struct PendingMedia {
     standalone_transport: Option<TransportId>,
     /// Transport to use when bundling
     bundle_transport: TransportId,
+}
+
+impl PendingMedia {
+    fn matches_answer(
+        &self,
+        transports: &SlotMap<TransportId, TransportEntry>,
+        desc: &MediaDescription,
+    ) -> bool {
+        if self.media_type != desc.media.media_type {
+            return false;
+        }
+
+        if let Some(answer_mid) = &desc.mid {
+            return self.mid == answer_mid.as_str();
+        }
+
+        if let Some(standalone_transport) = self.standalone_transport {
+            if transports[standalone_transport].type_().sdp_type() == desc.media.proto {
+                return true;
+            }
+        }
+
+        transports[self.bundle_transport].type_().sdp_type() == desc.media.proto
+    }
 }
 
 pub struct SdpAnswerState(Vec<SdpResponseEntry>);
@@ -251,7 +284,7 @@ impl SdpSession {
     pub fn add_local_media(
         &mut self,
         mut codecs: Codecs,
-        limit: usize,
+        limit: u32,
         direction: Direction,
     ) -> LocalMediaId {
         // Assign dynamic payload type numbers
@@ -281,11 +314,19 @@ impl SdpSession {
     pub fn add_media(&mut self, local_media_id: LocalMediaId, direction: Direction) -> MediaId {
         let media_id = self.next_media_id.step();
 
-        // TODO: if a "better" transport already exists, use that one instead?
+        // Find out which type of transport to use for this media
+        let transport_type = self
+            .transports
+            .values()
+            .map(|t| t.type_())
+            .max()
+            .unwrap_or(self.options.offer_transport);
+
+        // Find a transport of the previously found type to bundle
         let bundle_transport_id = self
             .transports
             .iter()
-            .find(|(_, t)| t.type_() == self.options.offer_transport)
+            .find(|(_, t)| t.type_() == transport_type)
             .map(|(id, _)| id);
 
         let (standalone_transport, bundle_transport) = match self.options.bundle_policy {
@@ -294,7 +335,7 @@ impl SdpSession {
                     TransportEntry::TransportBuilder(TransportBuilder::new(
                         &mut self.transport_state,
                         TransportRequiredChanges::new(id, &mut self.changes),
-                        self.options.offer_transport,
+                        transport_type,
                         self.options.rtcp_mux_policy,
                     ))
                 });
@@ -313,7 +354,7 @@ impl SdpSession {
                         TransportEntry::TransportBuilder(TransportBuilder::new(
                             &mut self.transport_state,
                             TransportRequiredChanges::new(id, &mut self.changes),
-                            self.options.offer_transport,
+                            transport_type,
                             self.options.rtcp_mux_policy,
                         ))
                     })
@@ -460,9 +501,9 @@ impl SdpSession {
             });
 
             if in_use_by_active || in_use_by_pending {
-                self.changes.push(TransportChange::Remove(id));
                 true
             } else {
+                self.changes.push(TransportChange::Remove(id));
                 false
             }
         });
@@ -591,64 +632,6 @@ impl SdpSession {
             attributes: vec![],
             media_descriptions,
         }
-    }
-
-    fn media_description_for_active(
-        &self,
-        active: &ActiveMedia,
-        override_direction: Option<Direction>,
-    ) -> MediaDescription {
-        let rtpmap = RtpMap {
-            payload: active.codec_pt,
-            encoding: active.codec.name.as_ref().into(),
-            clock_rate: active.codec.clock_rate,
-            params: Default::default(),
-        };
-
-        let fmtps = active.codec.params.iter().map(|param| Fmtp {
-            format: active.codec_pt,
-            params: param.as_str().into(),
-        });
-
-        let transport = self.transports[active.transport].unwrap();
-
-        let mut media_desc = MediaDescription {
-            media: Media {
-                media_type: active.media_type,
-                port: transport
-                    .local_rtp_port
-                    .expect("Did not set port for RTP socket"),
-                ports_num: None,
-                proto: transport.type_().sdp_type(),
-                fmts: vec![active.codec_pt],
-            },
-            connection: None,
-            bandwidth: vec![],
-            direction: override_direction.unwrap_or(active.direction.into()),
-            rtcp: transport.local_rtcp_port.map(|port| Rtcp {
-                port,
-                address: None,
-            }),
-            rtcp_mux: transport.remote_rtp_address == transport.remote_rtcp_address,
-            mid: active.mid.clone(),
-            rtpmap: vec![rtpmap],
-            fmtp: fmtps.collect(),
-            ice_ufrag: None,
-            ice_pwd: None,
-            ice_candidates: vec![],
-            ice_end_of_candidates: false,
-            crypto: vec![],
-            extmap: vec![],
-            extmap_allow_mixed: false,
-            ssrc: vec![],
-            setup: None,
-            fingerprint: vec![],
-            attributes: vec![],
-        };
-
-        transport.populate_desc(&mut media_desc);
-
-        media_desc
     }
 
     pub fn create_sdp_offer(&self) -> SessionDescription {
@@ -781,6 +764,160 @@ impl SdpSession {
             attributes: vec![],
             media_descriptions,
         }
+    }
+
+    /// Receive a SDP answer after sending an offer.
+    pub fn receive_sdp_answer(&mut self, answer: SessionDescription) {
+        'next_media_desc: for remote_media_desc in &answer.media_descriptions {
+            // Skip any rejected answers
+            if remote_media_desc.direction == Direction::Inactive {
+                continue;
+            }
+
+            let requested_direction: DirectionBools = remote_media_desc.direction.flipped().into();
+
+            // Try to match an active media session, while filtering out media that is to be deleted
+            for media in &mut self.state {
+                let pending_removal = self
+                    .pending
+                    .iter()
+                    .filter_map(PendingChange::remove_media)
+                    .any(|removed| removed == media.id);
+
+                if pending_removal {
+                    // Ignore this active media since it's supposed to be removed
+                    continue;
+                }
+
+                if media.matches(&self.transports, remote_media_desc) {
+                    // TODO: update media
+                    let _ = requested_direction;
+                    continue 'next_media_desc;
+                }
+            }
+
+            // Try to match a new media session
+            for pending_change in &self.pending {
+                let PendingChange::AddMedia(pending_media) = pending_change else {
+                    continue;
+                };
+
+                if !pending_media.matches_answer(&self.transports, remote_media_desc) {
+                    continue;
+                }
+
+                // Check which transport to use, (standalone or bundled)
+                let is_bundled = answer.group.iter().any(|group| {
+                    group.typ == "BUNDLE"
+                        && group.mids.iter().any(|m| m.as_str() == pending_media.mid)
+                });
+
+                let transport_id = if is_bundled {
+                    pending_media.bundle_transport
+                } else {
+                    // TODO: return an error here instead, we required BUNDLE, but it is not supported
+                    pending_media.standalone_transport.unwrap()
+                };
+
+                // Build transport if necessary
+                if let TransportEntry::TransportBuilder(transport_builder) =
+                    &mut self.transports[transport_id]
+                {
+                    let (remote_rtp_address, remote_rtcp_address) =
+                        resolve_rtp_and_rtcp_address(&answer, remote_media_desc).unwrap();
+
+                    let transport_builder =
+                        replace(transport_builder, TransportBuilder::placeholder());
+
+                    let transport = transport_builder.build_from_answer(
+                        &mut self.transport_state,
+                        TransportRequiredChanges::new(transport_id, &mut self.changes),
+                        remote_media_desc,
+                        remote_rtp_address,
+                        remote_rtcp_address,
+                    );
+
+                    self.transports[transport_id] = TransportEntry::Transport(transport);
+                }
+
+                let (codec, codec_pt, direction) = self.local_media[pending_media.local_media_id]
+                    .choose_codec_from_answer(remote_media_desc)
+                    .unwrap();
+
+                self.state.push(ActiveMedia {
+                    id: pending_media.id,
+                    local_media_id: pending_media.local_media_id,
+                    media_type: pending_media.media_type,
+                    rtp_session: RtpSession::new(rand::random(), codec.clock_rate),
+                    mid: remote_media_desc.mid.clone(),
+                    direction,
+                    transport: transport_id,
+                    codec_pt,
+                    codec,
+                });
+            }
+        }
+
+        self.pending.clear();
+        self.remove_unused_transports();
+    }
+
+    fn media_description_for_active(
+        &self,
+        active: &ActiveMedia,
+        override_direction: Option<Direction>,
+    ) -> MediaDescription {
+        let rtpmap = RtpMap {
+            payload: active.codec_pt,
+            encoding: active.codec.name.as_ref().into(),
+            clock_rate: active.codec.clock_rate,
+            params: Default::default(),
+        };
+
+        let fmtps = active.codec.params.iter().map(|param| Fmtp {
+            format: active.codec_pt,
+            params: param.as_str().into(),
+        });
+
+        let transport = self.transports[active.transport].unwrap();
+
+        let mut media_desc = MediaDescription {
+            media: Media {
+                media_type: active.media_type,
+                port: transport
+                    .local_rtp_port
+                    .expect("Did not set port for RTP socket"),
+                ports_num: None,
+                proto: transport.type_().sdp_type(),
+                fmts: vec![active.codec_pt],
+            },
+            connection: None,
+            bandwidth: vec![],
+            direction: override_direction.unwrap_or(active.direction.into()),
+            rtcp: transport.local_rtcp_port.map(|port| Rtcp {
+                port,
+                address: None,
+            }),
+            rtcp_mux: transport.remote_rtp_address == transport.remote_rtcp_address,
+            mid: active.mid.clone(),
+            rtpmap: vec![rtpmap],
+            fmtp: fmtps.collect(),
+            ice_ufrag: None,
+            ice_pwd: None,
+            ice_candidates: vec![],
+            ice_end_of_candidates: false,
+            crypto: vec![],
+            extmap: vec![],
+            extmap_allow_mixed: false,
+            ssrc: vec![],
+            setup: None,
+            fingerprint: vec![],
+            attributes: vec![],
+        };
+
+        transport.populate_desc(&mut media_desc);
+
+        media_desc
     }
 
     fn build_bundle_groups(&self, include_pending_changes: bool) -> Vec<Group> {

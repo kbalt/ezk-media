@@ -40,7 +40,7 @@ impl AsyncSdpSession {
     pub fn add_local_media(
         &mut self,
         codecs: Codecs,
-        limit: usize,
+        limit: u32,
         direction: Direction,
     ) -> LocalMediaId {
         self.inner.add_local_media(codecs, limit, direction)
@@ -66,10 +66,22 @@ impl AsyncSdpSession {
         Ok(self.inner.create_sdp_answer(state))
     }
 
+    pub async fn receive_sdp_answer(
+        &mut self,
+        answer: SessionDescription,
+    ) -> Result<(), super::Error> {
+        self.inner.receive_sdp_answer(answer);
+
+        self.handle_transport_changes().await?;
+
+        Ok(())
+    }
+
     async fn handle_transport_changes(&mut self) -> Result<(), crate::Error> {
         for change in self.inner.transport_changes() {
             match change {
                 TransportChange::CreateSocket(transport_id) => {
+                    println!("Create socket {transport_id:?}");
                     let socket = UdpSocket::bind("0.0.0.0:0").await?;
                     self.inner
                         .set_transport_ports(transport_id, socket.local_addr()?.port(), None);
@@ -77,6 +89,8 @@ impl AsyncSdpSession {
                         .insert(SocketId(transport_id, SocketUse::Rtp), socket);
                 }
                 TransportChange::CreateSocketPair(transport_id) => {
+                    println!("Create socket pair {transport_id:?}");
+
                     let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
                     let rtcp_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
@@ -92,11 +106,15 @@ impl AsyncSdpSession {
                         .insert(SocketId(transport_id, SocketUse::Rtcp), rtcp_socket);
                 }
                 TransportChange::Remove(transport_id) => {
+                    println!("Remove {transport_id:?}");
+
                     self.sockets.remove(&SocketId(transport_id, SocketUse::Rtp));
                     self.sockets
                         .remove(&SocketId(transport_id, SocketUse::Rtcp));
                 }
                 TransportChange::RemoveRtcpSocket(transport_id) => {
+                    println!("Remove rtcp socket of {transport_id:?}");
+
                     self.sockets
                         .remove(&SocketId(transport_id, SocketUse::Rtcp));
                 }
