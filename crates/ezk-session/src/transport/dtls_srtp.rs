@@ -5,7 +5,7 @@ use openssl::{
     hash::MessageDigest,
     pkey::{PKey, Private},
     rsa::Rsa,
-    ssl::{ErrorCode, Ssl, SslAcceptor, SslMethod, SslStream, SslVerifyMode},
+    ssl::{ErrorCode, Ssl, SslAcceptor, SslContext, SslMethod, SslStream, SslVerifyMode},
     x509::{
         extension::{BasicConstraints, KeyUsage, SubjectKeyIdentifier},
         X509NameBuilder, X509,
@@ -16,7 +16,6 @@ use srtp::openssl::Config;
 use std::{
     collections::VecDeque,
     io::{self, Cursor, Read, Write},
-    pin::Pin,
     time::Duration,
 };
 
@@ -27,24 +26,17 @@ pub(crate) enum DtlsSetup {
 }
 
 pub(crate) struct DtlsSrtpSession {
-    stream: Pin<Box<SslStream<IoQueue>>>,
+    stream: SslStream<IoQueue>,
     state: Option<DtlsSetup>,
 }
 
 impl DtlsSrtpSession {
     pub(crate) fn new(
-        dtls_cert: &DtlsCertificate,
+        ssl_context: &SslContext,
         fingerprints: Vec<(MessageDigest, Vec<u8>)>,
         setup: DtlsSetup,
     ) -> io::Result<Self> {
-        let mut ctx = SslAcceptor::mozilla_modern(SslMethod::dtls())?;
-        ctx.set_tlsext_use_srtp(srtp::openssl::SRTP_PROFILE_NAMES)?;
-        ctx.set_private_key(&dtls_cert.pkey)?;
-        ctx.set_certificate(&dtls_cert.cert)?;
-        ctx.check_private_key()?;
-        let ctx = ctx.build().into_context();
-
-        let mut ssl = Ssl::new(&ctx)?;
+        let mut ssl = Ssl::new(ssl_context)?;
         ssl.set_mtu(1200)?;
 
         ssl.set_verify_callback(
@@ -69,13 +61,13 @@ impl DtlsSrtpSession {
         );
 
         let mut this = Self {
-            stream: Box::pin(SslStream::new(
+            stream: SslStream::new(
                 ssl,
                 IoQueue {
                     to_read: None,
                     out: VecDeque::new(),
                 },
-            )?),
+            )?,
             state: Some(setup),
         };
 
@@ -125,8 +117,8 @@ impl DtlsSrtpSession {
         )>,
     > {
         let result = match self.state {
-            Some(DtlsSetup::Connect) => self.stream.as_mut().connect(),
-            Some(DtlsSetup::Accept) => self.stream.as_mut().accept(),
+            Some(DtlsSetup::Connect) => self.stream.connect(),
+            Some(DtlsSetup::Accept) => self.stream.accept(),
             None => {
                 assert!(
                     self.stream.get_mut().to_read.is_none(),
@@ -189,24 +181,29 @@ impl Write for IoQueue {
     }
 }
 
-pub(super) struct DtlsCertificate {
-    cert: X509,
-    pkey: PKey<Private>,
+pub(super) fn to_openssl_digest(algo: &FingerprintAlgorithm) -> Option<MessageDigest> {
+    match algo {
+        FingerprintAlgorithm::SHA1 => Some(MessageDigest::sha1()),
+        FingerprintAlgorithm::SHA224 => Some(MessageDigest::sha224()),
+        FingerprintAlgorithm::SHA256 => Some(MessageDigest::sha256()),
+        FingerprintAlgorithm::SHA384 => Some(MessageDigest::sha384()),
+        FingerprintAlgorithm::SHA512 => Some(MessageDigest::sha512()),
+        FingerprintAlgorithm::MD5 => Some(MessageDigest::md5()),
+        FingerprintAlgorithm::MD2 => None,
+        FingerprintAlgorithm::Other(..) => None,
+    }
 }
 
-impl DtlsCertificate {
-    pub(super) fn generate() -> Self {
-        let (cert, pkey) = make_ca_cert().unwrap();
+pub(super) fn make_ssl_context() -> SslContext {
+    let (cert, pkey) = make_ca_cert().unwrap();
 
-        Self { cert, pkey }
-    }
-
-    pub(super) fn fingerprint(&self) -> Fingerprint {
-        Fingerprint {
-            algorithm: FingerprintAlgorithm::SHA256,
-            fingerprint: self.cert.digest(MessageDigest::sha256()).unwrap().to_vec(),
-        }
-    }
+    let mut ctx = SslAcceptor::mozilla_modern(SslMethod::dtls()).unwrap();
+    ctx.set_tlsext_use_srtp(srtp::openssl::SRTP_PROFILE_NAMES)
+        .unwrap();
+    ctx.set_private_key(&pkey).unwrap();
+    ctx.set_certificate(&cert).unwrap();
+    ctx.check_private_key().unwrap();
+    ctx.build().into_context()
 }
 
 fn make_ca_cert() -> Result<(X509, PKey<Private>), ErrorStack> {
@@ -253,17 +250,4 @@ fn make_ca_cert() -> Result<(X509, PKey<Private>), ErrorStack> {
     let cert = cert_builder.build();
 
     Ok((cert, key_pair))
-}
-
-pub(super) fn to_openssl_digest(algo: &FingerprintAlgorithm) -> Option<MessageDigest> {
-    match algo {
-        FingerprintAlgorithm::SHA1 => Some(MessageDigest::sha1()),
-        FingerprintAlgorithm::SHA224 => Some(MessageDigest::sha224()),
-        FingerprintAlgorithm::SHA256 => Some(MessageDigest::sha256()),
-        FingerprintAlgorithm::SHA384 => Some(MessageDigest::sha384()),
-        FingerprintAlgorithm::SHA512 => Some(MessageDigest::sha512()),
-        FingerprintAlgorithm::MD5 => Some(MessageDigest::md5()),
-        FingerprintAlgorithm::MD2 => None,
-        FingerprintAlgorithm::Other(..) => None,
-    }
 }

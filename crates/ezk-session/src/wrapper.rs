@@ -21,9 +21,7 @@ use tokio::{
 
 pub struct AsyncSdpSession {
     inner: super::SdpSession,
-
     sockets: HashMap<SocketId, UdpSocket>,
-
     timeout: Option<Instant>,
 }
 

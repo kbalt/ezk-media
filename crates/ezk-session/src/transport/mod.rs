@@ -1,9 +1,11 @@
 use crate::{
     events::TransportRequiredChanges, rtp::RtpExtensionIds, ConnectionState, Error, TransportType,
 };
-use core::panic;
-use dtls_srtp::{DtlsCertificate, DtlsSetup, DtlsSrtpSession};
-use sdp_types::{Fingerprint, MediaDescription, Setup, SrtpCrypto, TransportProtocol};
+use dtls_srtp::{make_ssl_context, DtlsSetup, DtlsSrtpSession};
+use openssl::{hash::MessageDigest, ssl::SslContext};
+use sdp_types::{
+    Fingerprint, FingerprintAlgorithm, MediaDescription, Setup, SrtpCrypto, TransportProtocol,
+};
 use std::{borrow::Cow, collections::VecDeque, io, net::SocketAddr, time::Duration};
 
 mod builder;
@@ -16,8 +18,27 @@ pub(crate) use packet_kind::PacketKind;
 
 #[derive(Default)]
 pub(crate) struct SessionTransportState {
-    /// DTLS certificate to use for all DTLS traffic in a session
-    dtls_cert: Option<DtlsCertificate>,
+    ssl_context: Option<openssl::ssl::SslContext>,
+}
+
+impl SessionTransportState {
+    fn ssl_context(&mut self) -> &mut SslContext {
+        self.ssl_context.get_or_insert_with(make_ssl_context)
+    }
+
+    fn dtls_fingerprint(&mut self) -> Fingerprint {
+        let ctx = self.ssl_context();
+
+        Fingerprint {
+            algorithm: FingerprintAlgorithm::SHA256,
+            fingerprint: ctx
+                .certificate()
+                .unwrap()
+                .digest(MessageDigest::sha256())
+                .unwrap()
+                .to_vec(),
+        }
+    }
 }
 
 pub(crate) enum TransportEvent {
@@ -38,6 +59,8 @@ pub(crate) struct Transport {
 
     pub(crate) remote_rtp_address: SocketAddr,
     pub(crate) remote_rtcp_address: SocketAddr,
+
+    pub(crate) rtcp_mux: bool,
 
     // TODO: either split these up in send / receive ids or just make then receive and always use RtpExtensionIds::new() for send
     pub(crate) extension_ids: RtpExtensionIds,
@@ -63,7 +86,6 @@ enum TransportKind {
         fingerprint: Vec<Fingerprint>,
         setup: Setup,
 
-        // TODO: separate RTCP DTLS session
         dtls: DtlsSrtpSession,
         srtp: Option<(srtp::Session, srtp::Session)>,
     },
@@ -85,11 +107,12 @@ impl Transport {
         }
 
         let transport = match &remote_media_desc.media.proto {
-            TransportProtocol::RtpAvp => Self {
+            TransportProtocol::RtpAvp => Transport {
                 local_rtp_port: None,
                 local_rtcp_port: None,
                 remote_rtp_address,
                 remote_rtcp_address,
+                rtcp_mux: remote_media_desc.rtcp_mux,
                 extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                 state: ConnectionState::Connected,
                 kind: TransportKind::Rtp,
@@ -102,11 +125,12 @@ impl Transport {
                 let (crypto, inbound, outbound) =
                     sdes_srtp::negotiate_from_offer(&remote_media_desc.crypto)?;
 
-                Self {
+                Transport {
                     local_rtp_port: None,
                     local_rtcp_port: None,
                     remote_rtp_address,
                     remote_rtcp_address,
+                    rtcp_mux: remote_media_desc.rtcp_mux,
                     extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                     state: ConnectionState::Connected,
                     kind: TransportKind::SdesSrtp {
@@ -138,17 +162,13 @@ impl Transport {
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
     ) -> Result<Self, Error> {
-        if !remote_media_desc.rtcp_mux {
-            return Err(io::Error::other("DTLS-SRTP without rtcp-mux is not supported").into());
-        }
-
         let setup = match remote_media_desc.setup {
             Some(Setup::Active) => DtlsSetup::Accept,
             Some(Setup::Passive) => DtlsSetup::Connect,
             Some(Setup::ActPass) => {
                 // Use passive when accepting an offer so both sides will have the DTLS fingerprint
                 // before any request is sent
-                DtlsSetup::Accept
+                DtlsSetup::Connect
             }
             Some(Setup::HoldConn) | None => {
                 return Err(io::Error::other("missing or invalid setup attribute").into());
@@ -166,19 +186,10 @@ impl Transport {
             })
             .collect();
 
-        let mut dtls = DtlsSrtpSession::new(
-            state
-                .dtls_cert
-                .get_or_insert_with(DtlsCertificate::generate),
-            remote_fingerprints,
-            setup,
-        )?;
-
-        // Call handshake so that intial messages can be created
-        assert!(dtls.handshake().unwrap().is_none());
-
-        // Check for any send event from openssl
         let mut events = VecDeque::new();
+
+        let mut dtls =
+            DtlsSrtpSession::new(state.ssl_context(), remote_fingerprints.clone(), setup)?;
         while let Some(data) = dtls.pop_to_send() {
             events.push_back(TransportEvent::SendData {
                 socket: SocketUse::Rtp,
@@ -187,11 +198,12 @@ impl Transport {
             });
         }
 
-        Ok(Self {
+        Ok(Transport {
             local_rtp_port: None,
             local_rtcp_port: None,
             remote_rtp_address,
             remote_rtcp_address,
+            rtcp_mux: remote_media_desc.rtcp_mux,
             extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
             state: ConnectionState::New,
             kind: TransportKind::DtlsSrtp {

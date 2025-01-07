@@ -88,7 +88,8 @@ impl<'a> TransportRequiredChanges<'a> {
     }
 
     pub(crate) fn require_socket_pair(&mut self) {
-        self.changes.push(TransportChange::CreateSocket(self.id))
+        self.changes
+            .push(TransportChange::CreateSocketPair(self.id))
     }
 
     pub(crate) fn remove_rtcp_socket(&mut self) {

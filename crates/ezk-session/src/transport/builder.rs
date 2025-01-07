@@ -1,5 +1,5 @@
 use super::{
-    dtls_srtp::{to_openssl_digest, DtlsCertificate, DtlsSetup, DtlsSrtpSession},
+    dtls_srtp::{to_openssl_digest, DtlsSetup, DtlsSrtpSession},
     sdes_srtp::{self, SdesSrtpOffer},
     ReceivedPacket, SessionTransportState, SocketUse, Transport, TransportEvent, TransportKind,
     TransportRequiredChanges,
@@ -52,15 +52,9 @@ impl TransportBuilder {
             TransportType::SdesSrtp => {
                 TransportBuilderKind::SdesSrtp(sdes_srtp::SdesSrtpOffer::new())
             }
-            TransportType::DtlsSrtp => {
-                let cert = state
-                    .dtls_cert
-                    .get_or_insert_with(DtlsCertificate::generate);
-
-                TransportBuilderKind::DtlsSrtp {
-                    fingerprint: vec![cert.fingerprint()],
-                }
-            }
+            TransportType::DtlsSrtp => TransportBuilderKind::DtlsSrtp {
+                fingerprint: vec![state.dtls_fingerprint()],
+            },
         };
 
         Self {
@@ -124,6 +118,7 @@ impl TransportBuilder {
                 local_rtcp_port: self.local_rtcp_port,
                 remote_rtp_address,
                 remote_rtcp_address,
+                rtcp_mux: remote_media_desc.rtcp_mux,
                 extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                 state: ConnectionState::Connected,
                 kind: TransportKind::Rtp,
@@ -140,6 +135,7 @@ impl TransportBuilder {
                     local_rtcp_port: self.local_rtcp_port,
                     remote_rtp_address,
                     remote_rtcp_address,
+                    rtcp_mux: remote_media_desc.rtcp_mux,
                     extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                     state: ConnectionState::Connected,
                     kind: TransportKind::SdesSrtp {
@@ -166,18 +162,16 @@ impl TransportBuilder {
                     .filter_map(|e| Some((to_openssl_digest(&e.algorithm)?, e.fingerprint.clone())))
                     .collect();
 
-                let dtls = DtlsSrtpSession::new(
-                    state.dtls_cert.as_mut().unwrap(),
-                    remote_fingerprints,
-                    setup,
-                )
-                .unwrap();
+                let dtls =
+                    DtlsSrtpSession::new(state.ssl_context(), remote_fingerprints.clone(), setup)
+                        .unwrap();
 
                 Transport {
                     local_rtp_port: self.local_rtp_port,
                     local_rtcp_port: self.local_rtcp_port,
                     remote_rtp_address,
                     remote_rtcp_address,
+                    rtcp_mux: remote_media_desc.rtcp_mux,
                     extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                     state: ConnectionState::New,
                     kind: TransportKind::DtlsSrtp {

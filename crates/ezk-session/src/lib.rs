@@ -980,19 +980,11 @@ impl SdpSession {
         let mut timeout = None;
 
         for transport in self.transports.values().filter_map(TransportEntry::filter) {
-            match (&mut timeout, transport.timeout()) {
-                (None, Some(new)) => timeout = Some(new),
-                (Some(prev), Some(new)) => *prev = min(*prev, new),
-                _ => {}
-            }
+            timeout = opt_min(timeout, transport.timeout());
         }
 
         for media in self.state.iter() {
-            match (&mut timeout, media.rtp_session.pop_rtp_after(None)) {
-                (None, Some(new)) => timeout = Some(new),
-                (Some(prev), Some(new)) => *prev = min(*prev, new),
-                _ => {}
-            }
+            timeout = opt_min(timeout, media.rtp_session.pop_rtp_after(None));
         }
 
         timeout
@@ -1285,5 +1277,14 @@ impl From<Direction> for DirectionBools {
         };
 
         Self { send, recv }
+    }
+}
+
+fn opt_min<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (None, None) => None,
+        (None, Some(b)) => Some(b),
+        (Some(a), None) => Some(a),
+        (Some(a), Some(b)) => Some(min(a, b)),
     }
 }

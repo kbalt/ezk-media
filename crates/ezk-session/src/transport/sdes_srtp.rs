@@ -89,7 +89,7 @@ impl SdesSrtpOffer {
             let mut send_key = vec![0u8; policy.key_len()];
             rand::thread_rng().fill_bytes(&mut send_key);
 
-            keys.push((suite, send_key))
+            keys.push((suite, send_key));
         }
 
         Self { keys }
