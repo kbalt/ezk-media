@@ -72,6 +72,7 @@ pub enum TransportChange {
     RemoveRtcpSocket(TransportId),
 }
 
+// TODO; can this be removed because it too complex for something so simple
 pub(crate) struct TransportRequiredChanges<'a> {
     pub(crate) id: TransportId,
     pub(crate) changes: &'a mut Vec<TransportChange>,

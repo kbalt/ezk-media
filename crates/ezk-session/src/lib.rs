@@ -86,6 +86,7 @@ pub struct SdpSession {
     transports: SlotMap<TransportId, TransportEntry>,
 
     /// Pending changes which will be (maybe partially) applied once the offer/answer exchange has been completed
+    // TODO: copy str0m's API and maintain pending changes outside the session? This would allow moving the negotiation to another module...
     pending: Vec<PendingChange>,
 
     changes: Vec<TransportChange>,

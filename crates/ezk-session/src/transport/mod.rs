@@ -63,6 +63,7 @@ enum TransportKind {
         fingerprint: Vec<Fingerprint>,
         setup: Setup,
 
+        // TODO: separate RTCP DTLS session
         dtls: DtlsSrtpSession,
         srtp: Option<(srtp::Session, srtp::Session)>,
     },
