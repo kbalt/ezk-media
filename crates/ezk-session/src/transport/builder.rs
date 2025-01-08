@@ -122,10 +122,7 @@ impl TransportBuilder {
                 extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                 state: ConnectionState::Connected,
                 kind: TransportKind::Rtp,
-                events: VecDeque::from([TransportEvent::ConnectionState {
-                    old: ConnectionState::New,
-                    new: ConnectionState::Connected,
-                }]),
+                events: VecDeque::new(),
             },
             TransportBuilderKind::SdesSrtp(offer) => {
                 let (crypto, inbound, outbound) = offer.receive_answer(&remote_media_desc.crypto);
@@ -143,10 +140,7 @@ impl TransportBuilder {
                         inbound,
                         outbound,
                     },
-                    events: VecDeque::from([TransportEvent::ConnectionState {
-                        old: ConnectionState::New,
-                        new: ConnectionState::Connected,
-                    }]),
+                    events: VecDeque::new(),
                 }
             }
             TransportBuilderKind::DtlsSrtp { fingerprint } => {
@@ -187,6 +181,13 @@ impl TransportBuilder {
                 }
             }
         };
+
+        if transport.state != ConnectionState::New {
+            transport.events.push_back(TransportEvent::ConnectionState {
+                old: ConnectionState::New,
+                new: transport.state,
+            });
+        }
 
         // Feed the already received messages into the transport
         for (msg, source, socket) in self.backlog {
