@@ -17,7 +17,7 @@ use std::{
     io,
     mem::replace,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use transport::{
     ReceivedPacket, SessionTransportState, SocketUse, Transport, TransportBuilder, TransportEvent,
@@ -86,10 +86,8 @@ pub struct SdpSession {
     transports: SlotMap<TransportId, TransportEntry>,
 
     /// Pending changes which will be (maybe partially) applied once the offer/answer exchange has been completed
-    // TODO: copy str0m's API and maintain pending changes outside the session? This would allow moving the negotiation to another module...
-    pending: Vec<PendingChange>,
-
-    changes: Vec<TransportChange>,
+    pending_changes: Vec<PendingChange>,
+    transport_changes: Vec<TransportChange>,
     events: Events,
 }
 
@@ -163,6 +161,9 @@ struct ActiveMedia {
 
     /// The RTP session for this media
     rtp_session: RtpSession,
+
+    /// When to send the next RTCP report
+    next_rtcp: Instant,
 
     /// Optional mid, this is only one if both offer and answer have the mid attribute set
     mid: Option<BytesStr>,
@@ -275,8 +276,8 @@ impl SdpSession {
             next_media_id: MediaId(0),
             state: Vec::new(),
             transports: SlotMap::with_key(),
-            pending: Vec::new(),
-            changes: Vec::new(),
+            pending_changes: Vec::new(),
+            transport_changes: Vec::new(),
             events: Events::default(),
         }
     }
@@ -335,7 +336,7 @@ impl SdpSession {
                 let standalone_transport_id = self.transports.insert_with_key(|id| {
                     TransportEntry::TransportBuilder(TransportBuilder::new(
                         &mut self.transport_state,
-                        TransportRequiredChanges::new(id, &mut self.changes),
+                        TransportRequiredChanges::new(id, &mut self.transport_changes),
                         transport_type,
                         self.options.rtcp_mux_policy,
                     ))
@@ -354,7 +355,7 @@ impl SdpSession {
                     self.transports.insert_with_key(|id| {
                         TransportEntry::TransportBuilder(TransportBuilder::new(
                             &mut self.transport_state,
-                            TransportRequiredChanges::new(id, &mut self.changes),
+                            TransportRequiredChanges::new(id, &mut self.transport_changes),
                             transport_type,
                             self.options.rtcp_mux_policy,
                         ))
@@ -365,15 +366,16 @@ impl SdpSession {
             }
         };
 
-        self.pending.push(PendingChange::AddMedia(PendingMedia {
-            id: media_id,
-            local_media_id,
-            media_type: self.local_media[local_media_id].codecs.media_type,
-            mid: media_id.0.to_string(),
-            direction: direction.into(),
-            standalone_transport,
-            bundle_transport,
-        }));
+        self.pending_changes
+            .push(PendingChange::AddMedia(PendingMedia {
+                id: media_id,
+                local_media_id,
+                media_type: self.local_media[local_media_id].codecs.media_type,
+                mid: media_id.0.to_string(),
+                direction: direction.into(),
+                standalone_transport,
+                bundle_transport,
+            }));
 
         media_id
     }
@@ -466,6 +468,7 @@ impl SdpSession {
                 local_media_id,
                 media_type: remote_media_desc.media.media_type,
                 rtp_session: RtpSession::new(rand::random(), codec.clock_rate),
+                next_rtcp: Instant::now() + Duration::from_secs(5),
                 mid: remote_media_desc.mid.clone(),
                 direction: negotiated_direction,
                 transport,
@@ -493,7 +496,7 @@ impl SdpSession {
             let in_use_by_active = self.state.iter().any(|media| media.transport == id);
 
             // Is the transport in use by any pending changes?
-            let in_use_by_pending = self.pending.iter().any(|change| {
+            let in_use_by_pending = self.pending_changes.iter().any(|change| {
                 if let PendingChange::AddMedia(add_media) = change {
                     add_media.bundle_transport == id || add_media.standalone_transport == Some(id)
                 } else {
@@ -504,7 +507,7 @@ impl SdpSession {
             if in_use_by_active || in_use_by_pending {
                 true
             } else {
-                self.changes.push(TransportChange::Remove(id));
+                self.transport_changes.push(TransportChange::Remove(id));
                 false
             }
         });
@@ -544,7 +547,7 @@ impl SdpSession {
                 .try_insert_with_key(|id| -> Result<TransportEntry, Option<_>> {
                     Transport::create_from_offer(
                         &mut self.transport_state,
-                        TransportRequiredChanges::new(id, &mut self.changes),
+                        TransportRequiredChanges::new(id, &mut self.transport_changes),
                         remote_media_desc,
                         remote_rtp_address,
                         remote_rtcp_address,
@@ -643,7 +646,7 @@ impl SdpSession {
             let mut override_direction = None;
 
             // Apply requested changes
-            for change in &self.pending {
+            for change in &self.pending_changes {
                 match change {
                     PendingChange::AddMedia(..) => {}
                     PendingChange::RemoveMedia(media_id) => {
@@ -663,7 +666,7 @@ impl SdpSession {
         }
 
         // Add all pending added media
-        for change in &self.pending {
+        for change in &self.pending_changes {
             let PendingChange::AddMedia(pending_media) = change else {
                 continue;
             };
@@ -780,7 +783,7 @@ impl SdpSession {
             // Try to match an active media session, while filtering out media that is to be deleted
             for media in &mut self.state {
                 let pending_removal = self
-                    .pending
+                    .pending_changes
                     .iter()
                     .filter_map(PendingChange::remove_media)
                     .any(|removed| removed == media.id);
@@ -798,7 +801,7 @@ impl SdpSession {
             }
 
             // Try to match a new media session
-            for pending_change in &self.pending {
+            for pending_change in &self.pending_changes {
                 let PendingChange::AddMedia(pending_media) = pending_change else {
                     continue;
                 };
@@ -832,7 +835,7 @@ impl SdpSession {
 
                     let transport = transport_builder.build_from_answer(
                         &mut self.transport_state,
-                        TransportRequiredChanges::new(transport_id, &mut self.changes),
+                        TransportRequiredChanges::new(transport_id, &mut self.transport_changes),
                         remote_media_desc,
                         remote_rtp_address,
                         remote_rtcp_address,
@@ -850,6 +853,7 @@ impl SdpSession {
                     local_media_id: pending_media.local_media_id,
                     media_type: pending_media.media_type,
                     rtp_session: RtpSession::new(rand::random(), codec.clock_rate),
+                    next_rtcp: Instant::now() + Duration::from_secs(5),
                     mid: remote_media_desc.mid.clone(),
                     direction,
                     transport: transport_id,
@@ -859,7 +863,7 @@ impl SdpSession {
             }
         }
 
-        self.pending.clear();
+        self.pending_changes.clear();
         self.remove_unused_transports();
     }
 
@@ -931,7 +935,7 @@ impl SdpSession {
         }
 
         if include_pending_changes {
-            for change in &self.pending {
+            for change in &self.pending_changes {
                 if let PendingChange::AddMedia(pending_media) = change {
                     bundle_groups
                         .entry(pending_media.bundle_transport)
@@ -953,7 +957,7 @@ impl SdpSession {
 
     /// Returns an iterator which contains all pending transport changes
     pub fn transport_changes(&mut self) -> Vec<TransportChange> {
-        std::mem::take(&mut self.changes)
+        std::mem::take(&mut self.transport_changes)
     }
 
     /// Set the RTP/RTCP ports of a transport
@@ -977,6 +981,8 @@ impl SdpSession {
 
     /// Returns a duration after which [`poll`](Self::poll) must be called
     pub fn timeout(&self) -> Option<Duration> {
+        let now = Instant::now();
+
         let mut timeout = None;
 
         for transport in self.transports.values().filter_map(TransportEntry::filter) {
@@ -985,6 +991,12 @@ impl SdpSession {
 
         for media in self.state.iter() {
             timeout = opt_min(timeout, media.rtp_session.pop_rtp_after(None));
+
+            let rtcp_send_timeout = media
+                .next_rtcp
+                .checked_duration_since(now)
+                .unwrap_or_default();
+            timeout = opt_min(timeout, Some(rtcp_send_timeout))
         }
 
         timeout
@@ -992,6 +1004,8 @@ impl SdpSession {
 
     /// Poll for new events. Call [`pop_event`](Self::pop_event) to handle them.
     pub fn poll(&mut self) {
+        let now = Instant::now();
+
         for (transport_id, transport) in &mut self.transports {
             let TransportEntry::Transport(transport) = transport else {
                 continue;
@@ -1013,6 +1027,16 @@ impl SdpSession {
                     media_id: media.id,
                     packet: rtp_packet,
                 });
+            }
+
+            if media.next_rtcp <= now {
+                send_rtcp_report(
+                    &mut self.events,
+                    self.transports[media.transport].unwrap_mut(),
+                    media,
+                );
+
+                media.next_rtcp += Duration::from_secs(5);
             }
         }
     }
@@ -1147,48 +1171,43 @@ impl SdpSession {
             target: transport.remote_rtp_address,
         });
     }
+}
 
-    fn send_rtcp(&mut self, media_id: MediaId) {
-        let media = self.state.iter_mut().find(|m| m.id == media_id).unwrap();
+fn send_rtcp_report(events: &mut Events, transport: &mut Transport, media: &mut ActiveMedia) {
+    let mut encode_buf = vec![0u8; 65535];
 
-        let mut encode_buf = vec![0u8; 65535];
+    let len = match media.rtp_session.write_rtcp_report(&mut encode_buf) {
+        Ok(len) => len,
+        Err(e) => {
+            log::warn!("Failed to write RTCP packet, {e:?}");
+            return;
+        }
+    };
 
-        let len = match media.rtp_session.write_rtcp_report(&mut encode_buf) {
-            Ok(len) => len,
-            Err(e) => {
-                log::warn!("Failed to write RTCP packet, {e:?}");
-                return;
-            }
-        };
+    encode_buf.truncate(len);
+    transport.protect_rtcp(&mut encode_buf);
 
-        encode_buf.truncate(len);
+    let socket_use = if transport.rtcp_mux {
+        SocketUse::Rtp
+    } else {
+        SocketUse::Rtcp
+    };
 
-        let transport = self.transports[media.transport].unwrap_mut();
-
-        transport.protect_rtcp(&mut encode_buf);
-
-        let socket_use = if transport.local_rtcp_port.is_some() {
-            SocketUse::Rtp
-        } else {
-            SocketUse::Rtcp
-        };
-
-        self.events.push(Event::SendData {
-            socket: SocketId(media.transport, socket_use),
-            data: encode_buf,
-            target: transport.remote_rtcp_address,
-        });
-    }
+    events.push(Event::SendData {
+        socket: SocketId(media.transport, socket_use),
+        data: encode_buf,
+        target: transport.remote_rtcp_address,
+    });
 }
 
 fn resolve_rtp_and_rtcp_address(
-    offer: &SessionDescription,
+    remote_session_description: &SessionDescription,
     remote_media_description: &MediaDescription,
 ) -> Result<(SocketAddr, SocketAddr), Error> {
     let connection = remote_media_description
         .connection
         .as_ref()
-        .or(offer.connection.as_ref())
+        .or(remote_session_description.connection.as_ref())
         .unwrap();
 
     let remote_rtp_address = connection.address.clone();

@@ -168,7 +168,7 @@ impl Transport {
             Some(Setup::ActPass) => {
                 // Use passive when accepting an offer so both sides will have the DTLS fingerprint
                 // before any request is sent
-                DtlsSetup::Connect
+                DtlsSetup::Accept
             }
             Some(Setup::HoldConn) | None => {
                 return Err(io::Error::other("missing or invalid setup attribute").into());

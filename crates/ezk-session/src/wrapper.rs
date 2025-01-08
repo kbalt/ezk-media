@@ -5,11 +5,11 @@ use crate::{
 use sdp_types::{Direction, SessionDescription};
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::{pending, poll_fn},
     io,
     mem::MaybeUninit,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     task::Poll,
 };
 use tokio::{
@@ -21,8 +21,22 @@ use tokio::{
 
 pub struct AsyncSdpSession {
     inner: super::SdpSession,
-    sockets: HashMap<SocketId, UdpSocket>,
+    sockets: HashMap<SocketId, Socket>,
     timeout: Option<Instant>,
+}
+
+struct Socket {
+    socket: UdpSocket,
+    to_send: VecDeque<(Vec<u8>, SocketAddr)>,
+}
+
+impl Socket {
+    fn new(socket: UdpSocket) -> Self {
+        Self {
+            socket,
+            to_send: VecDeque::new(),
+        }
+    }
 }
 
 impl AsyncSdpSession {
@@ -83,8 +97,14 @@ impl AsyncSdpSession {
                     let socket = UdpSocket::bind("0.0.0.0:0").await?;
                     self.inner
                         .set_transport_ports(transport_id, socket.local_addr()?.port(), None);
-                    self.sockets
-                        .insert(SocketId(transport_id, SocketUse::Rtp), socket);
+
+                    self.sockets.insert(
+                        SocketId(transport_id, SocketUse::Rtp),
+                        Socket {
+                            socket,
+                            to_send: VecDeque::new(),
+                        },
+                    );
                 }
                 TransportChange::CreateSocketPair(transport_id) => {
                     println!("Create socket pair {transport_id:?}");
@@ -98,10 +118,14 @@ impl AsyncSdpSession {
                         Some(rtcp_socket.local_addr()?.port()),
                     );
 
-                    self.sockets
-                        .insert(SocketId(transport_id, SocketUse::Rtp), rtp_socket);
-                    self.sockets
-                        .insert(SocketId(transport_id, SocketUse::Rtcp), rtcp_socket);
+                    self.sockets.insert(
+                        SocketId(transport_id, SocketUse::Rtp),
+                        Socket::new(rtp_socket),
+                    );
+                    self.sockets.insert(
+                        SocketId(transport_id, SocketUse::Rtcp),
+                        Socket::new(rtcp_socket),
+                    );
                 }
                 TransportChange::Remove(transport_id) => {
                     println!("Remove {transport_id:?}");
@@ -122,7 +146,7 @@ impl AsyncSdpSession {
         Ok(())
     }
 
-    async fn handle_events(&mut self) -> Result<(), super::Error> {
+    fn handle_events(&mut self) -> Result<(), super::Error> {
         while let Some(event) = self.inner.pop_event() {
             match event {
                 Event::SendData {
@@ -130,7 +154,11 @@ impl AsyncSdpSession {
                     data,
                     target,
                 } => {
-                    self.sockets[&socket].send_to(&data, target).await?;
+                    self.sockets
+                        .get_mut(&socket)
+                        .unwrap()
+                        .to_send
+                        .push_back((data, target));
                 }
                 Event::ConnectionState { media_id, old, new } => {
                     println!("Connection state of {media_id:?} changed from {old:?} to {new:?}");
@@ -149,21 +177,21 @@ impl AsyncSdpSession {
         let mut buf = ReadBuf::uninit(&mut buf);
 
         loop {
-            buf.set_filled(0);
-
             self.inner.poll();
-            self.handle_events().await.unwrap();
+            self.handle_events().unwrap();
 
             self.timeout = self.inner.timeout().map(|d| Instant::now() + d);
 
             select! {
-                (socket_id, result) = recv_sockets(&self.sockets, &mut buf) => {
+                (socket_id, result) = poll_sockets(&mut self.sockets, &mut buf) => {
                     let source = result?;
 
                     self.inner
                         .receive(socket_id, &mut Cow::Borrowed(buf.filled()), source);
 
-                    self.handle_events().await.unwrap();
+                    self.handle_events().unwrap();
+
+                    buf.set_filled(0);
                 }
                 _ = timeout(self.timeout) => {
                     continue;
@@ -180,15 +208,25 @@ async fn timeout(instant: Option<Instant>) {
     }
 }
 
-async fn recv_sockets(
-    sockets: &HashMap<SocketId, UdpSocket>,
+async fn poll_sockets(
+    sockets: &mut HashMap<SocketId, Socket>,
     buf: &mut ReadBuf<'_>,
 ) -> (SocketId, Result<std::net::SocketAddr, io::Error>) {
-    buf.set_filled(0);
-
     poll_fn(|cx| {
-        for (socket_id, socket) in sockets {
-            let Poll::Ready(result) = socket.poll_recv_from(cx, buf) else {
+        for (socket_id, socket) in sockets.iter_mut() {
+            while let Some((data, target)) = socket.to_send.front() {
+                match socket.socket.poll_send_to(cx, data, *target) {
+                    Poll::Ready(Ok(..)) => {
+                        socket.to_send.pop_front();
+                    }
+                    Poll::Ready(Err(..)) => {
+                        todo!()
+                    }
+                    Poll::Pending => continue,
+                }
+            }
+
+            let Poll::Ready(result) = socket.socket.poll_recv_from(cx, buf) else {
                 continue;
             };
 
