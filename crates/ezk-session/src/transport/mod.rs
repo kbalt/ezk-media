@@ -207,7 +207,7 @@ impl Transport {
             extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
             state: ConnectionState::New,
             kind: TransportKind::DtlsSrtp {
-                fingerprint: vec![dtls.fingerprint()],
+                fingerprint: vec![state.dtls_fingerprint()],
                 setup: match setup {
                     DtlsSetup::Accept => Setup::Passive,
                     DtlsSetup::Connect => Setup::Active,

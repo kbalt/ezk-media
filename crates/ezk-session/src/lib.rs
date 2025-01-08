@@ -25,6 +25,7 @@ use transport::{
 
 mod codecs;
 mod events;
+mod ice;
 mod local_media;
 mod options;
 mod rtp;

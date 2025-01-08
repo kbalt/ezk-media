@@ -77,22 +77,6 @@ impl DtlsSrtpSession {
         Ok(this)
     }
 
-    pub(crate) fn fingerprint(&self) -> Fingerprint {
-        let fingerprint = self
-            .stream
-            .ssl()
-            .certificate()
-            .unwrap()
-            .digest(MessageDigest::sha256())
-            .unwrap()
-            .to_vec();
-
-        Fingerprint {
-            algorithm: FingerprintAlgorithm::SHA256,
-            fingerprint,
-        }
-    }
-
     #[cfg(openssl320)]
     pub(crate) fn timeout(&self) -> Option<Duration> {
         self.stream.ssl().event_timeout().unwrap()
@@ -162,7 +146,7 @@ impl Read for IoQueue {
 
         let result = to_read.read(buf)?;
 
-        if to_read.position() == to_read.get_ref().len() as u64 {
+        if to_read.position() == u64::try_from(to_read.get_ref().len()).unwrap() {
             self.to_read = None;
         }
 
