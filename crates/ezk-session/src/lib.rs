@@ -25,7 +25,8 @@ use transport::{
 
 mod codecs;
 mod events;
-mod ice;
+// TODO: make private
+pub mod ice;
 mod local_media;
 mod options;
 mod rtp;

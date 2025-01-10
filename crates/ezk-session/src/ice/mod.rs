@@ -1,14 +1,23 @@
 use bytesstr::BytesStr;
 use sdp_types::{IceCandidate, UntaggedAddress};
-use std::{collections::HashMap, net::SocketAddr};
+use slotmap::{new_key_type, SlotMap};
+use std::{
+    cmp::{max, min},
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
+
+new_key_type!(
+    struct CandidateId;
+);
 
 pub struct IceAgent {
     next_id: u32,
-    local_candidates: Vec<Candidate>,
 
-    remote_candidates: Vec<IceCandidate>,
+    local_candidates: SlotMap<CandidateId, Candidate>,
+    remote_candidates: SlotMap<CandidateId, Candidate>,
 
-    checklists: HashMap<u32, Checklist>,
+    checklists: Checklist,
 
     // TODO: stun/turn server
     is_controlling: bool,
@@ -16,6 +25,9 @@ pub struct IceAgent {
 
 struct Checklist {
     state: ChecklistState,
+
+    max_pairs: usize,
+    pairs: Vec<CandidatePair>,
 }
 
 enum ChecklistState {
@@ -24,13 +36,30 @@ enum ChecklistState {
     Failed,
 }
 
+struct CandidatePair {
+    local: CandidateId,
+    remote: CandidateId,
+    priority: u64,
+}
+
+enum CandidatePairState {
+    Waiting,
+    InProgress,
+    Succeeded,
+    Failed,
+}
+
 impl IceAgent {
     pub fn new(is_controlling: bool) -> Self {
         IceAgent {
             next_id: 0,
-            local_candidates: vec![],
-            remote_candidates: vec![],
-            checklists: HashMap::new(),
+            local_candidates: SlotMap::with_key(),
+            remote_candidates: SlotMap::with_key(),
+            checklists: Checklist {
+                state: ChecklistState::Running,
+                max_pairs: 100,
+                pairs: Vec::new(),
+            },
             is_controlling,
         }
     }
@@ -41,17 +70,21 @@ impl IceAgent {
         }
 
         if let SocketAddr::V6(v6) = addr {
-            if v6.ip().to_ipv4().is_some() || v6.ip().to_ipv4_mapped().is_some() {
+            let ip = v6.ip();
+            if ip.to_ipv4().is_some() || ip.to_ipv4_mapped().is_some() {
                 return;
             }
         }
 
+        self.add_local_candidate(component, CandidateKind::Host, addr);
+    }
+
+    fn add_local_candidate(&mut self, component: u32, kind: CandidateKind, addr: SocketAddr) {
         let id = self.next_id;
         self.next_id += 1;
 
-        let kind = CandidateKind::Host;
-
-        // Calculate the candidate priority (trick that I have stolen from str0m's implementation (thank you o/))
+        // Calculate the candidate priority using offsets + count of candidates of the same type
+        // (trick that I have stolen from str0m's implementation (thank you o/))
         let local_preference_offset = match kind {
             CandidateKind::Host => (65535 / 4) * 3,
             CandidateKind::PeerReflexive => (65535 / 4) * 2,
@@ -59,27 +92,104 @@ impl IceAgent {
             CandidateKind::Relayed => 0,
         };
 
-        let local_preference = local_preference_offset
-            + self
-                .local_candidates
-                .iter()
-                .filter(|c| c.kind == kind)
-                .count();
+        let local_preference = self
+            .local_candidates
+            .values()
+            .filter(|c| c.kind == kind)
+            .count() as u64
+            + local_preference_offset;
 
         let kind_preference = 2u64.pow(24) * kind as u64;
-        let local_preference = 2u64.pow(8) * local_preference as u64;
+        let local_preference = 2u64.pow(8) * local_preference;
         let priority = kind_preference + local_preference + (256 - component as u64);
 
-        self.local_candidates.push(Candidate {
+        println!("{priority} {addr}");
+
+        self.local_candidates.insert(Candidate {
             kind,
             priority,
             foundation: id,
             addr,
         });
+
+        self.form_pairs();
     }
 
     pub fn add_remote_candidtae(&mut self, candidate: IceCandidate) {
-        self.remote_candidates.push(candidate);
+        let kind = match candidate.typ.as_str() {
+            "host" => CandidateKind::Host,
+            "srflx" => CandidateKind::ServerReflexive,
+            _ => return,
+        };
+
+        let ip = match candidate.address {
+            UntaggedAddress::Fqdn(..) => return,
+            UntaggedAddress::IpAddress(ip_addr) => ip_addr,
+        };
+
+        self.remote_candidates.insert(Candidate {
+            kind,
+            priority: candidate.priority,
+            foundation: candidate.foundation.parse().unwrap(),
+            addr: SocketAddr::new(ip, candidate.port),
+        });
+
+        self.form_pairs();
+    }
+
+    fn form_pairs(&mut self) {
+        for (local_id, local_candidate) in &self.local_candidates {
+            for (remote_id, remote_candidate) in &self.remote_candidates {
+                // Exclude pairs with different ip version
+                match (local_candidate.addr.ip(), remote_candidate.addr.ip()) {
+                    (IpAddr::V4(..), IpAddr::V4(..)) => { /* ok */ }
+                    // Only pair IPv6 addresses when either both or neither are link local addresses
+                    (IpAddr::V6(l), IpAddr::V6(r))
+                        if l.is_unicast_link_local() == r.is_unicast_link_local() =>
+                    { /* ok */ }
+                    _ => {
+                        // Would make an invalid pair, skip
+                        continue;
+                    }
+                }
+
+                // Check if the pair already exists
+                let already_exists = self
+                    .checklists
+                    .pairs
+                    .iter()
+                    .any(|pair| pair.local == local_id && pair.remote == remote_id);
+
+                if already_exists {
+                    continue;
+                }
+
+                let (g, d) = if self.is_controlling {
+                    (local_candidate.priority, remote_candidate.priority)
+                } else {
+                    (remote_candidate.priority, local_candidate.priority)
+                };
+
+                // pair priority = 2^32*MIN(G,D) + 2*MAX(G,D) + (G>D?1:0)
+                let priority = 2u64.pow(32) * min(g, d) + 2 * max(g, d) + if g > d { 1 } else { 0 };
+
+                self.checklists.pairs.push(CandidatePair {
+                    local: local_id,
+                    remote: remote_id,
+                    priority,
+                })
+            }
+        }
+
+        self.checklists.pairs.sort_unstable_by_key(|p| p.priority);
+    }
+
+    /// Prune the lowest priority pairs until `max_pairs` is reached
+    fn prune_pairs(&mut self) {
+        while self.checklists.pairs.len() > self.checklists.max_pairs {
+            // TODO: is this enough?
+            self.checklists.pairs.pop();
+        }
     }
 }
 
