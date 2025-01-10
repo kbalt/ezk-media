@@ -165,23 +165,23 @@ async fn add_video_stream(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut ice = ezk_session::ice::IceAgent::new(true);
+    // let mut ice = ezk_session::ice::IceAgent::new(true);
 
-    for (_, ip) in local_ip_address::linux::list_afinet_netifas().unwrap() {
-        ice.add_local_addr(1, SocketAddr::new(ip, 52356));
-        ice.add_remote_candidtae(IceCandidate {
-            foundation: 1.to_string().into(),
-            component: 1,
-            transport: "UDP".into(),
-            priority: 2126511876,
-            address: sdp_types::UntaggedAddress::IpAddress(ip),
-            port: 50222,
-            typ: "host".into(),
-            rel_addr: None,
-            rel_port: None,
-            unknown: vec![],
-        });
-    }
+    // for (_, ip) in local_ip_address::linux::list_afinet_netifas().unwrap() {
+    //     ice.add_host_addr(1, SocketAddr::new(ip, 52356));
+    //     ice.add_remote_candidtae(IceCandidate {
+    //         foundation: 1.to_string().into(),
+    //         component: 1,
+    //         transport: "UDP".into(),
+    //         priority: 2126511876,
+    //         address: sdp_types::UntaggedAddress::IpAddress(ip),
+    //         port: 50222,
+    //         typ: "host".into(),
+    //         rel_addr: None,
+    //         rel_port: None,
+    //         unknown: vec![],
+    //     });
+    // }
     env_logger::init();
 
     let mut builder = Endpoint::builder();

@@ -1,25 +1,41 @@
 use bytesstr::BytesStr;
+use core::hash;
 use sdp_types::{IceCandidate, UntaggedAddress};
 use slotmap::{new_key_type, SlotMap};
 use std::{
     cmp::{max, min},
-    collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    collections::{HashMap, VecDeque},
+    hash::{DefaultHasher, Hash, Hasher},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
 };
+
+use crate::transport::{SocketUse, TransportEvent};
 
 new_key_type!(
     struct CandidateId;
 );
 
+const BASE_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+pub enum IceEvent {
+    CandidateGatheringComplete,
+    SendData {
+        socket: SocketUse,
+        data: Vec<u8>,
+        target: SocketAddr,
+    },
+}
+
 pub struct IceAgent {
-    next_id: u32,
+    remote_credentials: IceCredentials,
 
     local_candidates: SlotMap<CandidateId, Candidate>,
     remote_candidates: SlotMap<CandidateId, Candidate>,
 
     checklists: Checklist,
 
-    // TODO: stun/turn server
+    stun_server: Option<SocketAddr>,
+
     is_controlling: bool,
 }
 
@@ -49,10 +65,41 @@ enum CandidatePairState {
     Failed,
 }
 
+#[derive(Debug, PartialEq, Clone, Copy, Hash)]
+#[repr(u64)]
+enum CandidateKind {
+    Host = 126,
+    PeerReflexive = 110,
+    ServerReflexive = 100,
+    Relayed = 0,
+}
+
+struct Candidate {
+    addr: SocketAddr,
+    // transport: udp
+    kind: CandidateKind,
+    priority: u64,
+    foundation: String,
+
+    /// In the ICE world this would be the component, here we're just tracking RTP/RTCP
+    socket: SocketUse,
+
+    // The transport address that an ICE agent sends from for a particular candidate.
+    // For host, server-reflexive, and peer-reflexive candidates, the base is the same as the host candidate.
+    // For relayed candidates, the base is the same as the relayed candidate
+    //  (i.e., the transport address used by the TURN server to send from).
+    base: SocketAddr,
+}
+
+pub struct IceCredentials {
+    ufrag: String,
+    pwd: String,
+}
+
 impl IceAgent {
-    pub fn new(is_controlling: bool) -> Self {
+    pub fn new(rtcp_mux: bool, is_controlling: bool, remote_credentials: IceCredentials) -> Self {
         IceAgent {
-            next_id: 0,
+            remote_credentials,
             local_candidates: SlotMap::with_key(),
             remote_candidates: SlotMap::with_key(),
             checklists: Checklist {
@@ -60,11 +107,12 @@ impl IceAgent {
                 max_pairs: 100,
                 pairs: Vec::new(),
             },
+            stun_server: None,
             is_controlling,
         }
     }
 
-    pub fn add_local_addr(&mut self, component: u32, addr: SocketAddr) {
+    pub fn add_host_addr(&mut self, socket: SocketUse, addr: SocketAddr) {
         if addr.ip().is_loopback() || addr.ip().is_unspecified() {
             return;
         }
@@ -76,13 +124,10 @@ impl IceAgent {
             }
         }
 
-        self.add_local_candidate(component, CandidateKind::Host, addr);
+        self.add_local_candidate(socket, CandidateKind::Host, addr);
     }
 
-    fn add_local_candidate(&mut self, component: u32, kind: CandidateKind, addr: SocketAddr) {
-        let id = self.next_id;
-        self.next_id += 1;
-
+    fn add_local_candidate(&mut self, socket: SocketUse, kind: CandidateKind, addr: SocketAddr) {
         // Calculate the candidate priority using offsets + count of candidates of the same type
         // (trick that I have stolen from str0m's implementation (thank you o/))
         let local_preference_offset = match kind {
@@ -101,18 +146,19 @@ impl IceAgent {
 
         let kind_preference = 2u64.pow(24) * kind as u64;
         let local_preference = 2u64.pow(8) * local_preference;
-        let priority = kind_preference + local_preference + (256 - component as u64);
+        let priority = kind_preference + local_preference + (256 - socket as u64);
 
-        println!("{priority} {addr}");
+        // TODO: change this when adding server reflexive candidates
+        let base = addr;
 
         self.local_candidates.insert(Candidate {
+            addr,
             kind,
             priority,
-            foundation: id,
-            addr,
+            foundation: compute_foundation(kind, base, None, "udp").to_string(),
+            socket,
+            base,
         });
-
-        self.form_pairs();
     }
 
     pub fn add_remote_candidtae(&mut self, candidate: IceCandidate) {
@@ -122,19 +168,25 @@ impl IceAgent {
             _ => return,
         };
 
+        let socket = match candidate.component {
+            1 => SocketUse::Rtp,
+            2 => SocketUse::Rtcp,
+            _ => return,
+        };
+
         let ip = match candidate.address {
             UntaggedAddress::Fqdn(..) => return,
             UntaggedAddress::IpAddress(ip_addr) => ip_addr,
         };
 
         self.remote_candidates.insert(Candidate {
+            addr: SocketAddr::new(ip, candidate.port),
             kind,
             priority: candidate.priority,
             foundation: candidate.foundation.parse().unwrap(),
-            addr: SocketAddr::new(ip, candidate.port),
+            socket,
+            base: SocketAddr::new(ip, candidate.port), // TODO: do I even need this?
         });
-
-        self.form_pairs();
     }
 
     fn form_pairs(&mut self) {
@@ -191,22 +243,29 @@ impl IceAgent {
             self.checklists.pairs.pop();
         }
     }
+
+    /// Receive network packets for this ICE agent
+    pub fn receive(&mut self, data: &[u8], source: SocketAddr, socket: SocketUse) {
+        let x = stun_types::parse::ParsedMessage::parse(data.to_vec()).unwrap();
+
+        // stun_types::attributes::
+    }
+
+    pub fn poll(&mut self) {}
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-#[repr(u64)]
-enum CandidateKind {
-    Host = 126,
-    PeerReflexive = 110,
-    ServerReflexive = 100,
-    Relayed = 0,
-}
-
-struct Candidate {
+fn compute_foundation(
     kind: CandidateKind,
-    priority: u64,
-    foundation: u32,
-    addr: SocketAddr,
+    base: IpAddr,
+    rel_addr: Option<IpAddr>,
+    proto: &str,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    kind.hash(&mut hasher);
+    base.hash(&mut hasher);
+    rel_addr.hash(&mut hasher);
+    proto.hash(&mut hasher);
+    hasher.finish()
 }
 
 // v=0

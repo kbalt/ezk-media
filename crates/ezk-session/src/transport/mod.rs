@@ -400,6 +400,6 @@ pub(crate) enum ReceivedPacket {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SocketUse {
-    Rtp,
-    Rtcp,
+    Rtp = 1,
+    Rtcp = 2,
 }

@@ -214,6 +214,8 @@ async fn poll_sockets(
 ) -> (SocketId, Result<std::net::SocketAddr, io::Error>) {
     poll_fn(|cx| {
         for (socket_id, socket) in sockets.iter_mut() {
+            println!("{:?}", socket.socket.local_addr());
+
             while let Some((data, target)) = socket.to_send.front() {
                 match socket.socket.poll_send_to(cx, data, *target) {
                     Poll::Ready(Ok(..)) => {
