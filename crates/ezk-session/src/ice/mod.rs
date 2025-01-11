@@ -1,15 +1,20 @@
-use bytesstr::BytesStr;
-use core::hash;
+use crate::transport::SocketUse;
+use rand::distributions::{Alphanumeric, DistString};
 use sdp_types::{IceCandidate, UntaggedAddress};
 use slotmap::{new_key_type, SlotMap};
 use std::{
+    borrow::Cow,
     cmp::{max, min},
-    collections::{HashMap, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Instant,
 };
-
-use crate::transport::{SocketUse, TransportEvent};
+use stun_types::{
+    attributes::{
+        Fingerprint, MessageIntegrity, MessageIntegrityKey, Priority, UseCandidate, Username,
+    },
+    Class, Message, MessageBuilder, Method, TransactionId,
+};
 
 new_key_type!(
     struct CandidateId;
@@ -27,6 +32,7 @@ pub enum IceEvent {
 }
 
 pub struct IceAgent {
+    local_credentials: IceCredentials,
     remote_credentials: IceCredentials,
 
     local_candidates: SlotMap<CandidateId, Candidate>,
@@ -52,19 +58,6 @@ enum ChecklistState {
     Failed,
 }
 
-struct CandidatePair {
-    local: CandidateId,
-    remote: CandidateId,
-    priority: u64,
-}
-
-enum CandidatePairState {
-    Waiting,
-    InProgress,
-    Succeeded,
-    Failed,
-}
-
 #[derive(Debug, PartialEq, Clone, Copy, Hash)]
 #[repr(u64)]
 enum CandidateKind {
@@ -78,7 +71,7 @@ struct Candidate {
     addr: SocketAddr,
     // transport: udp
     kind: CandidateKind,
-    priority: u64,
+    priority: u32,
     foundation: String,
 
     /// In the ICE world this would be the component, here we're just tracking RTP/RTCP
@@ -91,14 +84,46 @@ struct Candidate {
     base: SocketAddr,
 }
 
+pub(super) struct CandidatePair {
+    local: CandidateId,
+    remote: CandidateId,
+    priority: u64,
+    state: CandidatePairState,
+}
+
+enum CandidatePairState {
+    Waiting,
+    InProgress,
+    Succeeded,
+    Failed,
+}
+
+struct ConnectivityCheckState {
+    transaction_id: TransactionId,
+    request_sent_at: Instant,
+    response_received_at: Option<Instant>,
+}
+
 pub struct IceCredentials {
     ufrag: String,
     pwd: String,
 }
 
+impl IceCredentials {
+    pub fn random() -> Self {
+        let mut rng = rand::thread_rng();
+
+        Self {
+            ufrag: Alphanumeric.sample_string(&mut rng, 32),
+            pwd: Alphanumeric.sample_string(&mut rng, 32),
+        }
+    }
+}
+
 impl IceAgent {
     pub fn new(rtcp_mux: bool, is_controlling: bool, remote_credentials: IceCredentials) -> Self {
         IceAgent {
+            local_credentials: IceCredentials::random(),
             remote_credentials,
             local_candidates: SlotMap::with_key(),
             remote_candidates: SlotMap::with_key(),
@@ -141,12 +166,12 @@ impl IceAgent {
             .local_candidates
             .values()
             .filter(|c| c.kind == kind)
-            .count() as u64
+            .count() as u32
             + local_preference_offset;
 
-        let kind_preference = 2u64.pow(24) * kind as u64;
-        let local_preference = 2u64.pow(8) * local_preference;
-        let priority = kind_preference + local_preference + (256 - socket as u64);
+        let kind_preference = 2u32.pow(24) * kind as u32;
+        let local_preference = 2u32.pow(8) * local_preference;
+        let priority = kind_preference + local_preference + (256 - socket as u32);
 
         // TODO: change this when adding server reflexive candidates
         let base = addr;
@@ -155,7 +180,7 @@ impl IceAgent {
             addr,
             kind,
             priority,
-            foundation: compute_foundation(kind, base, None, "udp").to_string(),
+            foundation: compute_foundation(kind, base.ip(), None, "udp").to_string(),
             socket,
             base,
         });
@@ -182,7 +207,7 @@ impl IceAgent {
         self.remote_candidates.insert(Candidate {
             addr: SocketAddr::new(ip, candidate.port),
             kind,
-            priority: candidate.priority,
+            priority: u32::try_from(candidate.priority).unwrap(),
             foundation: candidate.foundation.parse().unwrap(),
             socket,
             base: SocketAddr::new(ip, candidate.port), // TODO: do I even need this?
@@ -217,9 +242,15 @@ impl IceAgent {
                 }
 
                 let (g, d) = if self.is_controlling {
-                    (local_candidate.priority, remote_candidate.priority)
+                    (
+                        local_candidate.priority as u64,
+                        remote_candidate.priority as u64,
+                    )
                 } else {
-                    (remote_candidate.priority, local_candidate.priority)
+                    (
+                        remote_candidate.priority as u64,
+                        local_candidate.priority as u64,
+                    )
                 };
 
                 // pair priority = 2^32*MIN(G,D) + 2*MAX(G,D) + (G>D?1:0)
@@ -229,7 +260,8 @@ impl IceAgent {
                     local: local_id,
                     remote: remote_id,
                     priority,
-                })
+                    state: CandidatePairState::Waiting,
+                });
             }
         }
 
@@ -245,13 +277,78 @@ impl IceAgent {
     }
 
     /// Receive network packets for this ICE agent
-    pub fn receive(&mut self, data: &[u8], source: SocketAddr, socket: SocketUse) {
-        let x = stun_types::parse::ParsedMessage::parse(data.to_vec()).unwrap();
+    pub fn receive(&mut self, data: &[u8], source: SocketAddr, dst_ip: IpAddr, socket: SocketUse) {
+        let mut msg = Message::parse(data).unwrap();
 
-        // stun_types::attributes::
+        // TODO: move this ugly code somewhere else
+        let use_candidate = msg.attribute::<UseCandidate>().is_some();
+        let username = msg.attribute::<Username>().unwrap().unwrap();
+        let passed_integrity_check = msg
+            .attribute_with::<MessageIntegrity>(&MessageIntegrityKey::new_raw(Cow::Borrowed(
+                self.local_credentials.pwd.as_bytes(),
+            )))
+            .is_some_and(|r| r.is_ok());
+        let passed_fingerprint_check = msg.attribute::<Fingerprint>().is_some_and(|r| r.is_ok());
+        let priority = msg.attribute::<Priority>().unwrap().unwrap();
+
+        if self.is_controlling && use_candidate {
+            panic!()
+        }
+
+        let matching_remote_candidate = self.remote_candidates.iter().find(|(_, c)| {
+            // todo: also match protocol
+            c.addr == source
+        });
+
+        let remote_candidate = match matching_remote_candidate {
+            Some((remote, _)) => remote,
+            None => {
+                // TODO: filter out already known peer reflexive candidates
+
+                self.remote_candidates.insert(Candidate {
+                    addr: source,
+                    kind: CandidateKind::PeerReflexive,
+                    priority: priority.0,
+                    foundation: "TODO".into(), // TODO: ?
+                    socket,
+                    base: source,
+                })
+            }
+        };
+
+        let local_candidate = match self
+            .local_candidates
+            .iter()
+            .find(|(_, c)| c.kind == CandidateKind::Host && c.addr.ip() == dst_ip)
+        {
+            Some((id, _)) => id,
+            None => {
+                // TODO: unlucky?
+                return;
+            }
+        };
     }
 
-    pub fn poll(&mut self) {}
+    pub fn poll(&mut self) {
+        let now = Instant::now();
+
+        for pair in &mut self.checklists.pairs {
+            match pair.state {
+                CandidatePairState::Waiting => {
+                    // if let Some(timeout) = pair.timeout {
+                    //     if now < timeout {
+                    //         continue;
+                    //     }
+                    // } else {
+                    //     // MessageBuilder::new(Class::Request, Method::Binding, TransactionId::)
+                    // }
+                }
+                CandidatePairState::InProgress => todo!(),
+                CandidatePairState::Succeeded => todo!(),
+                CandidatePairState::Failed => todo!(),
+            }
+        }
+    }
 }
 
 fn compute_foundation(

@@ -391,6 +391,7 @@ impl Transport {
     }
 }
 
+#[derive(Debug)]
 #[must_use]
 pub(crate) enum ReceivedPacket {
     Rtp,

@@ -9,7 +9,6 @@ repository.workspace = true
 build = "build.rs"
 
 [dependencies]
-ezk.workspace = true
 ezk-rtp.workspace = true
 # stun-types = "0.1"
 stun-types = { git = "https://github.com/kbalt/ezk", package = "ezk-stun-types" }
@@ -26,3 +25,4 @@ srtp = "0.7"
 openssl = "0.10"
 openssl-sys = "0.9"
 base64 = "0.22"
+quinn-udp = "0.5"

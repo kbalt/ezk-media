@@ -26,6 +26,7 @@ use transport::{
 mod codecs;
 mod events;
 // TODO: make private
+mod async_wrapper;
 pub mod ice;
 mod local_media;
 mod options;
@@ -33,10 +34,10 @@ mod rtp;
 mod transport;
 mod wrapper;
 
+pub use async_wrapper::AsyncSdpSession;
 pub use codecs::{Codec, Codecs};
 pub use events::{ConnectionState, Event, Events};
 pub use options::{BundlePolicy, Options, RtcpMuxPolicy, TransportType};
-pub use wrapper::AsyncSdpSession;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MediaId(u32);
