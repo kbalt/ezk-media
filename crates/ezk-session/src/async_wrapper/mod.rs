@@ -1,11 +1,10 @@
 use crate::{
     events::TransportChange, transport::SocketUse, Codecs, Event, LocalMediaId, MediaId, Options,
-    SocketId,
+    ReceivedPkt, SocketId,
 };
 use sdp_types::{Direction, SessionDescription};
 use socket::Socket;
 use std::{
-    borrow::Cow,
     collections::HashMap,
     future::{pending, poll_fn},
     io::{self},
@@ -26,6 +25,7 @@ pub struct AsyncSdpSession {
     inner: super::SdpSession,
     sockets: HashMap<SocketId, Socket>,
     timeout: Option<Instant>,
+    ips: Vec<IpAddr>,
 }
 
 impl AsyncSdpSession {
@@ -34,6 +34,11 @@ impl AsyncSdpSession {
             inner: super::SdpSession::new(address, Options::default()),
             sockets: HashMap::new(),
             timeout: None,
+            ips: local_ip_address::linux::list_afinet_netifas()
+                .unwrap()
+                .into_iter()
+                .map(|(_, addr)| addr)
+                .collect(),
         }
     }
 
@@ -85,8 +90,12 @@ impl AsyncSdpSession {
                     println!("Create socket {transport_id:?}");
                     let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
-                    self.inner
-                        .set_transport_ports(transport_id, socket.local_addr()?.port(), None);
+                    self.inner.set_transport_ports(
+                        transport_id,
+                        &self.ips,
+                        socket.local_addr()?.port(),
+                        None,
+                    );
 
                     self.sockets
                         .insert(SocketId(transport_id, SocketUse::Rtp), Socket::new(socket));
@@ -99,6 +108,7 @@ impl AsyncSdpSession {
 
                     self.inner.set_transport_ports(
                         transport_id,
+                        &self.ips,
                         rtp_socket.local_addr()?.port(),
                         Some(rtcp_socket.local_addr()?.port()),
                     );
@@ -158,7 +168,6 @@ impl AsyncSdpSession {
         let mut buf = ReadBuf::uninit(&mut buf);
 
         loop {
-            buf.set_filled(0);
             self.inner.poll();
             self.handle_events().unwrap();
 
@@ -168,9 +177,14 @@ impl AsyncSdpSession {
                 (socket_id, result) = poll_sockets(&mut self.sockets, &mut buf) => {
                     let (dst, source) = result?;
 
-                    self.inner
-                        .receive(socket_id, &mut Cow::Borrowed(buf.filled()), source);
+                    let pkt = ReceivedPkt {
+                        data: buf.filled().to_vec(),
+                        source,
+                        destination: dst,
+                        socket: socket_id.1
+                    };
 
+                    self.inner.receive(socket_id.0, pkt);
                     self.handle_events().unwrap();
 
                     buf.set_filled(0);

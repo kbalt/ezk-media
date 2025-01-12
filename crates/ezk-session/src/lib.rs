@@ -166,6 +166,7 @@ struct ActiveMedia {
     rtp_session: RtpSession,
 
     /// When to send the next RTCP report
+    // TODO: do not start rtcp transmitting until transport is ready
     next_rtcp: Instant,
 
     /// Optional mid, this is only one if both offer and answer have the mid attribute set
@@ -264,6 +265,18 @@ enum SdpResponseEntry {
         media_type: MediaType,
         mid: Option<BytesStr>,
     },
+}
+
+/// A message received on a UDP socket
+pub struct ReceivedPkt {
+    /// The received data
+    pub data: Vec<u8>,
+    /// Source address of the message
+    pub source: SocketAddr,
+    /// Local socket destination address of the message
+    pub destination: IpAddr,
+    /// Intended usage of the socket
+    pub socket: SocketUse,
 }
 
 impl SdpSession {
@@ -530,7 +543,7 @@ impl SdpSession {
     fn get_or_create_transport(
         &mut self,
         new_state: &[ActiveMedia],
-        offer: &SessionDescription,
+        session_desc: &SessionDescription,
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
@@ -539,7 +552,7 @@ impl SdpSession {
         if let Some(id) = remote_media_desc
             .mid
             .as_ref()
-            .and_then(|mid| self.find_bundled_transport(new_state, offer, mid))
+            .and_then(|mid| self.find_bundled_transport(new_state, session_desc, mid))
         {
             return Ok(Some(id));
         }
@@ -551,6 +564,7 @@ impl SdpSession {
                     Transport::create_from_offer(
                         &mut self.transport_state,
                         TransportRequiredChanges::new(id, &mut self.transport_changes),
+                        session_desc,
                         remote_media_desc,
                         remote_rtp_address,
                         remote_rtcp_address,
@@ -967,6 +981,7 @@ impl SdpSession {
     pub fn set_transport_ports(
         &mut self,
         transport_id: TransportId,
+        ip_addrs: &[IpAddr],
         rtp_port: u16,
         rtcp_port: Option<u16>,
     ) {
@@ -974,6 +989,17 @@ impl SdpSession {
             TransportEntry::Transport(transport) => {
                 transport.local_rtp_port = Some(rtp_port);
                 transport.local_rtcp_port = rtcp_port;
+
+                if let Some(ice_agent) = &mut transport.ice_agent {
+                    for ip in ip_addrs {
+                        ice_agent.add_host_addr(SocketUse::Rtp, SocketAddr::new(*ip, rtp_port));
+
+                        if let Some(rtcp_port) = rtcp_port {
+                            ice_agent
+                                .add_host_addr(SocketUse::Rtcp, SocketAddr::new(*ip, rtcp_port));
+                        }
+                    }
+                }
             }
             TransportEntry::TransportBuilder(transport_builder) => {
                 transport_builder.local_rtp_port = Some(rtp_port);
@@ -1082,20 +1108,18 @@ impl SdpSession {
         self.events.pop()
     }
 
-    pub fn receive(&mut self, socket_id: SocketId, data: &mut Cow<[u8]>, source: SocketAddr) {
-        let transport = &mut self.transports[socket_id.0];
-
-        let transport = match transport {
+    pub fn receive(&mut self, transport_id: TransportId, mut pkt: ReceivedPkt) {
+        let transport = match &mut self.transports[transport_id] {
             TransportEntry::Transport(transport) => transport,
             TransportEntry::TransportBuilder(transport_builder) => {
-                transport_builder.receive(data.to_vec(), source, socket_id.1);
+                transport_builder.receive(pkt);
                 return;
             }
         };
 
-        match transport.receive(data, source, socket_id.1) {
+        match transport.receive(&mut pkt) {
             ReceivedPacket::Rtp => {
-                let rtp_packet = match RtpPacket::parse(data) {
+                let rtp_packet = match RtpPacket::parse(&pkt.data) {
                     Ok(rtp_packet) => rtp_packet,
                     Err(e) => {
                         log::debug!("Failed to parse RTP packet, {e:?}");
@@ -1110,7 +1134,7 @@ impl SdpSession {
                 let entry = self
                     .state
                     .iter_mut()
-                    .filter(|m| m.transport == socket_id.0)
+                    .filter(|m| m.transport == transport_id)
                     .find(|e| match (&e.mid, extensions.mid) {
                         (Some(a), Some(b)) => a.as_bytes() == b,
                         _ => false,
@@ -1122,7 +1146,7 @@ impl SdpSession {
                 } else {
                     self.state
                         .iter_mut()
-                        .filter(|m| m.transport == socket_id.0)
+                        .filter(|m| m.transport == transport_id)
                         .find(|e| e.codec_pt == packet.payload_type())
                 };
 
@@ -1133,7 +1157,7 @@ impl SdpSession {
                 }
             }
             ReceivedPacket::Rtcp => {
-                let rtcp_compound = match Compound::parse(data) {
+                let rtcp_compound = match Compound::parse(&pkt.data) {
                     Ok(rtcp_compound) => rtcp_compound,
                     Err(e) => {
                         log::debug!("Failed to parse incoming RTCP packet, {e}");

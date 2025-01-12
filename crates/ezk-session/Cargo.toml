@@ -11,7 +11,7 @@ build = "build.rs"
 [dependencies]
 ezk-rtp.workspace = true
 # stun-types = "0.1"
-stun-types = { git = "https://github.com/kbalt/ezk", package = "ezk-stun-types" }
+stun-types = { path = "../../../ezk/crates/stun-types", package = "ezk-stun-types" }
 # sdp-types = { package = "ezk-sdp-types", version = "0.4" }
 sdp-types = { git = "https://github.com/kbalt/ezk", package = "ezk-sdp-types" }
 log = "0.4"
@@ -26,3 +26,4 @@ openssl = "0.10"
 openssl-sys = "0.9"
 base64 = "0.22"
 quinn-udp = "0.5"
+local-ip-address = "0.6"

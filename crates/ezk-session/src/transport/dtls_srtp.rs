@@ -11,7 +11,7 @@ use openssl::{
         X509NameBuilder, X509,
     },
 };
-use sdp_types::{Fingerprint, FingerprintAlgorithm};
+use sdp_types::FingerprintAlgorithm;
 use srtp::openssl::Config;
 use std::{
     collections::VecDeque,

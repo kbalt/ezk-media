@@ -1,13 +1,13 @@
 use super::{
     dtls_srtp::{to_openssl_digest, DtlsSetup, DtlsSrtpSession},
     sdes_srtp::{self, SdesSrtpOffer},
-    ReceivedPacket, SessionTransportState, SocketUse, Transport, TransportEvent, TransportKind,
+    ReceivedPacket, SessionTransportState, Transport, TransportEvent, TransportKind,
     TransportRequiredChanges,
 };
-use crate::{rtp::RtpExtensionIds, ConnectionState, RtcpMuxPolicy, TransportType};
+use crate::{rtp::RtpExtensionIds, ConnectionState, ReceivedPkt, RtcpMuxPolicy, TransportType};
 use core::panic;
 use sdp_types::{Fingerprint, MediaDescription, Setup};
-use std::{borrow::Cow, collections::VecDeque, net::SocketAddr};
+use std::{collections::VecDeque, net::SocketAddr};
 
 /// Builder for a transport which has yet to be negotiated
 pub(crate) struct TransportBuilder {
@@ -17,7 +17,7 @@ pub(crate) struct TransportBuilder {
     kind: TransportBuilderKind,
 
     // Backlog of messages received before the SDP answer has been received
-    backlog: Vec<(Vec<u8>, SocketAddr, SocketUse)>,
+    backlog: Vec<ReceivedPkt>,
 }
 
 enum TransportBuilderKind {
@@ -88,14 +88,14 @@ impl TransportBuilder {
         }
     }
 
-    pub(crate) fn receive(&mut self, data: Vec<u8>, source: SocketAddr, socket: SocketUse) {
+    pub(crate) fn receive(&mut self, msg: ReceivedPkt) {
         // Limit the backlog buffer so it doesn't become a problem
         // this will never ever happen in a well behaved environment
         if self.backlog.len() > 100 {
             return;
         }
 
-        self.backlog.push((data, source, socket));
+        self.backlog.push(msg);
     }
 
     pub(crate) fn build_from_answer(
@@ -112,6 +112,8 @@ impl TransportBuilder {
             self.local_rtcp_port = None;
         }
 
+        let ice_agent = None;
+
         let mut transport = match self.kind {
             TransportBuilderKind::Rtp => Transport {
                 local_rtp_port: self.local_rtp_port,
@@ -119,6 +121,7 @@ impl TransportBuilder {
                 remote_rtp_address,
                 remote_rtcp_address,
                 rtcp_mux: remote_media_desc.rtcp_mux,
+                ice_agent,
                 extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                 state: ConnectionState::Connected,
                 kind: TransportKind::Rtp,
@@ -133,6 +136,7 @@ impl TransportBuilder {
                     remote_rtp_address,
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
+                    ice_agent,
                     extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                     state: ConnectionState::Connected,
                     kind: TransportKind::SdesSrtp {
@@ -166,6 +170,7 @@ impl TransportBuilder {
                     remote_rtp_address,
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
+                    ice_agent,
                     extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                     state: ConnectionState::New,
                     kind: TransportKind::DtlsSrtp {
@@ -190,8 +195,8 @@ impl TransportBuilder {
         }
 
         // Feed the already received messages into the transport
-        for (msg, source, socket) in self.backlog {
-            match transport.receive(&mut Cow::Owned(msg), source, socket) {
+        for mut pkt in self.backlog {
+            match transport.receive(&mut pkt) {
                 ReceivedPacket::Rtp => todo!("handle early rtp"),
                 ReceivedPacket::Rtcp => todo!("handle early rtcp"),
                 ReceivedPacket::TransportSpecific => {}

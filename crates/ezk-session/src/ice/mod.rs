@@ -1,29 +1,33 @@
-use crate::transport::SocketUse;
+use crate::{transport::SocketUse, ReceivedPkt};
 use rand::distributions::{Alphanumeric, DistString};
 use sdp_types::{IceCandidate, UntaggedAddress};
 use slotmap::{new_key_type, SlotMap};
 use std::{
     borrow::Cow,
     cmp::{max, min},
+    collections::VecDeque,
     hash::{DefaultHasher, Hash, Hasher},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Instant,
+    net::{IpAddr, SocketAddr},
+    time::{Duration, Instant},
 };
 use stun_types::{
     attributes::{
         Fingerprint, MessageIntegrity, MessageIntegrityKey, Priority, UseCandidate, Username,
     },
-    Class, Message, MessageBuilder, Method, TransactionId,
+    Class, Message, TransactionId,
 };
+
+mod stun;
 
 new_key_type!(
     struct CandidateId;
 );
 
-const BASE_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-
 pub enum IceEvent {
-    CandidateGatheringComplete,
+    UseAddr {
+        socket: SocketUse,
+        target: SocketAddr,
+    },
     SendData {
         socket: SocketUse,
         data: Vec<u8>,
@@ -43,6 +47,9 @@ pub struct IceAgent {
     stun_server: Option<SocketAddr>,
 
     is_controlling: bool,
+    control_tie_breaker: u64,
+
+    last_ta_trigger: Option<Instant>,
 }
 
 struct Checklist {
@@ -50,6 +57,9 @@ struct Checklist {
 
     max_pairs: usize,
     pairs: Vec<CandidatePair>,
+    triggered_check_queue: VecDeque<()>,
+
+    use_pair: Option<(CandidateId, CandidateId)>,
 }
 
 enum ChecklistState {
@@ -91,22 +101,32 @@ pub(super) struct CandidatePair {
     state: CandidatePairState,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 enum CandidatePairState {
+    /// A check has not been sent for this pair, but the pair is not Frozen.
     Waiting,
-    InProgress,
-    Succeeded,
-    Failed,
-}
 
-struct ConnectivityCheckState {
-    transaction_id: TransactionId,
-    request_sent_at: Instant,
-    response_received_at: Option<Instant>,
+    /// A check has been sent for this pair, but the transaction is in progress.
+    InProgress {
+        transaction_id: TransactionId,
+        sent_at: Instant,
+    },
+
+    // A check has been sent for this pair, and it produced a successful result.
+    Succeeded,
+
+    /// A check has been sent for this pair, and it failed (a response to the check
+    /// was never received, or a failure response was received).
+    Failed,
+
+    /// A check for this pair has not been sent, and it cannot be
+    /// sent until the pair is unfrozen and moved into the Waiting state.
+    Frozen,
 }
 
 pub struct IceCredentials {
-    ufrag: String,
-    pwd: String,
+    pub ufrag: String,
+    pub pwd: String,
 }
 
 impl IceCredentials {
@@ -114,14 +134,14 @@ impl IceCredentials {
         let mut rng = rand::thread_rng();
 
         Self {
-            ufrag: Alphanumeric.sample_string(&mut rng, 32),
+            ufrag: Alphanumeric.sample_string(&mut rng, 8),
             pwd: Alphanumeric.sample_string(&mut rng, 32),
         }
     }
 }
 
 impl IceAgent {
-    pub fn new(rtcp_mux: bool, is_controlling: bool, remote_credentials: IceCredentials) -> Self {
+    pub fn new(is_controlling: bool, remote_credentials: IceCredentials) -> Self {
         IceAgent {
             local_credentials: IceCredentials::random(),
             remote_credentials,
@@ -131,10 +151,18 @@ impl IceAgent {
                 state: ChecklistState::Running,
                 max_pairs: 100,
                 pairs: Vec::new(),
+                triggered_check_queue: VecDeque::new(),
+                use_pair: None,
             },
             stun_server: None,
             is_controlling,
+            control_tie_breaker: rand::random(),
+            last_ta_trigger: None,
         }
+    }
+
+    pub fn credentials(&self) -> &IceCredentials {
+        &self.local_credentials
     }
 
     pub fn add_host_addr(&mut self, socket: SocketUse, addr: SocketAddr) {
@@ -169,8 +197,8 @@ impl IceAgent {
             .count() as u32
             + local_preference_offset;
 
-        let kind_preference = 2u32.pow(24) * kind as u32;
-        let local_preference = 2u32.pow(8) * local_preference;
+        let kind_preference = (kind as u32) << 24;
+        let local_preference = local_preference << 8;
         let priority = kind_preference + local_preference + (256 - socket as u32);
 
         // TODO: change this when adding server reflexive candidates
@@ -184,9 +212,11 @@ impl IceAgent {
             socket,
             base,
         });
+
+        self.form_pairs();
     }
 
-    pub fn add_remote_candidtae(&mut self, candidate: IceCandidate) {
+    pub fn add_remote_candidate(&mut self, candidate: &IceCandidate) {
         let kind = match candidate.typ.as_str() {
             "host" => CandidateKind::Host,
             "srflx" => CandidateKind::ServerReflexive,
@@ -212,6 +242,8 @@ impl IceAgent {
             socket,
             base: SocketAddr::new(ip, candidate.port), // TODO: do I even need this?
         });
+
+        self.form_pairs();
     }
 
     fn form_pairs(&mut self) {
@@ -266,30 +298,83 @@ impl IceAgent {
         }
 
         self.checklists.pairs.sort_unstable_by_key(|p| p.priority);
+
+        self.prune_pairs();
     }
 
     /// Prune the lowest priority pairs until `max_pairs` is reached
     fn prune_pairs(&mut self) {
         while self.checklists.pairs.len() > self.checklists.max_pairs {
-            // TODO: is this enough?
-            self.checklists.pairs.pop();
+            let pair = self.checklists.pairs.pop().unwrap();
+            log::debug!("Pruned pair {:?}:{:?}", pair.local, pair.remote);
         }
     }
 
     /// Receive network packets for this ICE agent
-    pub fn receive(&mut self, data: &[u8], source: SocketAddr, dst_ip: IpAddr, socket: SocketUse) {
-        let mut msg = Message::parse(data).unwrap();
+    pub fn receive(&mut self, mut on_event: impl FnMut(IceEvent), pkt: &ReceivedPkt) {
+        // TODO: avoid clone here, this should be free
+        let mut stun_msg = Message::parse(pkt.data.clone()).unwrap();
 
-        // TODO: move this ugly code somewhere else
-        let use_candidate = msg.attribute::<UseCandidate>().is_some();
-        let username = msg.attribute::<Username>().unwrap().unwrap();
-        let passed_integrity_check = msg
+        let passed_integrity_check = stun_msg
             .attribute_with::<MessageIntegrity>(&MessageIntegrityKey::new_raw(Cow::Borrowed(
                 self.local_credentials.pwd.as_bytes(),
             )))
             .is_some_and(|r| r.is_ok());
-        let passed_fingerprint_check = msg.attribute::<Fingerprint>().is_some_and(|r| r.is_ok());
-        let priority = msg.attribute::<Priority>().unwrap().unwrap();
+        let passed_fingerprint_check = stun_msg
+            .attribute::<Fingerprint>()
+            .is_some_and(|r| r.is_ok());
+
+        if !passed_fingerprint_check || !passed_integrity_check {
+            // todo: return error response?
+            return;
+        }
+
+        let local_candidate = match self
+            .local_candidates
+            .iter()
+            .find(|(_, c)| c.kind == CandidateKind::Host && c.addr.ip() == pkt.destination)
+        {
+            Some((id, _)) => id,
+            None => {
+                // TODO: unlucky?
+                return;
+            }
+        };
+
+        match stun_msg.class() {
+            Class::Request => self.receive_stun_request(on_event, pkt, stun_msg),
+            Class::Indication => todo!(),
+            Class::Success => self.receive_stun_success(on_event, pkt, stun_msg),
+            Class::Error => todo!(),
+        }
+    }
+
+    fn receive_stun_success(
+        &mut self,
+        mut on_event: impl FnMut(IceEvent),
+        pkt: &ReceivedPkt,
+        stun_msg: Message,
+    ) {
+    }
+
+    fn receive_stun_request(
+        &mut self,
+        mut on_event: impl FnMut(IceEvent),
+        pkt: &ReceivedPkt,
+        mut stun_msg: Message,
+    ) {
+        let username = stun_msg.attribute::<Username>().unwrap().unwrap();
+        let expected_username = format!(
+            "{}:{}",
+            self.local_credentials.ufrag, self.remote_credentials.ufrag
+        );
+
+        if username.0 != expected_username {
+            return;
+        }
+
+        let priority = stun_msg.attribute::<Priority>().unwrap().unwrap();
+        let use_candidate = stun_msg.attribute::<UseCandidate>().is_some();
 
         if self.is_controlling && use_candidate {
             panic!()
@@ -297,7 +382,7 @@ impl IceAgent {
 
         let matching_remote_candidate = self.remote_candidates.iter().find(|(_, c)| {
             // todo: also match protocol
-            c.addr == source
+            c.addr == pkt.source
         });
 
         let remote_candidate = match matching_remote_candidate {
@@ -306,12 +391,12 @@ impl IceAgent {
                 // TODO: filter out already known peer reflexive candidates
 
                 self.remote_candidates.insert(Candidate {
-                    addr: source,
+                    addr: pkt.source,
                     kind: CandidateKind::PeerReflexive,
                     priority: priority.0,
                     foundation: "TODO".into(), // TODO: ?
-                    socket,
-                    base: source,
+                    socket: pkt.socket,
+                    base: pkt.source,
                 })
             }
         };
@@ -319,7 +404,7 @@ impl IceAgent {
         let local_candidate = match self
             .local_candidates
             .iter()
-            .find(|(_, c)| c.kind == CandidateKind::Host && c.addr.ip() == dst_ip)
+            .find(|(_, c)| c.kind == CandidateKind::Host && c.addr.ip() == pkt.destination)
         {
             Some((id, _)) => id,
             None => {
@@ -327,27 +412,136 @@ impl IceAgent {
                 return;
             }
         };
+
+        let Some(pair) = self
+            .checklists
+            .pairs
+            .iter_mut()
+            .find(|p| p.local == local_candidate && p.remote == remote_candidate)
+        else {
+            panic!()
+        };
+
+        println!("Found pair!");
+
+        let stun_response = stun::make_success_response(
+            stun_msg.transaction_id(),
+            &self.local_credentials,
+            &self.remote_credentials,
+            pkt.source,
+        );
+
+        on_event(IceEvent::SendData {
+            socket: SocketUse::Rtp,
+            data: stun_response,
+            target: pkt.source,
+        });
+
+        if use_candidate {
+            self.checklists.use_pair = Some((local_candidate, remote_candidate));
+
+            on_event(IceEvent::UseAddr {
+                socket: SocketUse::Rtp,
+                target: self.remote_candidates[remote_candidate].addr,
+            });
+        }
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self, mut on_event: impl FnMut(IceEvent)) {
+        // Limit checks to 1 per 50ms
         let now = Instant::now();
-
-        for pair in &mut self.checklists.pairs {
-            match pair.state {
-                CandidatePairState::Waiting => {
-                    // if let Some(timeout) = pair.timeout {
-                    //     if now < timeout {
-                    //         continue;
-                    //     }
-                    // } else {
-                    //     // MessageBuilder::new(Class::Request, Method::Binding, TransactionId::)
-                    // }
-                }
-                CandidatePairState::InProgress => todo!(),
-                CandidatePairState::Succeeded => todo!(),
-                CandidatePairState::Failed => todo!(),
+        if let Some(it) = self.last_ta_trigger {
+            if it + Duration::from_millis(5000) > now {
+                return;
             }
         }
+        self.last_ta_trigger = Some(now);
+
+        // If the triggered-check queue associated with the checklist
+        // contains one or more candidate pairs, the agent removes the top
+        // pair from the queue, performs a connectivity check on that pair,
+        // puts the candidate pair state to In-Progress, and aborts the
+        // subsequent steps.
+        if let Some(triggered_check) = self.checklists.triggered_check_queue.pop_front() {
+            return todo!();
+        }
+
+        // If there are one or more candidate pairs in the Waiting state,
+        // the agent picks the highest-priority candidate pair (if there are
+        // multiple pairs with the same priority, the pair with the lowest
+        // component ID is picked) in the Waiting state, performs a
+        // connectivity check on that pair, puts the candidate pair state to
+        // In-Progress, and aborts the subsequent steps.
+        let highest_waiting_pair = self
+            .checklists
+            .pairs
+            .iter_mut()
+            .find(|p| p.state == CandidatePairState::Waiting);
+
+        if let Some(pair) = highest_waiting_pair {
+            let transaction_id = TransactionId::random();
+
+            pair.state = CandidatePairState::InProgress {
+                transaction_id,
+                sent_at: now,
+            };
+
+            let stun_request = stun::make_binding_request(
+                transaction_id,
+                &self.local_credentials,
+                &self.remote_credentials,
+                &self.local_candidates[pair.local],
+                self.is_controlling,
+                self.control_tie_breaker,
+            );
+
+            on_event(IceEvent::SendData {
+                socket: SocketUse::Rtp,
+                data: stun_request,
+                target: self.remote_candidates[pair.remote].addr,
+            });
+
+            return;
+        }
+
+        // If this step is reached, no check could be performed for the
+        // checklist that was picked.  So, without waiting for timer Ta to
+        // expire again, select the next checklist in the Running state and
+        // return to step #1.  If this happens for every single checklist in
+        // the Running state, meaning there are no remaining candidate pairs
+        // to perform connectivity checks for, abort these steps.
+    }
+
+    pub fn timeout(&self) -> Option<Duration> {
+        self.last_ta_trigger
+            .map(|it| {
+                let poll_at = it + Duration::from_millis(50);
+                poll_at.checked_duration_since(Instant::now())
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn ice_candidates(&self) -> Vec<IceCandidate> {
+        self.local_candidates
+            .values()
+            .filter(|c| matches!(c.kind, CandidateKind::Host | CandidateKind::ServerReflexive))
+            .map(|c| IceCandidate {
+                foundation: c.foundation.clone().into(),
+                component: c.socket as _,
+                transport: "UDP".into(),
+                priority: c.priority.into(),
+                address: UntaggedAddress::IpAddress(c.addr.ip()),
+                port: c.addr.port(),
+                typ: match c.kind {
+                    CandidateKind::Host => "host".into(),
+                    CandidateKind::ServerReflexive => "srflx".into(),
+                    _ => unreachable!(),
+                },
+                rel_addr: None,
+                rel_port: None,
+                unknown: vec![],
+            })
+            .collect()
     }
 }
 
@@ -365,108 +559,13 @@ fn compute_foundation(
     hasher.finish()
 }
 
-// v=0
-// o=mozilla...THIS_IS_SDPARTA-99.0 4914015295632667792 0 IN IP4 0.0.0.0
-// s=-
-// t=0 0
-// a=fingerprint:sha-256 34:FF:83:E3:06:26:D9:DB:6C:C2:93:53:5F:EF:D0:AC:96:97:B7:F3:22:1E:53:AD:C9:04:06:A5:85:A8:E8:74
-// a=group:BUNDLE 0 1 2
-// a=ice-options:trickle
-// a=msid-semantic:WMS *
-// m=audio 9 UDP/TLS/RTP/SAVPF 109 9 0 8 101
-// c=IN IP4 0.0.0.0
-// a=sendrecv
-// a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level
-// a=extmap:2/recvonly urn:ietf:params:rtp-hdrext:csrc-audio-level
-// a=extmap:3 urn:ietf:params:rtp-hdrext:sdes:mid
-// a=fmtp:109 maxplaybackrate=48000;stereo=1;useinbandfec=1
-// a=fmtp:101 0-15
-// a=ice-pwd:bf23a6064b33ac5be53b10b697aa8bca
-// a=ice-ufrag:e57484d3
-// a=mid:0
-// a=msid:{d0748647-8527-4c64-bcef-8af6b51828ef} {04aa55c1-6e15-4107-923b-04db42a1b486}
-// a=rtcp-mux
-// a=rtpmap:109 opus/48000/2
-// a=rtpmap:9 G722/8000/1
-// a=rtpmap:0 PCMU/8000
-// a=rtpmap:8 PCMA/8000
-// a=rtpmap:101 telephone-event/8000/1
-// a=setup:actpass
-// a=ssrc:4264703613 cname:{0199e663-f620-4afe-a45b-654e0aa53e55}
-// m=video 9 UDP/TLS/RTP/SAVPF 120 124 121 125 126 127 97 98 123 122 119
-// c=IN IP4 0.0.0.0
-// a=sendrecv
-// a=extmap:3 urn:ietf:params:rtp-hdrext:sdes:mid
-// a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time
-// a=extmap:5 urn:ietf:params:rtp-hdrext:toffset
-// a=extmap:6/recvonly http://www.webrtc.org/experiments/rtp-hdrext/playout-delay
-// a=extmap:7 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01
-// a=fmtp:126 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1
-// a=fmtp:97 profile-level-id=42e01f;level-asymmetry-allowed=1
-// a=fmtp:120 max-fs=12288;max-fr=60
-// a=fmtp:124 apt=120
-// a=fmtp:121 max-fs=12288;max-fr=60
-// a=fmtp:125 apt=121
-// a=fmtp:127 apt=126
-// a=fmtp:98 apt=97
-// a=fmtp:119 apt=122
-// a=ice-pwd:bf23a6064b33ac5be53b10b697aa8bca
-// a=ice-ufrag:e57484d3
-// a=mid:1
-// a=msid:{d0748647-8527-4c64-bcef-8af6b51828ef} {662a1248-9683-43a8-a756-82aa5fb24eb7}
-// a=rtcp-fb:120 nack
-// a=rtcp-fb:120 nack pli
-// a=rtcp-fb:120 ccm fir
-// a=rtcp-fb:120 goog-remb
-// a=rtcp-fb:120 transport-cc
-// a=rtcp-fb:121 nack
-// a=rtcp-fb:121 nack pli
-// a=rtcp-fb:121 ccm fir
-// a=rtcp-fb:121 goog-remb
-// a=rtcp-fb:121 transport-cc
-// a=rtcp-fb:126 nack
-// a=rtcp-fb:126 nack pli
-// a=rtcp-fb:126 ccm fir
-// a=rtcp-fb:126 goog-remb
-// a=rtcp-fb:126 transport-cc
-// a=rtcp-fb:97 nack
-// a=rtcp-fb:97 nack pli
-// a=rtcp-fb:97 ccm fir
-// a=rtcp-fb:97 goog-remb
-// a=rtcp-fb:97 transport-cc
-// a=rtcp-fb:123 nack
-// a=rtcp-fb:123 nack pli
-// a=rtcp-fb:123 ccm fir
-// a=rtcp-fb:123 goog-remb
-// a=rtcp-fb:123 transport-cc
-// a=rtcp-fb:122 nack
-// a=rtcp-fb:122 nack pli
-// a=rtcp-fb:122 ccm fir
-// a=rtcp-fb:122 goog-remb
-// a=rtcp-fb:122 transport-cc
-// a=rtcp-mux
-// a=rtcp-rsize
-// a=rtpmap:120 VP8/90000
-// a=rtpmap:124 rtx/90000
-// a=rtpmap:121 VP9/90000
-// a=rtpmap:125 rtx/90000
-// a=rtpmap:126 H264/90000
-// a=rtpmap:127 rtx/90000
-// a=rtpmap:97 H264/90000
-// a=rtpmap:98 rtx/90000
-// a=rtpmap:123 ulpfec/90000
-// a=rtpmap:122 red/90000
-// a=rtpmap:119 rtx/90000
-// a=setup:actpass
-// a=ssrc:2400956597 cname:{0199e663-f620-4afe-a45b-654e0aa53e55}
-// a=ssrc:1488978004 cname:{0199e663-f620-4afe-a45b-654e0aa53e55}
-// a=ssrc-group:FID 2400956597 1488978004
-// m=application 9 UDP/DTLS/SCTP webrtc-datachannel
-// c=IN IP4 0.0.0.0
-// a=sendrecv
-// a=ice-pwd:bf23a6064b33ac5be53b10b697aa8bca
-// a=ice-ufrag:e57484d3
-// a=mid:2
-// a=setup:actpass
-// a=sctp-port:5000
-// a=max-message-size:1073741823
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_timeout() {
+        let ice_agent = IceAgent::new(true, IceCredentials::random());
+        assert_eq!(ice_agent.timeout(), Some(Duration::ZERO));
+    }
+}

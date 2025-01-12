@@ -1,18 +1,16 @@
 use bytesstr::BytesStr;
 use ezk_session::{AsyncSdpSession, Codec, Codecs};
-use sdp_types::{Direction, IceCandidate, MediaType, SessionDescription};
+use sdp_types::{Direction, MediaType, SessionDescription};
 use sip_core::transport::udp::Udp;
 use sip_core::{Endpoint, IncomingRequest, Layer, LayerKey, MayTake, Result};
 use sip_types::header::typed::{Contact, ContentType};
 use sip_types::uri::sip::SipUri;
 use sip_types::uri::NameAddr;
-use sip_types::{Code, Method, Name};
+use sip_types::{Code, Method};
 use sip_ua::dialog::{Dialog, DialogLayer};
 use sip_ua::invite::acceptor::Acceptor;
-use sip_ua::invite::prack::send_prack;
 use sip_ua::invite::session::{Event, Session};
 use sip_ua::invite::{create_ack, InviteLayer};
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
