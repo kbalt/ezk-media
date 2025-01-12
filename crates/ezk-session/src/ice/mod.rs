@@ -1,4 +1,5 @@
 use crate::{transport::SocketUse, ReceivedPkt};
+use core::fmt;
 use rand::distributions::{Alphanumeric, DistString};
 use sdp_types::{IceCandidate, UntaggedAddress};
 use slotmap::{new_key_type, SlotMap};
@@ -10,9 +11,11 @@ use std::{
     net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
+use stun::StunConfig;
 use stun_types::{
     attributes::{
-        Fingerprint, MessageIntegrity, MessageIntegrityKey, Priority, UseCandidate, Username,
+        ErrorCode, Fingerprint, MessageIntegrity, MessageIntegrityKey, Priority, UseCandidate,
+        Username, XorMappedAddress,
     },
     Class, Message, TransactionId,
 };
@@ -29,20 +32,24 @@ pub enum IceEvent {
         target: SocketAddr,
     },
     SendData {
+        // TODO: ideally this should include the source ip to send the data from
         socket: SocketUse,
         data: Vec<u8>,
+        source: IpAddr,
         target: SocketAddr,
     },
 }
 
 pub struct IceAgent {
+    stun_config: StunConfig,
+
     local_credentials: IceCredentials,
     remote_credentials: IceCredentials,
 
     local_candidates: SlotMap<CandidateId, Candidate>,
     remote_candidates: SlotMap<CandidateId, Candidate>,
 
-    checklists: Checklist,
+    checklist: Checklist,
 
     stun_server: Option<SocketAddr>,
 
@@ -57,9 +64,7 @@ struct Checklist {
 
     max_pairs: usize,
     pairs: Vec<CandidatePair>,
-    triggered_check_queue: VecDeque<()>,
-
-    use_pair: Option<(CandidateId, CandidateId)>,
+    triggered_check_queue: VecDeque<(CandidateId, CandidateId)>,
 }
 
 enum ChecklistState {
@@ -109,7 +114,11 @@ enum CandidatePairState {
     /// A check has been sent for this pair, but the transaction is in progress.
     InProgress {
         transaction_id: TransactionId,
-        sent_at: Instant,
+        stun_request: Vec<u8>,
+        retransmit_at: Instant,
+        retransmits: u32,
+        source: IpAddr,
+        target: SocketAddr,
     },
 
     // A check has been sent for this pair, and it produced a successful result.
@@ -143,16 +152,16 @@ impl IceCredentials {
 impl IceAgent {
     pub fn new(is_controlling: bool, remote_credentials: IceCredentials) -> Self {
         IceAgent {
+            stun_config: StunConfig::new(),
             local_credentials: IceCredentials::random(),
             remote_credentials,
             local_candidates: SlotMap::with_key(),
             remote_candidates: SlotMap::with_key(),
-            checklists: Checklist {
+            checklist: Checklist {
                 state: ChecklistState::Running,
                 max_pairs: 100,
                 pairs: Vec::new(),
                 triggered_check_queue: VecDeque::new(),
-                use_pair: None,
             },
             stun_server: None,
             is_controlling,
@@ -181,6 +190,8 @@ impl IceAgent {
     }
 
     fn add_local_candidate(&mut self, socket: SocketUse, kind: CandidateKind, addr: SocketAddr) {
+        println!("add local candidate {socket:?} {kind:?} {addr}");
+
         // Calculate the candidate priority using offsets + count of candidates of the same type
         // (trick that I have stolen from str0m's implementation (thank you o/))
         let local_preference_offset = match kind {
@@ -249,6 +260,16 @@ impl IceAgent {
     fn form_pairs(&mut self) {
         for (local_id, local_candidate) in &self.local_candidates {
             for (remote_id, remote_candidate) in &self.remote_candidates {
+                // Remote peer-reflexive candidates are not paired here
+                if remote_candidate.kind == CandidateKind::PeerReflexive {
+                    continue;
+                }
+
+                // Do not pair candidates with different components
+                if local_candidate.socket != remote_candidate.socket {
+                    continue;
+                }
+
                 // Exclude pairs with different ip version
                 match (local_candidate.addr.ip(), remote_candidate.addr.ip()) {
                     (IpAddr::V4(..), IpAddr::V4(..)) => { /* ok */ }
@@ -264,7 +285,7 @@ impl IceAgent {
 
                 // Check if the pair already exists
                 let already_exists = self
-                    .checklists
+                    .checklist
                     .pairs
                     .iter()
                     .any(|pair| pair.local == local_id && pair.remote == remote_id);
@@ -273,88 +294,157 @@ impl IceAgent {
                     continue;
                 }
 
-                let (g, d) = if self.is_controlling {
-                    (
-                        local_candidate.priority as u64,
-                        remote_candidate.priority as u64,
-                    )
-                } else {
-                    (
-                        remote_candidate.priority as u64,
-                        local_candidate.priority as u64,
-                    )
-                };
-
-                // pair priority = 2^32*MIN(G,D) + 2*MAX(G,D) + (G>D?1:0)
-                let priority = 2u64.pow(32) * min(g, d) + 2 * max(g, d) + if g > d { 1 } else { 0 };
-
-                self.checklists.pairs.push(CandidatePair {
-                    local: local_id,
-                    remote: remote_id,
-                    priority,
-                    state: CandidatePairState::Waiting,
-                });
+                Self::add_candidate_pair(
+                    local_id,
+                    local_candidate,
+                    remote_id,
+                    remote_candidate,
+                    self.is_controlling,
+                    &mut self.checklist,
+                );
             }
         }
 
-        self.checklists.pairs.sort_unstable_by_key(|p| p.priority);
+        self.checklist.pairs.sort_unstable_by_key(|p| p.priority);
 
         self.prune_pairs();
     }
 
+    fn add_candidate_pair(
+        local_id: CandidateId,
+        local_candidate: &Candidate,
+        remote_id: CandidateId,
+        remote_candidate: &Candidate,
+        is_controlling: bool,
+        checklist: &mut Checklist,
+    ) {
+        let (g, d) = if is_controlling {
+            (
+                local_candidate.priority as u64,
+                remote_candidate.priority as u64,
+            )
+        } else {
+            (
+                remote_candidate.priority as u64,
+                local_candidate.priority as u64,
+            )
+        };
+
+        log::debug!(
+            "add pair: {}",
+            DisplayPair(local_candidate, remote_candidate)
+        );
+
+        // pair priority = 2^32*MIN(G,D) + 2*MAX(G,D) + (G>D?1:0)
+        let priority = 2u64.pow(32) * min(g, d) + 2 * max(g, d) + if g > d { 1 } else { 0 };
+
+        checklist.pairs.push(CandidatePair {
+            local: local_id,
+            remote: remote_id,
+            priority,
+            state: CandidatePairState::Waiting,
+        });
+    }
+
     /// Prune the lowest priority pairs until `max_pairs` is reached
     fn prune_pairs(&mut self) {
-        while self.checklists.pairs.len() > self.checklists.max_pairs {
-            let pair = self.checklists.pairs.pop().unwrap();
+        while self.checklist.pairs.len() > self.checklist.max_pairs {
+            let pair = self.checklist.pairs.pop().unwrap();
             log::debug!("Pruned pair {:?}:{:?}", pair.local, pair.remote);
         }
     }
 
     /// Receive network packets for this ICE agent
-    pub fn receive(&mut self, mut on_event: impl FnMut(IceEvent), pkt: &ReceivedPkt) {
+    pub fn receive(&mut self, on_event: impl FnMut(IceEvent), pkt: &ReceivedPkt) {
         // TODO: avoid clone here, this should be free
         let mut stun_msg = Message::parse(pkt.data.clone()).unwrap();
 
-        let passed_integrity_check = stun_msg
-            .attribute_with::<MessageIntegrity>(&MessageIntegrityKey::new_raw(Cow::Borrowed(
-                self.local_credentials.pwd.as_bytes(),
-            )))
-            .is_some_and(|r| r.is_ok());
         let passed_fingerprint_check = stun_msg
             .attribute::<Fingerprint>()
             .is_some_and(|r| r.is_ok());
 
-        if !passed_fingerprint_check || !passed_integrity_check {
-            // todo: return error response?
+        if !passed_fingerprint_check {
+            log::debug!(
+                "Incoming STUN {:?} failed fingerprint check, discarding",
+                stun_msg.class()
+            );
             return;
         }
 
-        let local_candidate = match self
-            .local_candidates
-            .iter()
-            .find(|(_, c)| c.kind == CandidateKind::Host && c.addr.ip() == pkt.destination)
-        {
-            Some((id, _)) => id,
-            None => {
-                // TODO: unlucky?
-                return;
-            }
-        };
-
         match stun_msg.class() {
             Class::Request => self.receive_stun_request(on_event, pkt, stun_msg),
-            Class::Indication => todo!(),
-            Class::Success => self.receive_stun_success(on_event, pkt, stun_msg),
-            Class::Error => todo!(),
+            Class::Indication => { /* ignore */ }
+            Class::Success => self.receive_stun_success(pkt, stun_msg),
+            Class::Error => self.receive_stun_error(stun_msg),
         }
     }
 
-    fn receive_stun_success(
-        &mut self,
-        mut on_event: impl FnMut(IceEvent),
-        pkt: &ReceivedPkt,
-        stun_msg: Message,
-    ) {
+    fn receive_stun_success(&mut self, pkt: &ReceivedPkt, mut stun_msg: Message) {
+        if !stun::verify_integrity(
+            &self.local_credentials,
+            &self.remote_credentials,
+            &mut stun_msg,
+        ) {
+            log::debug!("Incoming stun request failed the integrity check, discarding");
+            return;
+        }
+
+        // A connectivity check is considered a success if each of the following
+        // criteria is true:
+        // o  The Binding request generated a success response; and
+        // o  The source and destination transport addresses in the Binding
+        //    request and response are symmetric.
+        let Some(pair) = self
+            .checklist
+            .pairs
+            .iter_mut()
+            .find(|p| {
+                matches!(p.state, CandidatePairState::InProgress { transaction_id, .. } if stun_msg.transaction_id() == transaction_id)
+            }) else {
+                log::debug!("Failed to find transaction for STUN success, discarding");
+                return;
+            };
+
+        let CandidatePairState::InProgress { source, target, .. } = &pair.state else {
+            unreachable!()
+        };
+
+        if pkt.source == *target || pkt.destination == *source {
+            pair.state = CandidatePairState::Succeeded;
+        } else {
+            // TODO: is setting this to failed right?
+            // Got a success response but the addresses are mismatching
+            pair.state = CandidatePairState::Failed;
+        }
+
+        let mapped_addr = stun_msg.attribute::<XorMappedAddress>().unwrap().unwrap();
+
+        if mapped_addr.0 != self.local_candidates[pair.local].addr {
+            self.add_local_candidate(SocketUse::Rtp, CandidateKind::PeerReflexive, mapped_addr.0);
+        }
+    }
+
+    fn receive_stun_error(&mut self, mut stun_msg: Message) {
+        let Some(pair) = self
+            .checklist
+            .pairs
+            .iter_mut()
+            .find(|p| {
+                matches!(p.state, CandidatePairState::InProgress { transaction_id, .. } if stun_msg.transaction_id() == transaction_id)
+            }) else {
+                log::debug!("Failed to find transaction for STUN error, discarding");
+                return;
+            };
+
+        pair.state = CandidatePairState::Failed;
+
+        if let Some(Ok(error_code)) = stun_msg.attribute::<ErrorCode>() {
+            log::debug!(
+                "Candidate pair failed with code={}, reason={}",
+                error_code.number,
+                error_code.reason
+            );
+        }
     }
 
     fn receive_stun_request(
@@ -363,13 +453,12 @@ impl IceAgent {
         pkt: &ReceivedPkt,
         mut stun_msg: Message,
     ) {
-        let username = stun_msg.attribute::<Username>().unwrap().unwrap();
-        let expected_username = format!(
-            "{}:{}",
-            self.local_credentials.ufrag, self.remote_credentials.ufrag
-        );
-
-        if username.0 != expected_username {
+        if !stun::verify_integrity(
+            &self.local_credentials,
+            &self.remote_credentials,
+            &mut stun_msg,
+        ) {
+            log::debug!("Incoming stun request failed the integrity check, discarding");
             return;
         }
 
@@ -380,28 +469,7 @@ impl IceAgent {
             panic!()
         }
 
-        let matching_remote_candidate = self.remote_candidates.iter().find(|(_, c)| {
-            // todo: also match protocol
-            c.addr == pkt.source
-        });
-
-        let remote_candidate = match matching_remote_candidate {
-            Some((remote, _)) => remote,
-            None => {
-                // TODO: filter out already known peer reflexive candidates
-
-                self.remote_candidates.insert(Candidate {
-                    addr: pkt.source,
-                    kind: CandidateKind::PeerReflexive,
-                    priority: priority.0,
-                    foundation: "TODO".into(), // TODO: ?
-                    socket: pkt.socket,
-                    base: pkt.source,
-                })
-            }
-        };
-
-        let local_candidate = match self
+        let local_id = match self
             .local_candidates
             .iter()
             .find(|(_, c)| c.kind == CandidateKind::Host && c.addr.ip() == pkt.destination)
@@ -413,14 +481,48 @@ impl IceAgent {
             }
         };
 
-        let Some(pair) = self
-            .checklists
+        let matching_remote_candidate = self.remote_candidates.iter().find(|(_, c)| {
+            // todo: also match protocol
+            c.addr == pkt.source
+        });
+
+        let remote_id = match matching_remote_candidate {
+            Some((remote, _)) => remote,
+            None => {
+                // No remote candidate with the source ip addr, create new peer-reflexive candidate
+                let peer_reflexive_id = self.remote_candidates.insert(Candidate {
+                    addr: pkt.source,
+                    kind: CandidateKind::PeerReflexive,
+                    priority: priority.0,
+                    foundation: "~".into(),
+                    socket: pkt.socket,
+                    base: pkt.source,
+                });
+
+                // Pair it with the local candidate
+                Self::add_candidate_pair(
+                    local_id,
+                    &self.local_candidates[local_id],
+                    peer_reflexive_id,
+                    &self.remote_candidates[peer_reflexive_id],
+                    self.is_controlling,
+                    &mut self.checklist,
+                );
+
+                self.checklist
+                    .triggered_check_queue
+                    .push_back((local_id, peer_reflexive_id));
+
+                peer_reflexive_id
+            }
+        };
+
+        let _pair = self
+            .checklist
             .pairs
             .iter_mut()
-            .find(|p| p.local == local_candidate && p.remote == remote_candidate)
-        else {
-            panic!()
-        };
+            .find(|p| p.local == local_id && p.remote == remote_id)
+            .unwrap();
 
         println!("Found pair!");
 
@@ -434,24 +536,27 @@ impl IceAgent {
         on_event(IceEvent::SendData {
             socket: SocketUse::Rtp,
             data: stun_response,
+            source: self.local_candidates[local_id].base.ip(),
             target: pkt.source,
         });
 
         if use_candidate {
-            self.checklists.use_pair = Some((local_candidate, remote_candidate));
-
             on_event(IceEvent::UseAddr {
                 socket: SocketUse::Rtp,
-                target: self.remote_candidates[remote_candidate].addr,
+                target: self.remote_candidates[remote_id].addr,
             });
         }
     }
 
     pub fn poll(&mut self, mut on_event: impl FnMut(IceEvent)) {
-        // Limit checks to 1 per 50ms
         let now = Instant::now();
+
+        // Handle pending stun retransmissions
+        self.poll_retransmit(now, &mut on_event);
+
+        // Limit new checks to 1 per 50ms
         if let Some(it) = self.last_ta_trigger {
-            if it + Duration::from_millis(5000) > now {
+            if it + Duration::from_millis(50) > now {
                 return;
             }
         }
@@ -462,29 +567,34 @@ impl IceAgent {
         // pair from the queue, performs a connectivity check on that pair,
         // puts the candidate pair state to In-Progress, and aborts the
         // subsequent steps.
-        if let Some(triggered_check) = self.checklists.triggered_check_queue.pop_front() {
-            return todo!();
-        }
+        let pair =
+            self.checklist
+                .triggered_check_queue
+                .pop_front()
+                .and_then(|(local_id, remote_id)| {
+                    self.checklist
+                        .pairs
+                        .iter_mut()
+                        .find(|p| p.local == local_id && p.remote == remote_id)
+                });
 
-        // If there are one or more candidate pairs in the Waiting state,
-        // the agent picks the highest-priority candidate pair (if there are
-        // multiple pairs with the same priority, the pair with the lowest
-        // component ID is picked) in the Waiting state, performs a
-        // connectivity check on that pair, puts the candidate pair state to
-        // In-Progress, and aborts the subsequent steps.
-        let highest_waiting_pair = self
-            .checklists
-            .pairs
-            .iter_mut()
-            .find(|p| p.state == CandidatePairState::Waiting);
+        let pair = if let Some(pair) = pair {
+            Some(pair)
+        } else {
+            // If there are one or more candidate pairs in the Waiting state,
+            // the agent picks the highest-priority candidate pair (if there are
+            // multiple pairs with the same priority, the pair with the lowest
+            // component ID is picked) in the Waiting state, performs a
+            // connectivity check on that pair, puts the candidate pair state to
+            // In-Progress, and aborts the subsequent steps.
+            self.checklist
+                .pairs
+                .iter_mut()
+                .find(|p| p.state == CandidatePairState::Waiting)
+        };
 
-        if let Some(pair) = highest_waiting_pair {
+        if let Some(pair) = pair {
             let transaction_id = TransactionId::random();
-
-            pair.state = CandidatePairState::InProgress {
-                transaction_id,
-                sent_at: now,
-            };
 
             let stun_request = stun::make_binding_request(
                 transaction_id,
@@ -495,10 +605,23 @@ impl IceAgent {
                 self.control_tie_breaker,
             );
 
+            let source = self.local_candidates[pair.local].base.ip();
+            let target = self.remote_candidates[pair.remote].addr;
+
+            pair.state = CandidatePairState::InProgress {
+                transaction_id,
+                stun_request: stun_request.clone(),
+                retransmit_at: now + self.stun_config.retransmit_delta(0),
+                retransmits: 0,
+                source,
+                target,
+            };
+
             on_event(IceEvent::SendData {
                 socket: SocketUse::Rtp,
                 data: stun_request,
-                target: self.remote_candidates[pair.remote].addr,
+                source,
+                target,
             });
 
             return;
@@ -510,6 +633,41 @@ impl IceAgent {
         // return to step #1.  If this happens for every single checklist in
         // the Running state, meaning there are no remaining candidate pairs
         // to perform connectivity checks for, abort these steps.
+    }
+
+    fn poll_retransmit(&mut self, now: Instant, mut on_event: impl FnMut(IceEvent)) {
+        for pair in &mut self.checklist.pairs {
+            let CandidatePairState::InProgress {
+                transaction_id: _,
+                stun_request,
+                retransmit_at,
+                retransmits,
+                source,
+                target,
+            } = &mut pair.state
+            else {
+                continue;
+            };
+
+            if *retransmit_at > now {
+                continue;
+            }
+
+            if *retransmits >= self.stun_config.max_retransmits {
+                pair.state = CandidatePairState::Failed;
+                continue;
+            }
+
+            *retransmits += 1;
+            *retransmit_at += self.stun_config.retransmit_delta(*retransmits);
+
+            on_event(IceEvent::SendData {
+                socket: SocketUse::Rtp,
+                data: stun_request.clone(),
+                source: *source,
+                target: *target,
+            });
+        }
     }
 
     pub fn timeout(&self) -> Option<Duration> {
@@ -552,11 +710,31 @@ fn compute_foundation(
     proto: &str,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
-    kind.hash(&mut hasher);
-    base.hash(&mut hasher);
-    rel_addr.hash(&mut hasher);
-    proto.hash(&mut hasher);
+    (kind, base, rel_addr, proto).hash(&mut hasher);
     hasher.finish()
+}
+
+struct DisplayPair<'a>(&'a Candidate, &'a Candidate);
+
+impl fmt::Display for DisplayPair<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn fmt_candidate(f: &mut fmt::Formatter<'_>, c: &Candidate) -> fmt::Result {
+            match c.kind {
+                CandidateKind::Host => write!(f, "host({})", c.addr),
+                CandidateKind::PeerReflexive => {
+                    write!(f, "peer-reflexive(base:{}, peer:{})", c.base, c.addr)
+                }
+                CandidateKind::ServerReflexive => {
+                    write!(f, "server-reflexive(base:{}, server:{})", c.base, c.addr)
+                }
+                CandidateKind::Relayed => write!(f, "relayed(base:{}, relay:{})", c.base, c.addr),
+            }
+        }
+
+        fmt_candidate(f, self.0)?;
+        write!(f, " <-> ")?;
+        fmt_candidate(f, self.1)
+    }
 }
 
 #[cfg(test)]

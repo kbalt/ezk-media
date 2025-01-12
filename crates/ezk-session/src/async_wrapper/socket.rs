@@ -14,7 +14,7 @@ use tokio::{
 pub(crate) struct Socket {
     state: UdpSocketState,
     socket: UdpSocket,
-    to_send: VecDeque<(Vec<u8>, SocketAddr)>,
+    to_send: VecDeque<(Vec<u8>, Option<IpAddr>, SocketAddr)>,
 }
 
 impl Socket {
@@ -26,8 +26,8 @@ impl Socket {
         }
     }
 
-    pub(crate) fn enqueue(&mut self, data: Vec<u8>, target: SocketAddr) {
-        self.to_send.push_back((data, target));
+    pub(crate) fn enqueue(&mut self, data: Vec<u8>, source: Option<IpAddr>, target: SocketAddr) {
+        self.to_send.push_back((data, source, target));
 
         if self.to_send.len() > 100 {
             self.to_send.pop_front();
@@ -37,7 +37,7 @@ impl Socket {
     }
 
     pub(crate) fn send_pending(&mut self, cx: &mut Context<'_>) {
-        'outer: while let Some((data, target)) = self.to_send.front() {
+        'outer: while let Some((data, source, target)) = self.to_send.front() {
             // Loop makes sure that the waker is registered with the runtime,
             // if poll_send_ready returns Ready but send returns WouldBlock
             loop {
@@ -55,7 +55,7 @@ impl Socket {
                             ecn: None,
                             contents: data,
                             segment_size: None,
-                            src_ip: None,
+                            src_ip: *source,
                         },
                     )
                 });

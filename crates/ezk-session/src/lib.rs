@@ -11,7 +11,6 @@ use sdp_types::{
 };
 use slotmap::SlotMap;
 use std::{
-    borrow::Cow,
     cmp::min,
     collections::HashMap,
     io,
@@ -94,6 +93,7 @@ pub struct SdpSession {
     events: Events,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum TransportEntry {
     Transport(Transport),
     TransportBuilder(TransportBuilder),
@@ -735,7 +735,8 @@ impl SdpSession {
                     port,
                     address: None,
                 }),
-                rtcp_mux: local_rtcp_port.is_none(),
+                // always offer rtcp-mux
+                rtcp_mux: true,
                 mid: Some(pending_media.mid.as_str().into()),
                 rtpmap,
                 fmtp,
@@ -1092,11 +1093,13 @@ impl SdpSession {
                 TransportEvent::SendData {
                     socket,
                     data,
+                    source,
                     target,
                 } => {
                     events.push(Event::SendData {
                         socket: SocketId(transport_id, socket),
                         data,
+                        source,
                         target,
                     });
                 }
@@ -1195,6 +1198,7 @@ impl SdpSession {
         self.events.push(Event::SendData {
             socket: SocketId(media.transport, SocketUse::Rtp),
             data: packet,
+            source: None, // TODO: set this according to the transport
             target: transport.remote_rtp_address,
         });
     }
@@ -1223,6 +1227,7 @@ fn send_rtcp_report(events: &mut Events, transport: &mut Transport, media: &mut 
     events.push(Event::SendData {
         socket: SocketId(media.transport, socket_use),
         data: encode_buf,
+        source: None, // TODO: set this according to the transport
         target: transport.remote_rtcp_address,
     });
 }

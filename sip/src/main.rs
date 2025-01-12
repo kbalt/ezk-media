@@ -1,6 +1,7 @@
 use bytesstr::BytesStr;
 use ezk_session::{AsyncSdpSession, Codec, Codecs};
 use sdp_types::{Direction, MediaType, SessionDescription};
+use sip_core::transport::tcp::TcpConnector;
 use sip_core::transport::udp::Udp;
 use sip_core::{Endpoint, IncomingRequest, Layer, LayerKey, MayTake, Result};
 use sip_types::header::typed::{Contact, ContentType};
@@ -9,8 +10,11 @@ use sip_types::uri::NameAddr;
 use sip_types::{Code, Method};
 use sip_ua::dialog::{Dialog, DialogLayer};
 use sip_ua::invite::acceptor::Acceptor;
+use sip_ua::invite::initiator::Initiator;
 use sip_ua::invite::session::{Event, Session};
 use sip_ua::invite::{create_ack, InviteLayer};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -193,9 +197,44 @@ async fn main() -> Result<()> {
     });
 
     Udp::spawn(&mut builder, "0.0.0.0:5060").await?;
+    // builder.add_transport_factory(Arc::new(TcpConnector::new()));
 
     // Build endpoint to start the SIP Stack
-    let _endpoint = builder.build();
+    let endpoint = builder.build();
+
+    let mut initiator = Initiator::new(
+        endpoint.clone(),
+        dialog_layer,
+        invite_layer,
+        NameAddr::uri(SipUri::new(
+            "172.23.97.79:5060".parse::<SocketAddr>().unwrap().into(),
+        )),
+        Contact::new(NameAddr::uri(SipUri::new(
+            "172.23.97.79:5060".parse::<SocketAddr>().unwrap().into(),
+        ))),
+        Box::new(SipUri::new(
+            "172.23.96.1:5062".parse::<SocketAddr>().unwrap().into(),
+        )),
+    );
+
+    let mut sess = AsyncSdpSession::new("172.23.97.79".parse().unwrap());
+
+    let audio_id = sess.add_local_media(
+        Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),
+        1,
+        Direction::RecvOnly,
+    );
+    let m = sess.add_media(audio_id, Direction::SendRecv);
+    let offer = sess.create_offer().await;
+
+    let mut invite = initiator.create_invite();
+    invite.headers.insert("Content-Type", "application/sdp");
+    invite.body = offer.to_string().into();
+
+    initiator.send_invite(invite).await.unwrap();
+    while let Ok(x) = initiator.receive().await {
+        println!("{:?}", x);
+    }
 
     // Busy sleep loop
     loop {

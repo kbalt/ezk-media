@@ -11,7 +11,12 @@ use sdp_types::{
     Fingerprint, FingerprintAlgorithm, MediaDescription, SessionDescription, Setup, SrtpCrypto,
     TransportProtocol,
 };
-use std::{collections::VecDeque, io, net::SocketAddr, time::Duration};
+use std::{
+    collections::VecDeque,
+    io,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 mod builder;
 mod dtls_srtp;
@@ -54,6 +59,7 @@ pub(crate) enum TransportEvent {
     SendData {
         socket: SocketUse,
         data: Vec<u8>,
+        source: Option<IpAddr>,
         target: SocketAddr,
     },
 }
@@ -229,10 +235,12 @@ impl Transport {
 
         let mut dtls =
             DtlsSrtpSession::new(state.ssl_context(), remote_fingerprints.clone(), setup)?;
+        // TODO: Delay this until ice-agent is ready if one is used
         while let Some(data) = dtls.pop_to_send() {
             events.push_back(TransportEvent::SendData {
                 socket: SocketUse::Rtp,
                 data,
+                source: None,
                 target: remote_rtp_address,
             });
         }
@@ -320,6 +328,7 @@ impl Transport {
                     self.events.push_back(TransportEvent::SendData {
                         socket: SocketUse::Rtp,
                         data,
+                        source: None, // TODO: set this
                         target: self.remote_rtp_address,
                     });
                 }
@@ -349,11 +358,13 @@ impl Transport {
             IceEvent::SendData {
                 socket,
                 data,
+                source,
                 target,
             } => {
                 events.push_back(TransportEvent::SendData {
                     socket,
                     data,
+                    source: Some(source),
                     target,
                 });
             }
@@ -429,6 +440,7 @@ impl Transport {
                         self.events.push_back(TransportEvent::SendData {
                             socket: SocketUse::Rtp,
                             data,
+                            source: None, // TODO: set this
                             target: self.remote_rtp_address,
                         });
                     }
