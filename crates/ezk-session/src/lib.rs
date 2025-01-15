@@ -71,6 +71,7 @@ pub struct SdpSession {
 
     // Local ip address to use
     address: IpAddr,
+    stun_server: Vec<SocketAddr>,
 
     /// State shared between transports
     transport_state: SessionTransportState,
@@ -274,7 +275,7 @@ pub struct ReceivedPkt {
     /// Source address of the message
     pub source: SocketAddr,
     /// Local socket destination address of the message
-    pub destination: IpAddr,
+    pub destination: SocketAddr,
     /// Intended usage of the socket
     pub socket: SocketUse,
 }
@@ -286,6 +287,7 @@ impl SdpSession {
             id: u64::from(rand::random::<u16>()),
             version: u64::from(rand::random::<u16>()),
             address,
+            stun_server: vec![],
             transport_state: SessionTransportState::default(),
             next_pt: 96,
             local_media: SlotMap::with_key(),
@@ -295,6 +297,26 @@ impl SdpSession {
             pending_changes: Vec::new(),
             transport_changes: Vec::new(),
             events: Events::default(),
+        }
+    }
+
+    /// Add a stun server to use for ICE
+    pub fn add_stun_server(&mut self, server: SocketAddr) {
+        self.stun_server.push(server);
+
+        for transport in self.transports.values_mut() {
+            match transport {
+                TransportEntry::Transport(transport) => {
+                    if let Some(ice_agent) = &mut transport.ice_agent {
+                        ice_agent.add_stun_server(server);
+                    }
+                }
+                TransportEntry::TransportBuilder(transport_builder) => {
+                    if let Some(ice_agent) = &mut transport_builder.ice_agent {
+                        ice_agent.add_stun_server(server);
+                    }
+                }
+            }
         }
     }
 
@@ -355,6 +377,7 @@ impl SdpSession {
                         TransportRequiredChanges::new(id, &mut self.transport_changes),
                         transport_type,
                         self.options.rtcp_mux_policy,
+                        self.options.offer_ice,
                     ))
                 });
 
@@ -374,6 +397,7 @@ impl SdpSession {
                             TransportRequiredChanges::new(id, &mut self.transport_changes),
                             transport_type,
                             self.options.rtcp_mux_policy,
+                            self.options.offer_ice,
                         ))
                     })
                 };
@@ -854,6 +878,7 @@ impl SdpSession {
                     let transport = transport_builder.build_from_answer(
                         &mut self.transport_state,
                         TransportRequiredChanges::new(transport_id, &mut self.transport_changes),
+                        &answer,
                         remote_media_desc,
                         remote_rtp_address,
                         remote_rtcp_address,

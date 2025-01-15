@@ -3,6 +3,7 @@ use sdp_types::TransportProtocol;
 #[derive(Debug, Default, Clone)]
 pub struct Options {
     pub offer_transport: TransportType,
+    pub offer_ice: bool,
     pub rtcp_mux_policy: RtcpMuxPolicy,
     pub bundle_policy: BundlePolicy,
 }

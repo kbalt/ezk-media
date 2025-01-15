@@ -364,7 +364,7 @@ impl Transport {
                 events.push_back(TransportEvent::SendData {
                     socket,
                     data,
-                    source: Some(source),
+                    source,
                     target,
                 });
             }

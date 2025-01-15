@@ -3,7 +3,7 @@ use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::{
     collections::VecDeque,
     io::{self, IoSliceMut},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     task::{Context, Poll},
 };
 use tokio::{
@@ -14,14 +14,17 @@ use tokio::{
 pub(crate) struct Socket {
     state: UdpSocketState,
     socket: UdpSocket,
+    local_addr: SocketAddr,
     to_send: VecDeque<(Vec<u8>, Option<IpAddr>, SocketAddr)>,
 }
 
 impl Socket {
     pub(crate) fn new(socket: UdpSocket) -> Self {
+        let local_addr = socket.local_addr().unwrap();
         Self {
             state: UdpSocketState::new((&socket).into()).unwrap(),
             socket,
+            local_addr,
             to_send: VecDeque::new(),
         }
     }
@@ -73,7 +76,7 @@ impl Socket {
         &mut self,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<(IpAddr, SocketAddr)>> {
+    ) -> Poll<io::Result<(SocketAddr, SocketAddr)>> {
         // Loop makes sure that the waker is registered with the runtime,
         // if poll_recv_ready returns Ready but recv returns WouldBlock
         loop {
@@ -89,7 +92,10 @@ impl Socket {
                 buf.set_filled(meta[0].len);
 
                 Ok((
-                    meta[0].dst_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+                    meta[0]
+                        .dst_ip
+                        .map(|ip| SocketAddr::new(ip, self.local_addr.port()))
+                        .unwrap_or(self.local_addr),
                     meta[0].addr,
                 ))
             });

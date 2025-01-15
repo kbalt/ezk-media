@@ -9,10 +9,13 @@ repository.workspace = true
 [dependencies]
 ezk-session.workspace = true
 
-sip-types = { version = "0.3", package = "ezk-sip-types" }
-sip-ua = { version = "0.5", package = "ezk-sip-ua" }
-sip-core = { version = "0.5", package = "ezk-sip-core" }
+#sip-types = { version = "0.3", package = "ezk-sip-types" }
+#sip-ua = { version = "0.5", package = "ezk-sip-ua" }
+#sip-core = { version = "0.5", package = "ezk-sip-core" }
 sdp-types = { git = "https://github.com/kbalt/ezk", package = "ezk-sdp-types" }
+sip-core = { git = "https://github.com/kbalt/ezk", package = "ezk-sip-core" }
+sip-ua = { git = "https://github.com/kbalt/ezk", package = "ezk-sip-ua" }
+sip-types = { git = "https://github.com/kbalt/ezk", package = "ezk-sip-types" }
 tokio = { version = "1.41.1", features = ["full"] }
 log = "0.4.22"
 env_logger = "0.11.5"

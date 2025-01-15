@@ -173,8 +173,8 @@ impl AsyncSdpSession {
 
         loop {
             self.inner.poll();
-            self.handle_events().unwrap();
 
+            self.handle_events().unwrap();
             self.timeout = self.inner.timeout().map(|d| Instant::now() + d);
 
             select! {
@@ -211,7 +211,7 @@ async fn timeout(instant: Option<Instant>) {
 async fn poll_sockets(
     sockets: &mut HashMap<SocketId, Socket>,
     buf: &mut ReadBuf<'_>,
-) -> (SocketId, Result<(IpAddr, SocketAddr), io::Error>) {
+) -> (SocketId, Result<(SocketAddr, SocketAddr), io::Error>) {
     buf.set_filled(0);
 
     poll_fn(|cx| {

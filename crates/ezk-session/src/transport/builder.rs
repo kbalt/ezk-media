@@ -4,10 +4,14 @@ use super::{
     ReceivedPacket, SessionTransportState, Transport, TransportEvent, TransportKind,
     TransportRequiredChanges,
 };
-use crate::{rtp::RtpExtensionIds, ConnectionState, ReceivedPkt, RtcpMuxPolicy, TransportType};
+use crate::{
+    ice::{IceAgentBuilder, IceCredentials},
+    rtp::RtpExtensionIds,
+    ConnectionState, ReceivedPkt, RtcpMuxPolicy, TransportType,
+};
 use core::panic;
-use sdp_types::{Fingerprint, MediaDescription, Setup};
-use std::{collections::VecDeque, net::SocketAddr};
+use sdp_types::{Fingerprint, MediaDescription, SessionDescription, Setup};
+use std::{collections::VecDeque, net::SocketAddr, time::Instant};
 
 /// Builder for a transport which has yet to be negotiated
 pub(crate) struct TransportBuilder {
@@ -16,9 +20,15 @@ pub(crate) struct TransportBuilder {
 
     kind: TransportBuilderKind,
 
+    pub(crate) ice_agent: Option<IceAgentBuilder>,
+
     // Backlog of messages received before the SDP answer has been received
     backlog: Vec<ReceivedPkt>,
 }
+
+compile_error!(
+    "transport builder now also needs an event queue... use callback just like with ice?"
+);
 
 enum TransportBuilderKind {
     Rtp,
@@ -32,6 +42,7 @@ impl TransportBuilder {
             local_rtp_port: None,
             local_rtcp_port: None,
             kind: TransportBuilderKind::Rtp,
+            ice_agent: None,
             backlog: vec![],
         }
     }
@@ -41,6 +52,7 @@ impl TransportBuilder {
         mut required_changes: TransportRequiredChanges<'_>,
         type_: TransportType,
         rtcp_mux_policy: RtcpMuxPolicy,
+        offer_ice: bool,
     ) -> Self {
         match rtcp_mux_policy {
             RtcpMuxPolicy::Negotiate => required_changes.require_socket_pair(),
@@ -60,6 +72,7 @@ impl TransportBuilder {
         Self {
             local_rtp_port: None,
             local_rtcp_port: None,
+            ice_agent: offer_ice.then(|| IceAgentBuilder::new(true)),
             kind,
             backlog: vec![],
         }
@@ -88,20 +101,34 @@ impl TransportBuilder {
         }
     }
 
-    pub(crate) fn receive(&mut self, msg: ReceivedPkt) {
+    pub(crate) fn poll(&mut self) {
+        if let Some(ice_agent) = &mut self.ice_agent {
+            ice_agent.poll(Instant::now(), |event| {});
+        }
+    }
+
+    pub(crate) fn receive(&mut self, pkt: ReceivedPkt) {
+        if let Some(ice_agent) = &mut self.ice_agent {
+            if ice_agent.receive(&pkt) {
+                // message has been handled by the ice-agent, return
+                return;
+            }
+        }
+
         // Limit the backlog buffer so it doesn't become a problem
         // this will never ever happen in a well behaved environment
         if self.backlog.len() > 100 {
             return;
         }
 
-        self.backlog.push(msg);
+        self.backlog.push(pkt);
     }
 
     pub(crate) fn build_from_answer(
         mut self,
         state: &mut SessionTransportState,
         mut required_changes: TransportRequiredChanges<'_>,
+        session_desc: &SessionDescription,
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
@@ -112,7 +139,31 @@ impl TransportBuilder {
             self.local_rtcp_port = None;
         }
 
-        let ice_agent = None;
+        let ice_ufrag = session_desc
+            .ice_ufrag
+            .as_ref()
+            .or(remote_media_desc.ice_ufrag.as_ref());
+
+        let ice_pwd = session_desc
+            .ice_pwd
+            .as_ref()
+            .or(remote_media_desc.ice_pwd.as_ref());
+
+        let ice_agent =
+            if let Some((ice_agent, (ufrag, pwd))) = self.ice_agent.zip(ice_ufrag.zip(ice_pwd)) {
+                let mut ice_agent = ice_agent.build(IceCredentials {
+                    ufrag: ufrag.ufrag.to_string(),
+                    pwd: pwd.pwd.to_string(),
+                });
+
+                for candidate in &remote_media_desc.ice_candidates {
+                    ice_agent.add_remote_candidate(candidate);
+                }
+
+                Some(ice_agent)
+            } else {
+                None
+            };
 
         let mut transport = match self.kind {
             TransportBuilderKind::Rtp => Transport {

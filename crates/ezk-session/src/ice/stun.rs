@@ -1,4 +1,9 @@
-use std::{borrow::Cow, cmp::min, net::SocketAddr, time::Duration};
+use std::{
+    borrow::Cow,
+    cmp::min,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 use stun_types::{
     attributes::{
         Fingerprint, IceControlled, IceControlling, MessageIntegrity, MessageIntegrityKey,
@@ -7,12 +12,15 @@ use stun_types::{
     Class, Message, MessageBuilder, Method, TransactionId,
 };
 
-use super::{Candidate, IceCredentials};
+use crate::{transport::SocketUse, ReceivedPkt};
+
+use super::{Candidate, IceCredentials, IceEvent};
 
 pub(crate) struct StunConfig {
     pub(crate) initial_rto: Duration,
     pub(crate) max_retransmits: u32,
     pub(crate) max_rto: Duration,
+    pub(crate) binding_refresh_interval: Duration,
 }
 
 impl StunConfig {
@@ -23,7 +31,9 @@ impl StunConfig {
             // RFC 5389 default
             max_retransmits: 7,
             // Like str0m & libwebrtc capping the maximum retransmit value
-            max_rto: Duration::from_secs(8),
+            max_rto: Duration::from_secs(3),
+            // TODO: I made this number up
+            binding_refresh_interval: Duration::from_secs(20),
         }
     }
 
@@ -131,4 +141,167 @@ pub(crate) fn verify_integrity(
     let username = stun_msg.attribute::<Username>().unwrap().unwrap();
 
     passed_integrity_check && username.0 == expected_username
+}
+
+pub(crate) struct StunServerBinding {
+    server: SocketAddr,
+    socket: SocketUse,
+    state: StunServerBindingState,
+    /// Addresses from last STUN response (local-ip, mapped-addr)
+    last_mapped_addr: Option<(SocketAddr, SocketAddr)>,
+}
+
+enum StunServerBindingState {
+    /// Waiting to be polled to send their first request
+    Waiting,
+    /// Mid STUN transaction to create binding
+    InProgress {
+        transaction_id: TransactionId,
+        stun_request: Vec<u8>,
+        retransmit_at: Instant,
+        retransmits: u32,
+    },
+    /// Waiting to refresh the binding
+    WaitingForRefresh { refresh_at: Instant },
+    /// Failed to reach the STUN server
+    Failed,
+}
+
+impl StunServerBinding {
+    pub(crate) fn new(server: SocketAddr, socket: SocketUse) -> Self {
+        Self {
+            server,
+            socket,
+            state: StunServerBindingState::Waiting,
+            last_mapped_addr: None,
+        }
+    }
+
+    pub(crate) fn socket(&self) -> SocketUse {
+        self.socket
+    }
+
+    /// Returns if the binding has either been completed or failed to complete
+    pub(crate) fn completed(&self) -> bool {
+        self.last_mapped_addr.is_some() || matches!(self.state, StunServerBindingState::Failed)
+    }
+
+    pub(crate) fn discovered_addr(&self) -> Option<(SocketAddr, SocketAddr)> {
+        self.last_mapped_addr
+    }
+
+    pub(crate) fn timeout(&self, now: Instant) -> Option<Duration> {
+        match &self.state {
+            StunServerBindingState::Waiting => Some(Duration::ZERO),
+            StunServerBindingState::InProgress { retransmit_at, .. } => Some(
+                retransmit_at
+                    .checked_duration_since(now)
+                    .unwrap_or(Duration::ZERO),
+            ),
+            StunServerBindingState::WaitingForRefresh { refresh_at, .. } => Some(
+                refresh_at
+                    .checked_duration_since(now)
+                    .unwrap_or(Duration::ZERO),
+            ),
+            StunServerBindingState::Failed => None,
+        }
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        now: Instant,
+        stun_config: &StunConfig,
+        mut on_event: impl FnMut(IceEvent),
+    ) {
+        match &mut self.state {
+            StunServerBindingState::Waiting => {
+                self.start_binding_request(now, stun_config, on_event)
+            }
+            StunServerBindingState::InProgress {
+                transaction_id: _,
+                stun_request,
+                retransmit_at,
+                retransmits,
+            } => {
+                if *retransmit_at > now {
+                    return;
+                }
+
+                if *retransmits >= stun_config.max_retransmits {
+                    self.state = StunServerBindingState::Failed;
+                    self.last_mapped_addr = None;
+                    return;
+                }
+
+                *retransmits += 1;
+                *retransmit_at += stun_config.retransmit_delta(*retransmits);
+
+                on_event(IceEvent::SendData {
+                    socket: self.socket,
+                    data: stun_request.clone(),
+                    source: None,
+                    target: self.server,
+                });
+            }
+            StunServerBindingState::WaitingForRefresh { refresh_at, .. } => {
+                if *refresh_at > now {
+                    self.start_binding_request(now, stun_config, on_event);
+                }
+            }
+            StunServerBindingState::Failed => {
+                // nothing to do
+            }
+        }
+    }
+
+    fn start_binding_request(
+        &mut self,
+        now: Instant,
+        stun_config: &StunConfig,
+        mut on_event: impl FnMut(IceEvent),
+    ) {
+        let transaction_id = TransactionId::random();
+
+        let mut builder = MessageBuilder::new(Class::Request, Method::Binding, transaction_id);
+        builder.add_attr(&Fingerprint).unwrap();
+
+        let stun_request = builder.finish();
+
+        on_event(IceEvent::SendData {
+            socket: self.socket,
+            data: stun_request.clone(),
+            source: None,
+            target: self.server,
+        });
+
+        self.state = StunServerBindingState::InProgress {
+            transaction_id,
+            stun_request,
+            retransmit_at: now + stun_config.retransmit_delta(0),
+            retransmits: 0,
+        };
+    }
+
+    pub(crate) fn wants_stun_response(&self, transaction_id: TransactionId) -> bool {
+        matches!(&self.state, StunServerBindingState::InProgress { transaction_id: tsx_id, .. } if transaction_id == *tsx_id)
+    }
+
+    /// Receive a STUN success response
+    ///
+    /// Returns a SocketAddr discovered through the STUN binding
+    pub(crate) fn receive_stun_response(
+        &mut self,
+        stun_config: &StunConfig,
+        pkt: &ReceivedPkt,
+        mut stun_msg: Message,
+    ) -> Option<SocketAddr> {
+        let mapped = stun_msg.attribute::<XorMappedAddress>()?.unwrap();
+
+        self.state = StunServerBindingState::WaitingForRefresh {
+            refresh_at: Instant::now() + stun_config.binding_refresh_interval,
+        };
+        self.last_mapped_addr = Some((pkt.destination, mapped.0));
+
+        Some(mapped.0)
+    }
 }

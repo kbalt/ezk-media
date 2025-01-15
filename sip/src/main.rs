@@ -10,7 +10,7 @@ use sip_types::uri::NameAddr;
 use sip_types::{Code, Method};
 use sip_ua::dialog::{Dialog, DialogLayer};
 use sip_ua::invite::acceptor::Acceptor;
-use sip_ua::invite::initiator::Initiator;
+use sip_ua::invite::initiator::{Initiator, Response};
 use sip_ua::invite::session::{Event, Session};
 use sip_ua::invite::{create_ack, InviteLayer};
 use std::net::SocketAddr;
@@ -196,7 +196,7 @@ async fn main() -> Result<()> {
         invite_layer,
     });
 
-    Udp::spawn(&mut builder, "0.0.0.0:5060").await?;
+    Udp::spawn(&mut builder, "172.23.97.79:5060").await?;
     // builder.add_transport_factory(Arc::new(TcpConnector::new()));
 
     // Build endpoint to start the SIP Stack
@@ -233,7 +233,21 @@ async fn main() -> Result<()> {
 
     initiator.send_invite(invite).await.unwrap();
     while let Ok(x) = initiator.receive().await {
-        println!("{:?}", x);
+        match dbg!(x) {
+            Response::Provisional(..) => {}
+            Response::Failure(..) => break,
+            Response::Early(e, res, rseq) => todo!(),
+            Response::Session(session, tsx_response) => {
+                let mut x = create_ack(&session.dialog, tsx_response.base_headers.cseq.cseq)
+                    .await
+                    .unwrap();
+
+                x.msg.headers.insert("Max-Forwards", "70");
+
+                endpoint.send_outgoing_request(&mut x).await.unwrap();
+            }
+            Response::Finished => break,
+        };
     }
 
     // Busy sleep loop

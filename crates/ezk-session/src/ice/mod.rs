@@ -1,46 +1,44 @@
-use crate::{transport::SocketUse, ReceivedPkt};
+use crate::{opt_min, transport::SocketUse, ReceivedPkt};
 use core::fmt;
 use rand::distributions::{Alphanumeric, DistString};
 use sdp_types::{IceCandidate, UntaggedAddress};
 use slotmap::{new_key_type, SlotMap};
 use std::{
-    borrow::Cow,
     cmp::{max, min},
     collections::VecDeque,
     hash::{DefaultHasher, Hash, Hasher},
     net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
-use stun::StunConfig;
+use stun::{StunConfig, StunServerBinding};
 use stun_types::{
-    attributes::{
-        ErrorCode, Fingerprint, MessageIntegrity, MessageIntegrityKey, Priority, UseCandidate,
-        Username, XorMappedAddress,
-    },
+    attributes::{ErrorCode, Fingerprint, Priority, UseCandidate, XorMappedAddress},
     Class, Message, TransactionId,
 };
 
+mod builder;
 mod stun;
+
+pub(crate) use builder::IceAgentBuilder;
 
 new_key_type!(
     struct CandidateId;
 );
 
-pub enum IceEvent {
+pub(crate) enum IceEvent {
     UseAddr {
         socket: SocketUse,
         target: SocketAddr,
     },
     SendData {
-        // TODO: ideally this should include the source ip to send the data from
         socket: SocketUse,
         data: Vec<u8>,
-        source: IpAddr,
+        source: Option<IpAddr>,
         target: SocketAddr,
     },
 }
 
-pub struct IceAgent {
+pub(crate) struct IceAgent {
     stun_config: StunConfig,
 
     local_credentials: IceCredentials,
@@ -51,7 +49,7 @@ pub struct IceAgent {
 
     checklist: Checklist,
 
-    stun_server: Option<SocketAddr>,
+    stun_server: Vec<StunServerBinding>,
 
     is_controlling: bool,
     control_tie_breaker: u64,
@@ -150,7 +148,7 @@ impl IceCredentials {
 }
 
 impl IceAgent {
-    pub fn new(is_controlling: bool, remote_credentials: IceCredentials) -> Self {
+    pub(crate) fn new(is_controlling: bool, remote_credentials: IceCredentials) -> Self {
         IceAgent {
             stun_config: StunConfig::new(),
             local_credentials: IceCredentials::random(),
@@ -163,18 +161,18 @@ impl IceAgent {
                 pairs: Vec::new(),
                 triggered_check_queue: VecDeque::new(),
             },
-            stun_server: None,
+            stun_server: vec![],
             is_controlling,
             control_tie_breaker: rand::random(),
             last_ta_trigger: None,
         }
     }
 
-    pub fn credentials(&self) -> &IceCredentials {
+    pub(crate) fn credentials(&self) -> &IceCredentials {
         &self.local_credentials
     }
 
-    pub fn add_host_addr(&mut self, socket: SocketUse, addr: SocketAddr) {
+    pub(crate) fn add_host_addr(&mut self, socket: SocketUse, addr: SocketAddr) {
         if addr.ip().is_loopback() || addr.ip().is_unspecified() {
             return;
         }
@@ -186,10 +184,36 @@ impl IceAgent {
             }
         }
 
-        self.add_local_candidate(socket, CandidateKind::Host, addr);
+        self.add_local_candidate(socket, CandidateKind::Host, addr, addr);
     }
 
-    fn add_local_candidate(&mut self, socket: SocketUse, kind: CandidateKind, addr: SocketAddr) {
+    pub(crate) fn add_stun_server(&mut self, server: SocketAddr) {
+        self.stun_server
+            .push(StunServerBinding::new(server, SocketUse::Rtp));
+
+        // TODO: only make this if we're using an rtcp socket
+        self.stun_server
+            .push(StunServerBinding::new(server, SocketUse::Rtcp));
+    }
+
+    fn add_local_candidate(
+        &mut self,
+        socket: SocketUse,
+        kind: CandidateKind,
+        base: SocketAddr,
+        addr: SocketAddr,
+    ) {
+        // Check if we need to create a new candidate for this
+        let already_exists = self
+            .local_candidates
+            .values()
+            .any(|c| c.kind == kind && c.base == base && c.addr == addr);
+
+        if already_exists {
+            // ignore
+            return;
+        }
+
         println!("add local candidate {socket:?} {kind:?} {addr}");
 
         // Calculate the candidate priority using offsets + count of candidates of the same type
@@ -212,9 +236,6 @@ impl IceAgent {
         let local_preference = local_preference << 8;
         let priority = kind_preference + local_preference + (256 - socket as u32);
 
-        // TODO: change this when adding server reflexive candidates
-        let base = addr;
-
         self.local_candidates.insert(Candidate {
             addr,
             kind,
@@ -227,7 +248,7 @@ impl IceAgent {
         self.form_pairs();
     }
 
-    pub fn add_remote_candidate(&mut self, candidate: &IceCandidate) {
+    pub(crate) fn add_remote_candidate(&mut self, candidate: &IceCandidate) {
         let kind = match candidate.typ.as_str() {
             "host" => CandidateKind::Host,
             "srflx" => CandidateKind::ServerReflexive,
@@ -355,7 +376,7 @@ impl IceAgent {
     }
 
     /// Receive network packets for this ICE agent
-    pub fn receive(&mut self, on_event: impl FnMut(IceEvent), pkt: &ReceivedPkt) {
+    pub(crate) fn receive(&mut self, on_event: impl FnMut(IceEvent), pkt: &ReceivedPkt) {
         // TODO: avoid clone here, this should be free
         let mut stun_msg = Message::parse(pkt.data.clone()).unwrap();
 
@@ -380,6 +401,30 @@ impl IceAgent {
     }
 
     fn receive_stun_success(&mut self, pkt: &ReceivedPkt, mut stun_msg: Message) {
+        // Check our stun server binding checks before verifying integrity since these aren't authenticated
+        for stun_server_binding in &mut self.stun_server {
+            if !stun_server_binding.wants_stun_response(stun_msg.transaction_id()) {
+                continue;
+            }
+
+            let Some(addr) =
+                stun_server_binding.receive_stun_response(&self.stun_config, pkt, stun_msg)
+            else {
+                // TODO; no xor mapped in response, discard message
+                return;
+            };
+
+            let socket = stun_server_binding.socket();
+            self.add_local_candidate(
+                socket,
+                CandidateKind::ServerReflexive,
+                pkt.destination,
+                addr,
+            );
+
+            return;
+        }
+
         if !stun::verify_integrity(
             &self.local_credentials,
             &self.remote_credentials,
@@ -409,7 +454,7 @@ impl IceAgent {
             unreachable!()
         };
 
-        if pkt.source == *target || pkt.destination == *source {
+        if pkt.source == *target || pkt.destination.ip() == *source {
             pair.state = CandidatePairState::Succeeded;
         } else {
             // TODO: is setting this to failed right?
@@ -420,7 +465,12 @@ impl IceAgent {
         let mapped_addr = stun_msg.attribute::<XorMappedAddress>().unwrap().unwrap();
 
         if mapped_addr.0 != self.local_candidates[pair.local].addr {
-            self.add_local_candidate(SocketUse::Rtp, CandidateKind::PeerReflexive, mapped_addr.0);
+            self.add_local_candidate(
+                SocketUse::Rtp,
+                CandidateKind::PeerReflexive,
+                pkt.destination,
+                mapped_addr.0,
+            );
         }
     }
 
@@ -472,7 +522,7 @@ impl IceAgent {
         let local_id = match self
             .local_candidates
             .iter()
-            .find(|(_, c)| c.kind == CandidateKind::Host && c.addr.ip() == pkt.destination)
+            .find(|(_, c)| c.kind == CandidateKind::Host && c.addr == pkt.destination)
         {
             Some((id, _)) => id,
             None => {
@@ -536,7 +586,7 @@ impl IceAgent {
         on_event(IceEvent::SendData {
             socket: SocketUse::Rtp,
             data: stun_response,
-            source: self.local_candidates[local_id].base.ip(),
+            source: Some(self.local_candidates[local_id].base.ip()),
             target: pkt.source,
         });
 
@@ -548,11 +598,15 @@ impl IceAgent {
         }
     }
 
-    pub fn poll(&mut self, mut on_event: impl FnMut(IceEvent)) {
+    pub(crate) fn poll(&mut self, mut on_event: impl FnMut(IceEvent)) {
         let now = Instant::now();
 
         // Handle pending stun retransmissions
         self.poll_retransmit(now, &mut on_event);
+
+        for stun_server_bindings in &mut self.stun_server {
+            stun_server_bindings.poll(now, &self.stun_config, &mut on_event);
+        }
 
         // Limit new checks to 1 per 50ms
         if let Some(it) = self.last_ta_trigger {
@@ -620,7 +674,7 @@ impl IceAgent {
             on_event(IceEvent::SendData {
                 socket: SocketUse::Rtp,
                 data: stun_request,
-                source,
+                source: Some(source),
                 target,
             });
 
@@ -664,22 +718,31 @@ impl IceAgent {
             on_event(IceEvent::SendData {
                 socket: SocketUse::Rtp,
                 data: stun_request.clone(),
-                source: *source,
+                source: Some(*source),
                 target: *target,
             });
         }
     }
 
-    pub fn timeout(&self) -> Option<Duration> {
-        self.last_ta_trigger
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        let now = Instant::now();
+
+        // Next TA trigger
+        let ta = self
+            .last_ta_trigger
             .map(|it| {
                 let poll_at = it + Duration::from_millis(50);
-                poll_at.checked_duration_since(Instant::now())
+                poll_at.checked_duration_since(now)
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // Next stun binding refresh/retransmit
+        let stun_bindings = self.stun_server.iter().filter_map(|b| b.timeout(now)).min();
+
+        opt_min(ta, stun_bindings)
     }
 
-    pub fn ice_candidates(&self) -> Vec<IceCandidate> {
+    pub(crate) fn ice_candidates(&self) -> Vec<IceCandidate> {
         self.local_candidates
             .values()
             .filter(|c| matches!(c.kind, CandidateKind::Host | CandidateKind::ServerReflexive))
