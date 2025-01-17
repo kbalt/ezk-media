@@ -1,5 +1,6 @@
+use super::{Candidate, IceCredentials, IceEvent};
+use crate::{transport::SocketUse, ReceivedPkt};
 use std::{
-    borrow::Cow,
     cmp::min,
     net::SocketAddr,
     time::{Duration, Instant},
@@ -11,10 +12,6 @@ use stun_types::{
     },
     Class, Message, MessageBuilder, Method, TransactionId,
 };
-
-use crate::{transport::SocketUse, ReceivedPkt};
-
-use super::{Candidate, IceCredentials, IceEvent};
 
 pub(crate) struct StunConfig {
     pub(crate) initial_rto: Duration,
@@ -59,29 +56,21 @@ pub(super) fn make_binding_request(
     let mut stun_message = MessageBuilder::new(Class::Request, Method::Binding, transaction_id);
 
     let username = format!("{}:{}", remote_credentials.ufrag, local_credentials.ufrag);
-    stun_message.add_attr(&Username::new(&username)).unwrap();
-    stun_message
-        .add_attr(&Priority(local_candidate.priority))
-        .unwrap();
+    stun_message.add_attr(Username::new(&username));
+    stun_message.add_attr(Priority(local_candidate.priority));
 
     if is_controlling {
-        stun_message
-            .add_attr(&IceControlling(control_tie_breaker))
-            .unwrap();
+        stun_message.add_attr(IceControlling(control_tie_breaker));
     } else {
-        stun_message
-            .add_attr(&IceControlled(control_tie_breaker))
-            .unwrap();
+        stun_message.add_attr(IceControlled(control_tie_breaker));
     }
 
-    stun_message
-        .add_attr_with(
-            &MessageIntegrity::default(),
-            &MessageIntegrityKey::new_raw(Cow::Borrowed(remote_credentials.pwd.as_bytes())),
-        )
-        .unwrap();
+    stun_message.add_attr_with(
+        MessageIntegrity,
+        MessageIntegrityKey::new(&remote_credentials.pwd),
+    );
 
-    stun_message.add_attr(&Fingerprint).unwrap();
+    stun_message.add_attr(Fingerprint);
 
     stun_message.finish()
 }
@@ -96,16 +85,14 @@ pub(super) fn make_success_response(
 
     let username = format!("{}:{}", local_credentials.ufrag, remote_credentials.ufrag);
 
-    stun_message.add_attr(&Username::new(&username)).unwrap();
-    stun_message.add_attr(&XorMappedAddress(source)).unwrap();
-    stun_message
-        .add_attr_with(
-            &MessageIntegrity::default(),
-            &MessageIntegrityKey::new_raw(Cow::Borrowed(remote_credentials.pwd.as_bytes())),
-        )
-        .unwrap();
+    stun_message.add_attr(Username::new(&username));
+    stun_message.add_attr(XorMappedAddress(source));
+    stun_message.add_attr_with(
+        MessageIntegrity,
+        MessageIntegrityKey::new(&remote_credentials.pwd),
+    );
 
-    stun_message.add_attr(&Fingerprint).unwrap();
+    stun_message.add_attr(Fingerprint);
 
     stun_message.finish()
 }
@@ -122,34 +109,26 @@ pub(super) fn make_role_error(
 
     let username = format!("{}:{}", local_credentials.ufrag, remote_credentials.ufrag);
 
-    stun_message.add_attr(&Username::new(&username)).unwrap();
+    stun_message.add_attr(Username::new(&username));
 
-    stun_message
-        .add_attr(&ErrorCode {
-            number: 487,
-            reason: "Role Conflict",
-        })
-        .unwrap();
+    stun_message.add_attr(ErrorCode {
+        number: 487,
+        reason: "Role Conflict",
+    });
 
     if is_controlling {
-        stun_message
-            .add_attr(&IceControlling(control_tie_breaker))
-            .unwrap();
+        stun_message.add_attr(IceControlling(control_tie_breaker));
     } else {
-        stun_message
-            .add_attr(&IceControlled(control_tie_breaker))
-            .unwrap();
+        stun_message.add_attr(IceControlled(control_tie_breaker));
     }
 
-    stun_message.add_attr(&XorMappedAddress(source)).unwrap();
-    stun_message
-        .add_attr_with(
-            &MessageIntegrity::default(),
-            &MessageIntegrityKey::new_raw(Cow::Borrowed(remote_credentials.pwd.as_bytes())),
-        )
-        .unwrap();
+    stun_message.add_attr(XorMappedAddress(source));
+    stun_message.add_attr_with(
+        MessageIntegrity,
+        MessageIntegrityKey::new(&remote_credentials.pwd),
+    );
 
-    stun_message.add_attr(&Fingerprint).unwrap();
+    stun_message.add_attr(Fingerprint);
 
     stun_message.finish()
 }
@@ -175,9 +154,7 @@ pub(crate) fn verify_integrity(
     };
 
     let passed_integrity_check = stun_msg
-        .attribute_with::<MessageIntegrity>(&MessageIntegrityKey::new_raw(Cow::Borrowed(
-            key.as_bytes(),
-        )))
+        .attribute_with::<MessageIntegrity>(MessageIntegrityKey::new(key))
         .is_some_and(|r| r.is_ok());
 
     let expected_username = if is_request {
@@ -311,7 +288,7 @@ impl StunServerBinding {
         let transaction_id = TransactionId::random();
 
         let mut builder = MessageBuilder::new(Class::Request, Method::Binding, transaction_id);
-        builder.add_attr(&Fingerprint).unwrap();
+        builder.add_attr(Fingerprint);
 
         let stun_request = builder.finish();
 

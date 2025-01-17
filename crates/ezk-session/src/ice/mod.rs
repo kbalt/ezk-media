@@ -429,7 +429,7 @@ impl IceAgent {
             .is_some_and(|r| r.is_ok());
 
         if !passed_fingerprint_check {
-            log::debug!(
+            log::trace!(
                 "Incoming STUN {:?} failed fingerprint check, discarding",
                 stun_msg.class()
             );
@@ -632,7 +632,7 @@ impl IceAgent {
         let priority = stun_msg.attribute::<Priority>().unwrap().unwrap();
         let use_candidate = stun_msg.attribute::<UseCandidate>().is_some();
 
-        compile_error!("todo: finish the nomination state");
+        // compile_error!("todo: finish the nomination state");
 
         // Detect and handle role conflict
         if self.is_controlling {

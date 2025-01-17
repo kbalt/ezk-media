@@ -1,8 +1,6 @@
-use base64::Engine;
 use bytesstr::BytesStr;
 use ezk_session::{AsyncSdpSession, Codec, Codecs};
 use sdp_types::{Direction, MediaType, SessionDescription};
-use sip_core::transport::tcp::TcpConnector;
 use sip_core::transport::udp::Udp;
 use sip_core::{Endpoint, IncomingRequest, Layer, LayerKey, MayTake, Result};
 use sip_types::header::typed::{Contact, ContentType};
@@ -15,7 +13,6 @@ use sip_ua::invite::initiator::{Initiator, Response};
 use sip_ua::invite::session::{Event, Session};
 use sip_ua::invite::{create_ack, InviteLayer};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -180,7 +177,7 @@ async fn main() -> Result<()> {
         invite_layer,
     });
 
-    Udp::spawn(&mut builder, "172.23.97.79:5060").await?;
+    Udp::spawn(&mut builder, "0.0.0.0:5060").await?;
     // builder.add_transport_factory(Arc::new(TcpConnector::new()));
 
     // Build endpoint to start the SIP Stack
@@ -208,7 +205,7 @@ async fn main() -> Result<()> {
         1,
         Direction::RecvOnly,
     );
-    let m = sess.add_media(audio_id, Direction::SendRecv);
+    let _m = sess.add_media(audio_id, Direction::SendRecv);
     let offer = sess.create_offer().await;
 
     let mut invite = initiator.create_invite();
