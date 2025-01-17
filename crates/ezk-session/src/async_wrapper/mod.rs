@@ -31,7 +31,13 @@ pub struct AsyncSdpSession {
 impl AsyncSdpSession {
     pub fn new(address: IpAddr) -> Self {
         Self {
-            inner: super::SdpSession::new(address, Options::default()),
+            inner: super::SdpSession::new(
+                address,
+                Options {
+                    offer_ice: true,
+                    ..Options::default()
+                },
+            ),
             sockets: HashMap::new(),
             timeout: None,
             ips: local_ip_address::linux::list_afinet_netifas()
@@ -40,6 +46,10 @@ impl AsyncSdpSession {
                 .map(|(_, addr)| addr)
                 .collect(),
         }
+    }
+
+    pub fn add_stun_server(&mut self, server: SocketAddr) {
+        self.inner.add_stun_server(server);
     }
 
     /// Register codecs for a media type with a limit of how many media session by can be created
@@ -150,10 +160,11 @@ impl AsyncSdpSession {
                     source,
                     target,
                 } => {
-                    self.sockets
-                        .get_mut(&socket)
-                        .unwrap()
-                        .enqueue(data, source, target);
+                    if let Some(socket) = self.sockets.get_mut(&socket) {
+                        socket.enqueue(data, source, target);
+                    } else {
+                        println!("invalid socket id")
+                    }
                 }
                 Event::ConnectionState { media_id, old, new } => {
                     println!("Connection state of {media_id:?} changed from {old:?} to {new:?}");

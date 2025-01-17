@@ -3,11 +3,12 @@
 use bytesstr::BytesStr;
 use events::{TransportChange, TransportRequiredChanges};
 use ezk_rtp::{rtcp_types::Compound, RtpPacket, RtpSession};
+use ice::IceAgent;
 use local_media::LocalMedia;
 use rtp::RtpExtensions;
 use sdp_types::{
-    Connection, Direction, Fmtp, Group, IceOptions, Media, MediaDescription, MediaType, Origin,
-    Rtcp, RtpMap, SessionDescription, TaggedAddress, Time,
+    Connection, Direction, Fmtp, Group, IceOptions, IcePassword, IceUsernameFragment, Media,
+    MediaDescription, MediaType, Origin, Rtcp, RtpMap, SessionDescription, Time,
 };
 use slotmap::SlotMap;
 use std::{
@@ -15,7 +16,7 @@ use std::{
     collections::HashMap,
     io,
     mem::replace,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
 use transport::{
@@ -71,7 +72,6 @@ pub struct SdpSession {
 
     // Local ip address to use
     address: IpAddr,
-    stun_server: Vec<SocketAddr>,
 
     /// State shared between transports
     transport_state: SessionTransportState,
@@ -137,13 +137,6 @@ impl TransportEntry {
         }
     }
 
-    fn filter(&self) -> Option<&Transport> {
-        match self {
-            TransportEntry::Transport(transport) => Some(transport),
-            TransportEntry::TransportBuilder(..) => None,
-        }
-    }
-
     fn ports(&self) -> (Option<u16>, Option<u16>) {
         match self {
             TransportEntry::Transport(transport) => {
@@ -153,6 +146,24 @@ impl TransportEntry {
                 transport_builder.local_rtp_port,
                 transport_builder.local_rtcp_port,
             ),
+        }
+    }
+
+    fn ice_agent(&self) -> Option<&IceAgent> {
+        match self {
+            TransportEntry::Transport(transport) => transport.ice_agent.as_ref(),
+            TransportEntry::TransportBuilder(transport_builder) => {
+                transport_builder.ice_agent.as_ref()
+            }
+        }
+    }
+
+    fn ice_agent_mut(&mut self) -> Option<&mut IceAgent> {
+        match self {
+            TransportEntry::Transport(transport) => transport.ice_agent.as_mut(),
+            TransportEntry::TransportBuilder(transport_builder) => {
+                transport_builder.ice_agent.as_mut()
+            }
         }
     }
 }
@@ -287,7 +298,6 @@ impl SdpSession {
             id: u64::from(rand::random::<u16>()),
             version: u64::from(rand::random::<u16>()),
             address,
-            stun_server: vec![],
             transport_state: SessionTransportState::default(),
             next_pt: 96,
             local_media: SlotMap::with_key(),
@@ -302,7 +312,7 @@ impl SdpSession {
 
     /// Add a stun server to use for ICE
     pub fn add_stun_server(&mut self, server: SocketAddr) {
-        self.stun_server.push(server);
+        self.transport_state.add_stun_server(server);
 
         for transport in self.transports.values_mut() {
             match transport {
@@ -461,10 +471,6 @@ impl SdpSession {
                 continue;
             }
 
-            // resolve remote rtp & rtcp address
-            let (remote_rtp_address, remote_rtcp_address) =
-                resolve_rtp_and_rtcp_address(&offer, remote_media_desc)?;
-
             // Choose local media for this media description
             let chosen_media = self.local_media.iter_mut().find_map(|(id, local_media)| {
                 local_media
@@ -485,13 +491,7 @@ impl SdpSession {
             let media_id = self.next_media_id.step();
 
             // Get or create transport for the m-line
-            let transport = self.get_or_create_transport(
-                &new_state,
-                &offer,
-                remote_media_desc,
-                remote_rtp_address,
-                remote_rtcp_address,
-            )?;
+            let transport = self.get_or_create_transport(&new_state, &offer, remote_media_desc)?;
 
             let Some(transport) = transport else {
                 // No transport was found or created, reject media
@@ -569,8 +569,6 @@ impl SdpSession {
         new_state: &[ActiveMedia],
         session_desc: &SessionDescription,
         remote_media_desc: &MediaDescription,
-        remote_rtp_address: SocketAddr,
-        remote_rtcp_address: SocketAddr,
     ) -> Result<Option<TransportId>, Error> {
         // See if there's a transport to be reused via BUNDLE group
         if let Some(id) = remote_media_desc
@@ -586,12 +584,11 @@ impl SdpSession {
             self.transports
                 .try_insert_with_key(|id| -> Result<TransportEntry, Option<_>> {
                     Transport::create_from_offer(
+                        Self::propagate_transport_events(&self.state, &mut self.events, id),
                         &mut self.transport_state,
                         TransportRequiredChanges::new(id, &mut self.transport_changes),
                         session_desc,
                         remote_media_desc,
-                        remote_rtp_address,
-                        remote_rtcp_address,
                     )
                     .map_err(Some)?
                     .map(TransportEntry::Transport)
@@ -649,7 +646,7 @@ impl SdpSession {
             media_descriptions.push(self.media_description_for_active(active, None));
         }
 
-        SessionDescription {
+        let mut sess_desc = SessionDescription {
             origin: Origin {
                 username: "-".into(),
                 session_id: self.id.to_string().into(),
@@ -676,7 +673,23 @@ impl SdpSession {
             fingerprint: vec![],
             attributes: vec![],
             media_descriptions,
+        };
+
+        if let Some(ice_credentials) = self
+            .transports
+            .values()
+            .find_map(|t| Some(t.ice_agent()?.credentials()))
+        {
+            sess_desc.ice_ufrag = Some(IceUsernameFragment {
+                ufrag: ice_credentials.ufrag.clone().into(),
+            });
+
+            sess_desc.ice_pwd = Some(IcePassword {
+                pwd: ice_credentials.pwd.clone().into(),
+            });
         }
+
+        sess_desc
     }
 
     pub fn create_sdp_offer(&self) -> SessionDescription {
@@ -770,7 +783,7 @@ impl SdpSession {
                 ice_end_of_candidates: false,
                 crypto: vec![],
                 extmap: vec![],
-                extmap_allow_mixed: true,
+                extmap_allow_mixed: false,
                 ssrc: vec![],
                 setup: None,
                 fingerprint: vec![],
@@ -782,7 +795,7 @@ impl SdpSession {
             media_descriptions.push(media_desc);
         }
 
-        SessionDescription {
+        let mut sess_desc = SessionDescription {
             origin: Origin {
                 username: "-".into(),
                 session_id: self.id.to_string().into(),
@@ -809,7 +822,23 @@ impl SdpSession {
             fingerprint: vec![],
             attributes: vec![],
             media_descriptions,
+        };
+
+        if let Some(ice_credentials) = self
+            .transports
+            .values()
+            .find_map(|t| Some(t.ice_agent()?.credentials()))
+        {
+            sess_desc.ice_ufrag = Some(IceUsernameFragment {
+                ufrag: ice_credentials.ufrag.clone().into(),
+            });
+
+            sess_desc.ice_pwd = Some(IcePassword {
+                pwd: ice_credentials.pwd.clone().into(),
+            });
         }
+
+        sess_desc
     }
 
     /// Receive a SDP answer after sending an offer.
@@ -864,24 +893,26 @@ impl SdpSession {
                     // TODO: return an error here instead, we required BUNDLE, but it is not supported
                     pending_media.standalone_transport.unwrap()
                 };
+                println!("YAYAYAYasddasA");
 
                 // Build transport if necessary
                 if let TransportEntry::TransportBuilder(transport_builder) =
                     &mut self.transports[transport_id]
                 {
-                    let (remote_rtp_address, remote_rtcp_address) =
-                        resolve_rtp_and_rtcp_address(&answer, remote_media_desc).unwrap();
-
+                    println!("YAYAYAYA");
                     let transport_builder =
                         replace(transport_builder, TransportBuilder::placeholder());
 
                     let transport = transport_builder.build_from_answer(
+                        Self::propagate_transport_events(
+                            &self.state,
+                            &mut self.events,
+                            transport_id,
+                        ),
                         &mut self.transport_state,
                         TransportRequiredChanges::new(transport_id, &mut self.transport_changes),
                         &answer,
                         remote_media_desc,
-                        remote_rtp_address,
-                        remote_rtcp_address,
                     );
 
                     self.transports[transport_id] = TransportEntry::Transport(transport);
@@ -990,7 +1021,7 @@ impl SdpSession {
 
         bundle_groups
             .into_values()
-            .filter(|c| c.len() > 1)
+            .filter(|c| !c.is_empty())
             .map(|mids| Group {
                 typ: BytesStr::from_static("BUNDLE"),
                 mids,
@@ -1011,25 +1042,26 @@ impl SdpSession {
         rtp_port: u16,
         rtcp_port: Option<u16>,
     ) {
-        match &mut self.transports[transport_id] {
+        let transport = &mut self.transports[transport_id];
+
+        match transport {
             TransportEntry::Transport(transport) => {
                 transport.local_rtp_port = Some(rtp_port);
                 transport.local_rtcp_port = rtcp_port;
-
-                if let Some(ice_agent) = &mut transport.ice_agent {
-                    for ip in ip_addrs {
-                        ice_agent.add_host_addr(SocketUse::Rtp, SocketAddr::new(*ip, rtp_port));
-
-                        if let Some(rtcp_port) = rtcp_port {
-                            ice_agent
-                                .add_host_addr(SocketUse::Rtcp, SocketAddr::new(*ip, rtcp_port));
-                        }
-                    }
-                }
             }
             TransportEntry::TransportBuilder(transport_builder) => {
                 transport_builder.local_rtp_port = Some(rtp_port);
                 transport_builder.local_rtcp_port = rtcp_port;
+            }
+        };
+
+        if let Some(ice_agent) = transport.ice_agent_mut() {
+            for ip in ip_addrs {
+                ice_agent.add_host_addr(SocketUse::Rtp, SocketAddr::new(*ip, rtp_port));
+
+                if let Some(rtcp_port) = rtcp_port {
+                    ice_agent.add_host_addr(SocketUse::Rtcp, SocketAddr::new(*ip, rtcp_port));
+                }
             }
         }
     }
@@ -1040,8 +1072,15 @@ impl SdpSession {
 
         let mut timeout = None;
 
-        for transport in self.transports.values().filter_map(TransportEntry::filter) {
-            timeout = opt_min(timeout, transport.timeout());
+        for transport in self.transports.values() {
+            match transport {
+                TransportEntry::Transport(transport) => {
+                    timeout = opt_min(timeout, transport.timeout(now))
+                }
+                TransportEntry::TransportBuilder(transport_builder) => {
+                    timeout = opt_min(timeout, transport_builder.timeout(now))
+                }
+            }
         }
 
         for media in self.state.iter() {
@@ -1062,18 +1101,22 @@ impl SdpSession {
         let now = Instant::now();
 
         for (transport_id, transport) in &mut self.transports {
-            let TransportEntry::Transport(transport) = transport else {
-                continue;
-            };
-
-            transport.poll();
-
-            Self::propagate_transport_events(
-                &self.state,
-                &mut self.events,
-                transport_id,
-                transport,
-            );
+            match transport {
+                TransportEntry::Transport(transport) => {
+                    transport.poll(Self::propagate_transport_events(
+                        &self.state,
+                        &mut self.events,
+                        transport_id,
+                    ));
+                }
+                TransportEntry::TransportBuilder(transport_builder) => {
+                    transport_builder.poll(Self::propagate_transport_events(
+                        &self.state,
+                        &mut self.events,
+                        transport_id,
+                    ));
+                }
+            }
         }
 
         for media in self.state.iter_mut() {
@@ -1084,26 +1127,25 @@ impl SdpSession {
                 });
             }
 
-            if media.next_rtcp <= now {
-                send_rtcp_report(
-                    &mut self.events,
-                    self.transports[media.transport].unwrap_mut(),
-                    media,
-                );
+            // if media.next_rtcp <= now {
+            //     send_rtcp_report(
+            //         &mut self.events,
+            //         self.transports[media.transport].unwrap_mut(),
+            //         media,
+            //     );
 
-                media.next_rtcp += Duration::from_secs(5);
-            }
+            //     media.next_rtcp += Duration::from_secs(5);
+            // }
         }
     }
 
     /// "Converts" the the transport's event to the session events
-    fn propagate_transport_events(
-        state: &[ActiveMedia],
-        events: &mut Events,
+    fn propagate_transport_events<'a>(
+        state: &'a [ActiveMedia],
+        events: &'a mut Events,
         transport_id: TransportId,
-        transport: &mut Transport,
-    ) {
-        while let Some(event) = transport.pop_event() {
+    ) -> impl FnMut(TransportEvent) + use<'a> {
+        move |event| {
             match event {
                 TransportEvent::ConnectionState { old, new } => {
                     // Emit the connection state event for every track that uses the transport
@@ -1145,7 +1187,10 @@ impl SdpSession {
             }
         };
 
-        match transport.receive(&mut pkt) {
+        match transport.receive(
+            Self::propagate_transport_events(&self.state, &mut self.events, transport_id),
+            &mut pkt,
+        ) {
             ReceivedPacket::Rtp => {
                 let rtp_packet = match RtpPacket::parse(&pkt.data) {
                     Ok(rtp_packet) => rtp_packet,
@@ -1255,74 +1300,6 @@ fn send_rtcp_report(events: &mut Events, transport: &mut Transport, media: &mut 
         source: None, // TODO: set this according to the transport
         target: transport.remote_rtcp_address,
     });
-}
-
-fn resolve_rtp_and_rtcp_address(
-    remote_session_description: &SessionDescription,
-    remote_media_description: &MediaDescription,
-) -> Result<(SocketAddr, SocketAddr), Error> {
-    let connection = remote_media_description
-        .connection
-        .as_ref()
-        .or(remote_session_description.connection.as_ref())
-        .unwrap();
-
-    let remote_rtp_address = connection.address.clone();
-    let remote_rtp_port = remote_media_description.media.port;
-
-    let (remote_rtcp_address, remote_rtcp_port) =
-        rtcp_address_and_port(remote_media_description, connection);
-
-    let remote_rtp_address = resolve_tagged_address(&remote_rtp_address, remote_rtp_port)?;
-    let remote_rtcp_address = resolve_tagged_address(&remote_rtcp_address, remote_rtcp_port)?;
-
-    Ok((remote_rtp_address, remote_rtcp_address))
-}
-
-fn rtcp_address_and_port(
-    remote_media_description: &MediaDescription,
-    connection: &Connection,
-) -> (TaggedAddress, u16) {
-    if remote_media_description.rtcp_mux {
-        return (
-            connection.address.clone(),
-            remote_media_description.media.port,
-        );
-    }
-
-    if let Some(rtcp_addr) = &remote_media_description.rtcp {
-        let address = rtcp_addr
-            .address
-            .clone()
-            .unwrap_or_else(|| connection.address.clone());
-
-        return (address, rtcp_addr.port);
-    }
-
-    (
-        connection.address.clone(),
-        remote_media_description.media.port + 1,
-    )
-}
-
-fn resolve_tagged_address(address: &TaggedAddress, port: u16) -> io::Result<SocketAddr> {
-    // TODO: do not resolve here directly
-    match address {
-        TaggedAddress::IP4(ipv4_addr) => Ok(SocketAddr::from((*ipv4_addr, port))),
-        TaggedAddress::IP4FQDN(bytes_str) => (bytes_str.as_str(), port)
-            .to_socket_addrs()?
-            .find(SocketAddr::is_ipv4)
-            .ok_or_else(|| {
-                io::Error::other(format!("Failed to find IPv4 address for {bytes_str}"))
-            }),
-        TaggedAddress::IP6(ipv6_addr) => Ok(SocketAddr::from((*ipv6_addr, port))),
-        TaggedAddress::IP6FQDN(bytes_str) => (bytes_str.as_str(), port)
-            .to_socket_addrs()?
-            .find(SocketAddr::is_ipv6)
-            .ok_or_else(|| {
-                io::Error::other(format!("Failed to find IPv6 address for {bytes_str}"))
-            }),
-    }
 }
 
 // i'm too lazy to work with the direction type, so using this as a cop out

@@ -8,14 +8,14 @@ use crate::{
 use dtls_srtp::{make_ssl_context, DtlsSetup, DtlsSrtpSession};
 use openssl::{hash::MessageDigest, ssl::SslContext};
 use sdp_types::{
-    Fingerprint, FingerprintAlgorithm, MediaDescription, SessionDescription, Setup, SrtpCrypto,
-    TransportProtocol,
+    Connection, Fingerprint, FingerprintAlgorithm, MediaDescription, SessionDescription, Setup,
+    SrtpCrypto, TaggedAddress, TransportProtocol,
 };
 use std::{
     collections::VecDeque,
     io,
-    net::{IpAddr, SocketAddr},
-    time::Duration,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    time::{Duration, Instant},
 };
 
 mod builder;
@@ -29,9 +29,15 @@ pub(crate) use packet_kind::PacketKind;
 #[derive(Default)]
 pub(crate) struct SessionTransportState {
     ssl_context: Option<openssl::ssl::SslContext>,
+    ice_credentials: Option<IceCredentials>,
+    stun_servers: Vec<SocketAddr>,
 }
 
 impl SessionTransportState {
+    pub(crate) fn add_stun_server(&mut self, server: SocketAddr) {
+        self.stun_servers.push(server);
+    }
+
     fn ssl_context(&mut self) -> &mut SslContext {
         self.ssl_context.get_or_insert_with(make_ssl_context)
     }
@@ -48,6 +54,12 @@ impl SessionTransportState {
                 .unwrap()
                 .to_vec(),
         }
+    }
+
+    fn ice_credentials(&mut self) -> IceCredentials {
+        self.ice_credentials
+            .get_or_insert_with(IceCredentials::random)
+            .clone()
     }
 }
 
@@ -80,10 +92,6 @@ pub(crate) struct Transport {
 
     state: ConnectionState,
     kind: TransportKind,
-
-    // Transport keep track of their own events separately since they shouldn't be responsible for propagating these
-    // events to the media tracks/streams that are using them.
-    events: VecDeque<TransportEvent>,
 }
 
 enum TransportKind {
@@ -107,18 +115,20 @@ enum TransportKind {
 impl Transport {
     // TODO: rethink the return type here, this Result<Option<T>> business isn't really working out on the caller site
     pub(crate) fn create_from_offer(
+        mut on_event: impl FnMut(TransportEvent),
         state: &mut SessionTransportState,
         mut required_changes: TransportRequiredChanges<'_>,
         session_desc: &SessionDescription,
         remote_media_desc: &MediaDescription,
-        remote_rtp_address: SocketAddr,
-        remote_rtcp_address: SocketAddr,
     ) -> Result<Option<Self>, Error> {
         if remote_media_desc.rtcp_mux {
             required_changes.require_socket();
         } else {
             required_changes.require_socket_pair();
         }
+
+        let (remote_rtp_address, remote_rtcp_address) =
+            resolve_rtp_and_rtcp_address(session_desc, remote_media_desc).unwrap();
 
         let ice_ufrag = session_desc
             .ice_ufrag
@@ -131,13 +141,19 @@ impl Transport {
             .or(remote_media_desc.ice_pwd.as_ref());
 
         let ice_agent = if let Some((ufrag, pwd)) = ice_ufrag.zip(ice_pwd) {
-            let mut ice_agent = IceAgent::new(
+            let mut ice_agent = IceAgent::new_from_answer(
                 false,
+                state.ice_credentials(),
                 IceCredentials {
                     ufrag: ufrag.ufrag.to_string(),
                     pwd: pwd.pwd.to_string(),
                 },
             );
+
+            for server in &state.stun_servers {
+                ice_agent.add_stun_server(*server);
+            }
+
             for candidate in &remote_media_desc.ice_candidates {
                 ice_agent.add_remote_candidate(candidate);
             }
@@ -158,10 +174,6 @@ impl Transport {
                 extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                 state: ConnectionState::Connected,
                 kind: TransportKind::Rtp,
-                events: VecDeque::from([TransportEvent::ConnectionState {
-                    old: ConnectionState::New,
-                    new: ConnectionState::Connected,
-                }]),
             },
             TransportProtocol::RtpSavp => {
                 let (crypto, inbound, outbound) =
@@ -181,10 +193,6 @@ impl Transport {
                         inbound,
                         outbound,
                     },
-                    events: VecDeque::from([TransportEvent::ConnectionState {
-                        old: ConnectionState::New,
-                        new: ConnectionState::Connected,
-                    }]),
                 }
             }
             TransportProtocol::UdpTlsRtpSavp => Self::dtls_srtp_from_offer(
@@ -196,6 +204,13 @@ impl Transport {
             )?,
             _ => return Ok(None),
         };
+
+        if transport.state != ConnectionState::New {
+            on_event(TransportEvent::ConnectionState {
+                old: ConnectionState::New,
+                new: transport.state,
+            })
+        }
 
         Ok(Some(transport))
     }
@@ -263,7 +278,6 @@ impl Transport {
                 dtls,
                 srtp: None,
             },
-            events,
         })
     }
 
@@ -303,7 +317,7 @@ impl Transport {
         }
     }
 
-    pub(crate) fn timeout(&self) -> Option<Duration> {
+    pub(crate) fn timeout(&self, now: Instant) -> Option<Duration> {
         let timeout = match &self.kind {
             TransportKind::Rtp => None,
             TransportKind::SdesSrtp { .. } => None,
@@ -311,13 +325,13 @@ impl Transport {
         };
 
         if let Some(ice_agent) = &self.ice_agent {
-            opt_min(ice_agent.timeout(), timeout)
+            opt_min(ice_agent.timeout(now), timeout)
         } else {
             timeout
         }
     }
 
-    pub(crate) fn poll(&mut self) {
+    pub(crate) fn poll(&mut self, mut on_event: impl FnMut(TransportEvent)) {
         match &mut self.kind {
             TransportKind::Rtp => {}
             TransportKind::SdesSrtp { .. } => {}
@@ -325,7 +339,7 @@ impl Transport {
                 assert!(dtls.handshake().unwrap().is_none());
 
                 while let Some(data) = dtls.pop_to_send() {
-                    self.events.push_back(TransportEvent::SendData {
+                    on_event(TransportEvent::SendData {
                         socket: SocketUse::Rtp,
                         data,
                         source: None, // TODO: set this
@@ -337,7 +351,7 @@ impl Transport {
 
         if let Some(ice_agent) = &mut self.ice_agent {
             ice_agent.poll(Self::handle_ice_event(
-                &mut self.events,
+                &mut on_event,
                 &mut self.remote_rtp_address,
                 &mut self.remote_rtcp_address,
             ));
@@ -345,11 +359,11 @@ impl Transport {
     }
 
     /// Create a closure to handle events emitted by the IceAgent
-    fn handle_ice_event<'a>(
-        events: &'a mut VecDeque<TransportEvent>,
+    fn handle_ice_event<'a, F: FnMut(TransportEvent) + 'a>(
+        mut on_event: F,
         remote_rtp_address: &'a mut SocketAddr,
         remote_rtcp_address: &'a mut SocketAddr,
-    ) -> impl FnMut(IceEvent) + use<'a> {
+    ) -> impl FnMut(IceEvent) + use<'a, F> {
         move |event| match event {
             IceEvent::UseAddr { socket, target } => match socket {
                 SocketUse::Rtp => *remote_rtp_address = target,
@@ -361,7 +375,7 @@ impl Transport {
                 source,
                 target,
             } => {
-                events.push_back(TransportEvent::SendData {
+                on_event(TransportEvent::SendData {
                     socket,
                     data,
                     source,
@@ -371,11 +385,11 @@ impl Transport {
         }
     }
 
-    pub(crate) fn pop_event(&mut self) -> Option<TransportEvent> {
-        self.events.pop_front()
-    }
-
-    pub(crate) fn receive(&mut self, pkt: &mut ReceivedPkt) -> ReceivedPacket {
+    pub(crate) fn receive(
+        &mut self,
+        mut on_event: impl FnMut(TransportEvent),
+        pkt: &mut ReceivedPkt,
+    ) -> ReceivedPacket {
         match PacketKind::identify(&pkt.data) {
             PacketKind::Rtp => {
                 // Handle incoming RTP packet
@@ -407,7 +421,7 @@ impl Transport {
                 if let Some(ice_agent) = &mut self.ice_agent {
                     ice_agent.receive(
                         Self::handle_ice_event(
-                            &mut self.events,
+                            on_event,
                             &mut self.remote_rtp_address,
                             &mut self.remote_rtcp_address,
                         ),
@@ -418,17 +432,21 @@ impl Transport {
                 ReceivedPacket::TransportSpecific
             }
             PacketKind::Dtls => {
+                println!("received dtls1");
+
                 // We only expect DTLS traffic on the rtp socket
                 if pkt.socket != SocketUse::Rtp {
                     return ReceivedPacket::TransportSpecific;
                 }
+
+                println!("received dtls");
 
                 if let TransportKind::DtlsSrtp { dtls, srtp, .. } = &mut self.kind {
                     dtls.receive(pkt.data.clone());
 
                     if let Some((inbound, outbound)) = dtls.handshake().unwrap() {
                         Self::update_connection_state(
-                            &mut self.events,
+                            &mut on_event,
                             &mut self.state,
                             ConnectionState::Connected,
                         );
@@ -437,7 +455,7 @@ impl Transport {
                     }
 
                     while let Some(data) = dtls.pop_to_send() {
-                        self.events.push_back(TransportEvent::SendData {
+                        on_event(TransportEvent::SendData {
                             socket: SocketUse::Rtp,
                             data,
                             source: None, // TODO: set this
@@ -489,12 +507,12 @@ impl Transport {
 
     // Set the a new connection state and emit an event if the state differs from the old one
     fn update_connection_state(
-        events: &mut VecDeque<TransportEvent>,
+        mut on_event: impl FnMut(TransportEvent),
         state: &mut ConnectionState,
         new: ConnectionState,
     ) {
         if *state != new {
-            events.push_back(TransportEvent::ConnectionState {
+            on_event(TransportEvent::ConnectionState {
                 old: *state,
                 new: ConnectionState::Connected,
             });
@@ -516,4 +534,72 @@ pub(crate) enum ReceivedPacket {
 pub enum SocketUse {
     Rtp = 1,
     Rtcp = 2,
+}
+
+fn resolve_rtp_and_rtcp_address(
+    remote_session_description: &SessionDescription,
+    remote_media_description: &MediaDescription,
+) -> Result<(SocketAddr, SocketAddr), Error> {
+    let connection = remote_media_description
+        .connection
+        .as_ref()
+        .or(remote_session_description.connection.as_ref())
+        .unwrap();
+
+    let remote_rtp_address = connection.address.clone();
+    let remote_rtp_port = remote_media_description.media.port;
+
+    let (remote_rtcp_address, remote_rtcp_port) =
+        rtcp_address_and_port(remote_media_description, connection);
+
+    let remote_rtp_address = resolve_tagged_address(&remote_rtp_address, remote_rtp_port)?;
+    let remote_rtcp_address = resolve_tagged_address(&remote_rtcp_address, remote_rtcp_port)?;
+
+    Ok((remote_rtp_address, remote_rtcp_address))
+}
+
+fn rtcp_address_and_port(
+    remote_media_description: &MediaDescription,
+    connection: &Connection,
+) -> (TaggedAddress, u16) {
+    if remote_media_description.rtcp_mux {
+        return (
+            connection.address.clone(),
+            remote_media_description.media.port,
+        );
+    }
+
+    if let Some(rtcp_addr) = &remote_media_description.rtcp {
+        let address = rtcp_addr
+            .address
+            .clone()
+            .unwrap_or_else(|| connection.address.clone());
+
+        return (address, rtcp_addr.port);
+    }
+
+    (
+        connection.address.clone(),
+        remote_media_description.media.port + 1,
+    )
+}
+
+fn resolve_tagged_address(address: &TaggedAddress, port: u16) -> io::Result<SocketAddr> {
+    // TODO: do not resolve here directly
+    match address {
+        TaggedAddress::IP4(ipv4_addr) => Ok(SocketAddr::from((*ipv4_addr, port))),
+        TaggedAddress::IP4FQDN(bytes_str) => (bytes_str.as_str(), port)
+            .to_socket_addrs()?
+            .find(SocketAddr::is_ipv4)
+            .ok_or_else(|| {
+                io::Error::other(format!("Failed to find IPv4 address for {bytes_str}"))
+            }),
+        TaggedAddress::IP6(ipv6_addr) => Ok(SocketAddr::from((*ipv6_addr, port))),
+        TaggedAddress::IP6FQDN(bytes_str) => (bytes_str.as_str(), port)
+            .to_socket_addrs()?
+            .find(SocketAddr::is_ipv6)
+            .ok_or_else(|| {
+                io::Error::other(format!("Failed to find IPv6 address for {bytes_str}"))
+            }),
+    }
 }

@@ -1,3 +1,4 @@
+use base64::Engine;
 use bytesstr::BytesStr;
 use ezk_session::{AsyncSdpSession, Codec, Codecs};
 use sdp_types::{Direction, MediaType, SessionDescription};
@@ -167,23 +168,6 @@ async fn add_video_stream(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // let mut ice = ezk_session::ice::IceAgent::new(true);
-
-    // for (_, ip) in local_ip_address::linux::list_afinet_netifas().unwrap() {
-    //     ice.add_host_addr(1, SocketAddr::new(ip, 52356));
-    //     ice.add_remote_candidtae(IceCandidate {
-    //         foundation: 1.to_string().into(),
-    //         component: 1,
-    //         transport: "UDP".into(),
-    //         priority: 2126511876,
-    //         address: sdp_types::UntaggedAddress::IpAddress(ip),
-    //         port: 50222,
-    //         typ: "host".into(),
-    //         rel_addr: None,
-    //         rel_port: None,
-    //         unknown: vec![],
-    //     });
-    // }
     env_logger::init();
 
     let mut builder = Endpoint::builder();
@@ -218,7 +202,7 @@ async fn main() -> Result<()> {
     );
 
     let mut sess = AsyncSdpSession::new("172.23.97.79".parse().unwrap());
-
+    sess.add_stun_server("15.197.250.192:3478".parse().unwrap());
     let audio_id = sess.add_local_media(
         Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),
         1,
@@ -232,11 +216,11 @@ async fn main() -> Result<()> {
     invite.body = offer.to_string().into();
 
     initiator.send_invite(invite).await.unwrap();
-    while let Ok(x) = initiator.receive().await {
-        match dbg!(x) {
+    while let Ok(response) = initiator.receive().await {
+        match response {
             Response::Provisional(..) => {}
             Response::Failure(..) => break,
-            Response::Early(e, res, rseq) => todo!(),
+            Response::Early(..) => todo!(),
             Response::Session(session, tsx_response) => {
                 let mut x = create_ack(&session.dialog, tsx_response.base_headers.cseq.cseq)
                     .await
@@ -245,6 +229,15 @@ async fn main() -> Result<()> {
                 x.msg.headers.insert("Max-Forwards", "70");
 
                 endpoint.send_outgoing_request(&mut x).await.unwrap();
+
+                let answer = SessionDescription::parse(
+                    &BytesStr::from_utf8_bytes(tsx_response.body).unwrap(),
+                )
+                .unwrap();
+
+                sess.receive_sdp_answer(answer).await.unwrap();
+
+                sess.run().await.unwrap();
             }
             Response::Finished => break,
         };

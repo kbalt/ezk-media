@@ -1,17 +1,19 @@
 use super::{
     dtls_srtp::{to_openssl_digest, DtlsSetup, DtlsSrtpSession},
+    resolve_rtp_and_rtcp_address,
     sdes_srtp::{self, SdesSrtpOffer},
-    ReceivedPacket, SessionTransportState, Transport, TransportEvent, TransportKind,
-    TransportRequiredChanges,
+    IceAgent, IceEvent, ReceivedPacket, SessionTransportState, Transport, TransportEvent,
+    TransportKind, TransportRequiredChanges,
 };
 use crate::{
-    ice::{IceAgentBuilder, IceCredentials},
+    ice::{self, IceCredentials},
     rtp::RtpExtensionIds,
     ConnectionState, ReceivedPkt, RtcpMuxPolicy, TransportType,
 };
 use core::panic;
 use sdp_types::{Fingerprint, MediaDescription, SessionDescription, Setup};
-use std::{collections::VecDeque, net::SocketAddr, time::Instant};
+use std::time::{Duration, Instant};
+use stun_types::{is_stun_message, IsStunMessageInfo};
 
 /// Builder for a transport which has yet to be negotiated
 pub(crate) struct TransportBuilder {
@@ -20,15 +22,11 @@ pub(crate) struct TransportBuilder {
 
     kind: TransportBuilderKind,
 
-    pub(crate) ice_agent: Option<IceAgentBuilder>,
+    pub(crate) ice_agent: Option<IceAgent>,
 
     // Backlog of messages received before the SDP answer has been received
     backlog: Vec<ReceivedPkt>,
 }
-
-compile_error!(
-    "transport builder now also needs an event queue... use callback just like with ice?"
-);
 
 enum TransportBuilderKind {
     Rtp,
@@ -69,10 +67,22 @@ impl TransportBuilder {
             },
         };
 
+        let ice_agent = if offer_ice {
+            let mut ice_agent = IceAgent::new_for_offer(state.ice_credentials(), true);
+
+            for server in &state.stun_servers {
+                ice_agent.add_stun_server(*server);
+            }
+
+            Some(ice_agent)
+        } else {
+            None
+        };
+
         Self {
             local_rtp_port: None,
             local_rtcp_port: None,
-            ice_agent: offer_ice.then(|| IceAgentBuilder::new(true)),
+            ice_agent,
             kind,
             backlog: vec![],
         }
@@ -91,6 +101,17 @@ impl TransportBuilder {
                 desc.fingerprint.extend_from_slice(fingerprint);
             }
         }
+
+        if let Some(ice_agent) = &self.ice_agent {
+            desc.ice_candidates.extend(ice_agent.ice_candidates());
+            desc.ice_ufrag = Some(sdp_types::IceUsernameFragment {
+                ufrag: ice_agent.credentials().ufrag.clone().into(),
+            });
+            desc.ice_pwd = Some(sdp_types::IcePassword {
+                pwd: ice_agent.credentials().pwd.clone().into(),
+            });
+            desc.ice_end_of_candidates = true;
+        }
     }
 
     pub(crate) fn type_(&self) -> TransportType {
@@ -101,16 +122,37 @@ impl TransportBuilder {
         }
     }
 
-    pub(crate) fn poll(&mut self) {
+    pub(crate) fn timeout(&self, now: Instant) -> Option<Duration> {
+        if let Some(ice_agent) = &self.ice_agent {
+            ice_agent.timeout(now)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn poll(&mut self, mut on_event: impl FnMut(TransportEvent)) {
         if let Some(ice_agent) = &mut self.ice_agent {
-            ice_agent.poll(Instant::now(), |event| {});
+            ice_agent.poll(|event| match event {
+                IceEvent::UseAddr { .. } => unreachable!(),
+                IceEvent::SendData {
+                    socket,
+                    data,
+                    source,
+                    target,
+                } => on_event(TransportEvent::SendData {
+                    socket,
+                    data,
+                    source,
+                    target,
+                }),
+            });
         }
     }
 
     pub(crate) fn receive(&mut self, pkt: ReceivedPkt) {
         if let Some(ice_agent) = &mut self.ice_agent {
-            if ice_agent.receive(&pkt) {
-                // message has been handled by the ice-agent, return
+            if matches!(is_stun_message(&pkt.data), IsStunMessageInfo::Yes { .. }) {
+                ice_agent.receive(|_| unreachable!(), &pkt);
                 return;
             }
         }
@@ -126,13 +168,15 @@ impl TransportBuilder {
 
     pub(crate) fn build_from_answer(
         mut self,
+        mut on_event: impl FnMut(TransportEvent),
         state: &mut SessionTransportState,
         mut required_changes: TransportRequiredChanges<'_>,
         session_desc: &SessionDescription,
         remote_media_desc: &MediaDescription,
-        remote_rtp_address: SocketAddr,
-        remote_rtcp_address: SocketAddr,
     ) -> Transport {
+        let (remote_rtp_address, remote_rtcp_address) =
+            resolve_rtp_and_rtcp_address(session_desc, remote_media_desc).unwrap();
+
         // Remove RTCP socket if the answer has rtcp-mux set
         if remote_media_desc.rtcp_mux && self.local_rtcp_port.is_some() {
             required_changes.remove_rtcp_socket();
@@ -149,21 +193,25 @@ impl TransportBuilder {
             .as_ref()
             .or(remote_media_desc.ice_pwd.as_ref());
 
-        let ice_agent =
-            if let Some((ice_agent, (ufrag, pwd))) = self.ice_agent.zip(ice_ufrag.zip(ice_pwd)) {
-                let mut ice_agent = ice_agent.build(IceCredentials {
-                    ufrag: ufrag.ufrag.to_string(),
-                    pwd: pwd.pwd.to_string(),
-                });
+        println!("abc123");
 
-                for candidate in &remote_media_desc.ice_candidates {
-                    ice_agent.add_remote_candidate(candidate);
-                }
+        let ice_agent = if let Some((mut ice_agent, (ufrag, pwd))) =
+            self.ice_agent.zip(ice_ufrag.zip(ice_pwd))
+        {
+            println!("abc1235576");
+            ice_agent.set_remote_credentials(IceCredentials {
+                ufrag: ufrag.ufrag.to_string(),
+                pwd: pwd.pwd.to_string(),
+            });
 
-                Some(ice_agent)
-            } else {
-                None
-            };
+            for candidate in &remote_media_desc.ice_candidates {
+                ice_agent.add_remote_candidate(candidate);
+            }
+
+            Some(ice_agent)
+        } else {
+            None
+        };
 
         let mut transport = match self.kind {
             TransportBuilderKind::Rtp => Transport {
@@ -176,7 +224,6 @@ impl TransportBuilder {
                 extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                 state: ConnectionState::Connected,
                 kind: TransportKind::Rtp,
-                events: VecDeque::new(),
             },
             TransportBuilderKind::SdesSrtp(offer) => {
                 let (crypto, inbound, outbound) = offer.receive_answer(&remote_media_desc.crypto);
@@ -195,7 +242,6 @@ impl TransportBuilder {
                         inbound,
                         outbound,
                     },
-                    events: VecDeque::new(),
                 }
             }
             TransportBuilderKind::DtlsSrtp { fingerprint } => {
@@ -233,13 +279,12 @@ impl TransportBuilder {
                         dtls,
                         srtp: None,
                     },
-                    events: VecDeque::new(),
                 }
             }
         };
 
         if transport.state != ConnectionState::New {
-            transport.events.push_back(TransportEvent::ConnectionState {
+            on_event(TransportEvent::ConnectionState {
                 old: ConnectionState::New,
                 new: transport.state,
             });
@@ -247,7 +292,7 @@ impl TransportBuilder {
 
         // Feed the already received messages into the transport
         for mut pkt in self.backlog {
-            match transport.receive(&mut pkt) {
+            match transport.receive(&mut on_event, &mut pkt) {
                 ReceivedPacket::Rtp => todo!("handle early rtp"),
                 ReceivedPacket::Rtcp => todo!("handle early rtcp"),
                 ReceivedPacket::TransportSpecific => {}

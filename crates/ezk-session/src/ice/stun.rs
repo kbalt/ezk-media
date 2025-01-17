@@ -6,8 +6,8 @@ use std::{
 };
 use stun_types::{
     attributes::{
-        Fingerprint, IceControlled, IceControlling, MessageIntegrity, MessageIntegrityKey,
-        Priority, Username, XorMappedAddress,
+        ErrorCode, Fingerprint, IceControlled, IceControlling, MessageIntegrity,
+        MessageIntegrityKey, Priority, Username, XorMappedAddress,
     },
     Class, Message, MessageBuilder, Method, TransactionId,
 };
@@ -110,11 +110,59 @@ pub(super) fn make_success_response(
     stun_message.finish()
 }
 
-pub(crate) fn verify_integrity(
+pub(super) fn make_role_error(
+    transaction_id: TransactionId,
     local_credentials: &IceCredentials,
     remote_credentials: &IceCredentials,
+    source: SocketAddr,
+    is_controlling: bool,
+    control_tie_breaker: u64,
+) -> Vec<u8> {
+    let mut stun_message = MessageBuilder::new(Class::Success, Method::Binding, transaction_id);
+
+    let username = format!("{}:{}", local_credentials.ufrag, remote_credentials.ufrag);
+
+    stun_message.add_attr(&Username::new(&username)).unwrap();
+
+    stun_message
+        .add_attr(&ErrorCode {
+            number: 487,
+            reason: "Role Conflict",
+        })
+        .unwrap();
+
+    if is_controlling {
+        stun_message
+            .add_attr(&IceControlling(control_tie_breaker))
+            .unwrap();
+    } else {
+        stun_message
+            .add_attr(&IceControlled(control_tie_breaker))
+            .unwrap();
+    }
+
+    stun_message.add_attr(&XorMappedAddress(source)).unwrap();
+    stun_message
+        .add_attr_with(
+            &MessageIntegrity::default(),
+            &MessageIntegrityKey::new_raw(Cow::Borrowed(remote_credentials.pwd.as_bytes())),
+        )
+        .unwrap();
+
+    stun_message.add_attr(&Fingerprint).unwrap();
+
+    stun_message.finish()
+}
+
+pub(crate) fn verify_integrity(
+    local_credentials: &IceCredentials,
+    remote_credentials: &Option<IceCredentials>,
     stun_msg: &mut Message,
 ) -> bool {
+    let Some(remote_credentials) = remote_credentials else {
+        return false;
+    };
+
     let is_request = match stun_msg.class() {
         Class::Request | Class::Indication => true,
         Class::Success | Class::Error => false,
@@ -244,7 +292,7 @@ impl StunServerBinding {
                 });
             }
             StunServerBindingState::WaitingForRefresh { refresh_at, .. } => {
-                if *refresh_at > now {
+                if now > *refresh_at {
                     self.start_binding_request(now, stun_config, on_event);
                 }
             }
