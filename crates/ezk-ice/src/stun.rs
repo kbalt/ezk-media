@@ -1,5 +1,5 @@
-use super::{Candidate, IceCredentials, IceEvent};
-use crate::{transport::SocketUse, ReceivedPkt};
+use super::{Candidate, IceCredentials, IceEvent, ReceivedPkt};
+use crate::SocketUse;
 use std::{
     cmp::min,
     net::SocketAddr,

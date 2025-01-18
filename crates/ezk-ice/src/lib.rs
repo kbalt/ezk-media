@@ -1,4 +1,3 @@
-use crate::{opt_min, transport::SocketUse, ReceivedPkt};
 use core::fmt;
 use rand::distributions::{Alphanumeric, DistString};
 use sdp_types::{IceCandidate, UntaggedAddress};
@@ -21,12 +20,30 @@ use stun_types::{
 
 mod stun;
 
+/// A message received on a UDP socket
+pub struct ReceivedPkt {
+    /// The received data
+    pub data: Vec<u8>,
+    /// Source address of the message
+    pub source: SocketAddr,
+    /// Local socket destination address of the message
+    pub destination: SocketAddr,
+    /// Intended usage of the socket
+    pub socket: SocketUse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SocketUse {
+    Rtp = 1,
+    Rtcp = 2,
+}
+
 new_key_type!(
     struct LocalCandidateId;
     struct RemoteCandidateId;
 );
 
-pub(crate) enum IceEvent {
+pub enum IceEvent {
     UseAddr {
         socket: SocketUse,
         target: SocketAddr,
@@ -39,7 +56,7 @@ pub(crate) enum IceEvent {
     },
 }
 
-pub(crate) struct IceAgent {
+pub struct IceAgent {
     stun_config: StunConfig,
 
     local_credentials: IceCredentials,
@@ -177,7 +194,7 @@ impl IceCredentials {
 }
 
 impl IceAgent {
-    pub(crate) fn new_from_answer(
+    pub fn new_from_answer(
         local_credentials: IceCredentials,
         remote_credentials: IceCredentials,
         is_controlling: bool,
@@ -202,7 +219,7 @@ impl IceAgent {
         }
     }
 
-    pub(crate) fn new_for_offer(
+    pub fn new_for_offer(
         local_credentials: IceCredentials,
         is_controlling: bool,
         rtcp_mux: bool,
@@ -226,7 +243,7 @@ impl IceAgent {
         }
     }
 
-    pub(crate) fn set_remote_data(
+    pub fn set_remote_data(
         &mut self,
         credentials: IceCredentials,
         candidates: &[IceCandidate],
@@ -249,11 +266,11 @@ impl IceAgent {
         }
     }
 
-    pub(crate) fn credentials(&self) -> &IceCredentials {
+    pub fn credentials(&self) -> &IceCredentials {
         &self.local_credentials
     }
 
-    pub(crate) fn add_host_addr(&mut self, socket: SocketUse, addr: SocketAddr) {
+    pub fn add_host_addr(&mut self, socket: SocketUse, addr: SocketAddr) {
         if addr.ip().is_loopback() || addr.ip().is_unspecified() {
             return;
         }
@@ -268,7 +285,7 @@ impl IceAgent {
         self.add_local_candidate(socket, CandidateKind::Host, addr, addr);
     }
 
-    pub(crate) fn add_stun_server(&mut self, server: SocketAddr) {
+    pub fn add_stun_server(&mut self, server: SocketAddr) {
         self.stun_server
             .push(StunServerBinding::new(server, SocketUse::Rtp));
 
@@ -330,7 +347,7 @@ impl IceAgent {
         self.form_pairs();
     }
 
-    pub(crate) fn add_remote_candidate(&mut self, candidate: &IceCandidate) {
+    pub fn add_remote_candidate(&mut self, candidate: &IceCandidate) {
         let kind = match candidate.typ.as_str() {
             "host" => CandidateKind::Host,
             "srflx" => CandidateKind::ServerReflexive,
@@ -479,7 +496,7 @@ impl IceAgent {
     }
 
     /// Receive network packets for this ICE agent
-    pub(crate) fn receive(&mut self, on_event: impl FnMut(IceEvent), pkt: &ReceivedPkt) {
+    pub fn receive(&mut self, on_event: impl FnMut(IceEvent), pkt: &ReceivedPkt) {
         // TODO: avoid clone here, this should be free
         let mut stun_msg = Message::parse(pkt.data.clone()).unwrap();
 
@@ -823,7 +840,7 @@ impl IceAgent {
         }
     }
 
-    pub(crate) fn poll(&mut self, mut on_event: impl FnMut(IceEvent)) {
+    pub fn poll(&mut self, mut on_event: impl FnMut(IceEvent)) {
         let now = Instant::now();
 
         // Handle pending stun retransmissions
@@ -1033,7 +1050,7 @@ impl IceAgent {
         }
     }
 
-    pub(crate) fn timeout(&self, now: Instant) -> Option<Duration> {
+    pub fn timeout(&self, now: Instant) -> Option<Duration> {
         // Next TA trigger
         let ta = self
             .last_ta_trigger
@@ -1049,7 +1066,7 @@ impl IceAgent {
         opt_min(ta, stun_bindings)
     }
 
-    pub(crate) fn ice_candidates(&self) -> Vec<IceCandidate> {
+    pub fn ice_candidates(&self) -> Vec<IceCandidate> {
         self.local_candidates
             .values()
             .filter(|c| matches!(c.kind, CandidateKind::Host | CandidateKind::ServerReflexive))
@@ -1135,19 +1152,11 @@ impl fmt::Display for DisplayPair<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn initial_timeout() {
-        let ice_agent = IceAgent::new_from_answer(
-            IceCredentials::random(),
-            IceCredentials::random(),
-            true,
-            true,
-        );
-
-        assert_eq!(ice_agent.timeout(Instant::now()), Some(Duration::ZERO));
+fn opt_min<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (None, None) => None,
+        (None, Some(b)) => Some(b),
+        (Some(a), None) => Some(a),
+        (Some(a), Some(b)) => Some(min(a, b)),
     }
 }

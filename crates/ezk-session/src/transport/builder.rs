@@ -5,11 +5,9 @@ use super::{
     IceAgent, IceEvent, ReceivedPacket, SessionTransportState, Transport, TransportEvent,
     TransportKind, TransportRequiredChanges,
 };
-use crate::{
-    ice::IceCredentials, rtp::RtpExtensionIds, ConnectionState, ReceivedPkt, RtcpMuxPolicy,
-    TransportType,
-};
+use crate::{rtp::RtpExtensionIds, ConnectionState, ReceivedPkt, RtcpMuxPolicy, TransportType};
 use core::panic;
+use ezk_ice::IceCredentials;
 use sdp_types::{Fingerprint, MediaDescription, SessionDescription, Setup};
 use std::time::{Duration, Instant};
 use stun_types::{is_stun_message, IsStunMessageInfo};

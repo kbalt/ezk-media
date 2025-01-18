@@ -1,0 +1,15 @@
+[package]
+name = "ezk-ice"
+version = "0.1.0"
+description = "ICE implementation"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+stun-types = { path = "../../../ezk/crates/stun-types", package = "ezk-stun-types" }
+sdp-types = { git = "https://github.com/kbalt/ezk", package = "ezk-sdp-types" }
+rand = "0.8"
+slotmap = "1.0.7"
+log = "0.4"

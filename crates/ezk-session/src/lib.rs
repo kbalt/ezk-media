@@ -2,8 +2,8 @@
 
 use bytesstr::BytesStr;
 use events::{TransportChange, TransportRequiredChanges};
+use ezk_ice::{IceAgent, ReceivedPkt, SocketUse};
 use ezk_rtp::{rtcp_types::Compound, RtpPacket, RtpSession};
-use ice::IceAgent;
 use local_media::LocalMedia;
 use rtp::RtpExtensions;
 use sdp_types::{
@@ -20,14 +20,12 @@ use std::{
     time::{Duration, Instant},
 };
 use transport::{
-    ReceivedPacket, SessionTransportState, SocketUse, Transport, TransportBuilder, TransportEvent,
+    ReceivedPacket, SessionTransportState, Transport, TransportBuilder, TransportEvent,
 };
 
+mod async_wrapper;
 mod codecs;
 mod events;
-// TODO: make private
-mod async_wrapper;
-pub mod ice;
 mod local_media;
 mod options;
 mod rtp;
@@ -277,18 +275,6 @@ enum SdpResponseEntry {
         media_type: MediaType,
         mid: Option<BytesStr>,
     },
-}
-
-/// A message received on a UDP socket
-pub struct ReceivedPkt {
-    /// The received data
-    pub data: Vec<u8>,
-    /// Source address of the message
-    pub source: SocketAddr,
-    /// Local socket destination address of the message
-    pub destination: SocketAddr,
-    /// Intended usage of the socket
-    pub socket: SocketUse,
 }
 
 impl SdpSession {

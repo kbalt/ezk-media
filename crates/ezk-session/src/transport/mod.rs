@@ -1,11 +1,9 @@
 use crate::{
-    events::TransportRequiredChanges,
-    ice::{IceAgent, IceCredentials, IceEvent},
-    opt_min,
-    rtp::RtpExtensionIds,
-    ConnectionState, Error, ReceivedPkt, TransportType,
+    events::TransportRequiredChanges, opt_min, rtp::RtpExtensionIds, ConnectionState, Error,
+    TransportType,
 };
 use dtls_srtp::{make_ssl_context, DtlsSetup, DtlsSrtpSession};
+use ezk_ice::{IceAgent, IceCredentials, IceEvent, ReceivedPkt, SocketUse};
 use openssl::{hash::MessageDigest, ssl::SslContext};
 use sdp_types::{
     Connection, Fingerprint, FingerprintAlgorithm, MediaDescription, SessionDescription, Setup,
@@ -529,12 +527,6 @@ pub(crate) enum ReceivedPacket {
     Rtp,
     Rtcp,
     TransportSpecific,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SocketUse {
-    Rtp = 1,
-    Rtcp = 2,
 }
 
 fn resolve_rtp_and_rtcp_address(

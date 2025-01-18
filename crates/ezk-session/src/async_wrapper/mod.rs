@@ -1,7 +1,7 @@
 use crate::{
-    events::TransportChange, transport::SocketUse, Codecs, Event, LocalMediaId, MediaId, Options,
-    ReceivedPkt, SocketId,
+    events::TransportChange, Codecs, Event, LocalMediaId, MediaId, Options, ReceivedPkt, SocketId,
 };
+use ezk_ice::SocketUse;
 use sdp_types::{Direction, SessionDescription};
 use socket::Socket;
 use std::{
