@@ -136,12 +136,12 @@ impl TransportBuilder {
             ice_agent.poll(|event| match event {
                 IceEvent::UseAddr { .. } => unreachable!(),
                 IceEvent::SendData {
-                    socket,
+                    component,
                     data,
                     source,
                     target,
                 } => on_event(TransportEvent::SendData {
-                    socket,
+                    component,
                     data,
                     source,
                     target,

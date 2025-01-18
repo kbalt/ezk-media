@@ -2,7 +2,7 @@
 
 use bytesstr::BytesStr;
 use events::{TransportChange, TransportRequiredChanges};
-use ezk_ice::{IceAgent, ReceivedPkt, SocketUse};
+use ezk_ice::{Component, IceAgent, ReceivedPkt};
 use ezk_rtp::{rtcp_types::Compound, RtpPacket, RtpSession};
 use local_media::LocalMedia;
 use rtp::RtpExtensions;
@@ -54,7 +54,7 @@ slotmap::new_key_type! {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SocketId(pub TransportId, pub SocketUse);
+pub struct SocketId(pub TransportId, pub Component);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -1041,10 +1041,10 @@ impl SdpSession {
 
         if let Some(ice_agent) = transport.ice_agent_mut() {
             for ip in ip_addrs {
-                ice_agent.add_host_addr(SocketUse::Rtp, SocketAddr::new(*ip, rtp_port));
+                ice_agent.add_host_addr(Component::Rtp, SocketAddr::new(*ip, rtp_port));
 
                 if let Some(rtcp_port) = rtcp_port {
-                    ice_agent.add_host_addr(SocketUse::Rtcp, SocketAddr::new(*ip, rtcp_port));
+                    ice_agent.add_host_addr(Component::Rtcp, SocketAddr::new(*ip, rtcp_port));
                 }
             }
         }
@@ -1140,13 +1140,13 @@ impl SdpSession {
                     }
                 }
                 TransportEvent::SendData {
-                    socket,
+                    component,
                     data,
                     source,
                     target,
                 } => {
                     events.push(Event::SendData {
-                        socket: SocketId(transport_id, socket),
+                        socket: SocketId(transport_id, component),
                         data,
                         source,
                         target,
@@ -1248,7 +1248,7 @@ impl SdpSession {
         transport.protect_rtp(&mut packet);
 
         self.events.push(Event::SendData {
-            socket: SocketId(media.transport, SocketUse::Rtp),
+            socket: SocketId(media.transport, Component::Rtp),
             data: packet,
             source: None, // TODO: set this according to the transport
             target: transport.remote_rtp_address,
@@ -1271,9 +1271,9 @@ fn send_rtcp_report(events: &mut Events, transport: &mut Transport, media: &mut 
     transport.protect_rtcp(&mut encode_buf);
 
     let socket_use = if transport.rtcp_mux {
-        SocketUse::Rtp
+        Component::Rtp
     } else {
-        SocketUse::Rtcp
+        Component::Rtcp
     };
 
     events.push(Event::SendData {

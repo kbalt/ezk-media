@@ -3,7 +3,7 @@ use crate::{
     TransportType,
 };
 use dtls_srtp::{make_ssl_context, DtlsSetup, DtlsSrtpSession};
-use ezk_ice::{IceAgent, IceCredentials, IceEvent, ReceivedPkt, SocketUse};
+use ezk_ice::{Component, IceAgent, IceCredentials, IceEvent, ReceivedPkt};
 use openssl::{hash::MessageDigest, ssl::SslContext};
 use sdp_types::{
     Connection, Fingerprint, FingerprintAlgorithm, MediaDescription, SessionDescription, Setup,
@@ -67,7 +67,7 @@ pub(crate) enum TransportEvent {
         new: ConnectionState,
     },
     SendData {
-        socket: SocketUse,
+        component: Component,
         data: Vec<u8>,
         source: Option<IpAddr>,
         target: SocketAddr,
@@ -252,7 +252,7 @@ impl Transport {
         // TODO: Delay this until ice-agent is ready if one is used
         while let Some(data) = dtls.pop_to_send() {
             events.push_back(TransportEvent::SendData {
-                socket: SocketUse::Rtp,
+                component: Component::Rtp,
                 data,
                 source: None,
                 target: remote_rtp_address,
@@ -339,7 +339,7 @@ impl Transport {
 
                 while let Some(data) = dtls.pop_to_send() {
                     on_event(TransportEvent::SendData {
-                        socket: SocketUse::Rtp,
+                        component: Component::Rtp,
                         data,
                         source: None, // TODO: set this
                         target: self.remote_rtp_address,
@@ -364,18 +364,18 @@ impl Transport {
         remote_rtcp_address: &'a mut SocketAddr,
     ) -> impl FnMut(IceEvent) + use<'a, F> {
         move |event| match event {
-            IceEvent::UseAddr { socket, target } => match socket {
-                SocketUse::Rtp => *remote_rtp_address = target,
-                SocketUse::Rtcp => *remote_rtcp_address = target,
+            IceEvent::UseAddr { component, target } => match component {
+                Component::Rtp => *remote_rtp_address = target,
+                Component::Rtcp => *remote_rtcp_address = target,
             },
             IceEvent::SendData {
-                socket,
+                component,
                 data,
                 source,
                 target,
             } => {
                 on_event(TransportEvent::SendData {
-                    socket,
+                    component,
                     data,
                     source,
                     target,
@@ -434,7 +434,7 @@ impl Transport {
                 println!("received dtls1");
 
                 // We only expect DTLS traffic on the rtp socket
-                if pkt.socket != SocketUse::Rtp {
+                if pkt.component != Component::Rtp {
                     return ReceivedPacket::TransportSpecific;
                 }
 
@@ -455,7 +455,7 @@ impl Transport {
 
                     while let Some(data) = dtls.pop_to_send() {
                         on_event(TransportEvent::SendData {
-                            socket: SocketUse::Rtp,
+                            component: Component::Rtp,
                             data,
                             source: None, // TODO: set this
                             target: self.remote_rtp_address,

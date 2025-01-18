@@ -28,13 +28,16 @@ pub struct ReceivedPkt {
     pub source: SocketAddr,
     /// Local socket destination address of the message
     pub destination: SocketAddr,
-    /// Intended usage of the socket
-    pub socket: SocketUse,
+    /// On which component socket this was received
+    pub component: Component,
 }
 
+/// Component of the data stream
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SocketUse {
+pub enum Component {
+    /// The RTP component of the data stream. This will also contain RTCP if rtcp-mux is enabled.
     Rtp = 1,
+    /// The RTCP component of the data stream. This will not be used if rtcp-mux is enabled.
     Rtcp = 2,
 }
 
@@ -45,11 +48,11 @@ new_key_type!(
 
 pub enum IceEvent {
     UseAddr {
-        socket: SocketUse,
+        component: Component,
         target: SocketAddr,
     },
     SendData {
-        socket: SocketUse,
+        component: Component,
         data: Vec<u8>,
         source: Option<IpAddr>,
         target: SocketAddr,
@@ -130,8 +133,7 @@ struct Candidate {
     priority: u32,
     foundation: String,
 
-    /// In the ICE world this would be the component, here we're just tracking RTP/RTCP
-    socket: SocketUse,
+    component: Component,
 
     // The transport address that an ICE agent sends from for a particular candidate.
     // For host, server-reflexive, and peer-reflexive candidates, the base is the same as the host candidate.
@@ -145,7 +147,7 @@ struct CandidatePair {
     remote: RemoteCandidateId,
     priority: u64,
     state: CandidatePairState,
-    socket: SocketUse,
+    component: Component,
 
     // Nominated by the peer
     received_use_candidate: bool,
@@ -254,9 +256,9 @@ impl IceAgent {
 
         // Remove all rtcp candidates and stun server bindings rtcp-mux is enabled
         if rtcp_mux {
-            self.stun_server.retain(|s| s.socket() == SocketUse::Rtp);
+            self.stun_server.retain(|s| s.component() == Component::Rtp);
             self.local_candidates
-                .retain(|_, c| c.socket == SocketUse::Rtp);
+                .retain(|_, c| c.component == Component::Rtp);
         }
 
         self.remote_credentials = Some(credentials);
@@ -270,7 +272,7 @@ impl IceAgent {
         &self.local_credentials
     }
 
-    pub fn add_host_addr(&mut self, socket: SocketUse, addr: SocketAddr) {
+    pub fn add_host_addr(&mut self, component: Component, addr: SocketAddr) {
         if addr.ip().is_loopback() || addr.ip().is_unspecified() {
             return;
         }
@@ -282,22 +284,22 @@ impl IceAgent {
             }
         }
 
-        self.add_local_candidate(socket, CandidateKind::Host, addr, addr);
+        self.add_local_candidate(component, CandidateKind::Host, addr, addr);
     }
 
     pub fn add_stun_server(&mut self, server: SocketAddr) {
         self.stun_server
-            .push(StunServerBinding::new(server, SocketUse::Rtp));
+            .push(StunServerBinding::new(server, Component::Rtp));
 
         if !self.rtcp_mux {
             self.stun_server
-                .push(StunServerBinding::new(server, SocketUse::Rtcp));
+                .push(StunServerBinding::new(server, Component::Rtcp));
         }
     }
 
     fn add_local_candidate(
         &mut self,
-        socket: SocketUse,
+        component: Component,
         kind: CandidateKind,
         base: SocketAddr,
         addr: SocketAddr,
@@ -313,7 +315,7 @@ impl IceAgent {
             return;
         }
 
-        log::debug!("add local candidate {socket:?} {kind:?} {addr}");
+        log::debug!("add local candidate {component:?} {kind:?} {addr}");
 
         // Calculate the candidate priority using offsets + count of candidates of the same type
         // (trick that I have stolen from str0m's implementation)
@@ -333,14 +335,14 @@ impl IceAgent {
 
         let kind_preference = (kind as u32) << 24;
         let local_preference = local_preference << 8;
-        let priority = kind_preference + local_preference + (256 - socket as u32);
+        let priority = kind_preference + local_preference + (256 - component as u32);
 
         self.local_candidates.insert(Candidate {
             addr,
             kind,
             priority,
             foundation: compute_foundation(kind, base.ip(), None, "udp").to_string(),
-            socket,
+            component,
             base,
         });
 
@@ -354,10 +356,10 @@ impl IceAgent {
             _ => return,
         };
 
-        let socket = match candidate.component {
-            1 => SocketUse::Rtp,
+        let component = match candidate.component {
+            1 => Component::Rtp,
             // Discard candidates for rtcp is rtcp-mux is enabled
-            2 if !self.rtcp_mux => SocketUse::Rtcp,
+            2 if !self.rtcp_mux => Component::Rtcp,
             _ => {
                 log::debug!(
                     "Discard remote candidate with unsupported component candidate:{candidate}"
@@ -376,7 +378,7 @@ impl IceAgent {
             kind,
             priority: u32::try_from(candidate.priority).unwrap(),
             foundation: candidate.foundation.to_string(),
-            socket,
+            component,
             base: SocketAddr::new(ip, candidate.port), // TODO: do I even need this?
         });
 
@@ -392,7 +394,7 @@ impl IceAgent {
                 }
 
                 // Do not pair candidates with different components
-                if local_candidate.socket != remote_candidate.socket {
+                if local_candidate.component != remote_candidate.component {
                     continue;
                 }
 
@@ -458,9 +460,9 @@ impl IceAgent {
         let priority = pair_priority(local_candidate, remote_candidate, is_controlling);
 
         log::debug!(
-            "add pair {}, priority: {priority}, socket={:?}",
+            "add pair {}, priority: {priority}, component={:?}",
             DisplayPair(local_candidate, remote_candidate),
-            local_candidate.socket,
+            local_candidate.component,
         );
 
         pairs.push(CandidatePair {
@@ -468,7 +470,7 @@ impl IceAgent {
             remote: remote_id,
             priority,
             state: CandidatePairState::Waiting,
-            socket: local_candidate.socket,
+            component: local_candidate.component,
             received_use_candidate,
             nominated: false,
         });
@@ -539,9 +541,9 @@ impl IceAgent {
                 return;
             };
 
-            let socket = stun_server_binding.socket();
+            let component = stun_server_binding.component();
             self.add_local_candidate(
-                socket,
+                component,
                 CandidateKind::ServerReflexive,
                 pkt.destination,
                 addr,
@@ -594,7 +596,7 @@ impl IceAgent {
                 let remote_candidate = &self.remote_candidates[pair.remote];
 
                 on_event(IceEvent::UseAddr {
-                    socket: local_candidate.socket,
+                    component: local_candidate.component,
                     target: remote_candidate.addr,
                 });
             }
@@ -621,9 +623,9 @@ impl IceAgent {
         // Check if we discover a new peer-reflexive candidate here
         let mapped_addr = stun_msg.attribute::<XorMappedAddress>().unwrap().unwrap();
         if mapped_addr.0 != self.local_candidates[pair.local].addr {
-            let socket = pair.socket;
+            let component = pair.component;
             self.add_local_candidate(
-                socket,
+                component,
                 CandidateKind::PeerReflexive,
                 pkt.destination,
                 mapped_addr.0,
@@ -717,7 +719,7 @@ impl IceAgent {
                     );
 
                     on_event(IceEvent::SendData {
-                        socket: pkt.socket,
+                        component: pkt.component,
                         data: response,
                         source: Some(pkt.destination.ip()),
                         target: pkt.source,
@@ -742,7 +744,7 @@ impl IceAgent {
                     );
 
                     on_event(IceEvent::SendData {
-                        socket: pkt.socket,
+                        component: pkt.component,
                         data: response,
                         source: Some(pkt.destination.ip()),
                         target: pkt.source,
@@ -781,7 +783,7 @@ impl IceAgent {
                     kind: CandidateKind::PeerReflexive,
                     priority: priority.0,
                     foundation: "~".into(),
-                    socket: pkt.socket,
+                    component: pkt.component,
                     base: pkt.source,
                 });
 
@@ -828,7 +830,7 @@ impl IceAgent {
         );
 
         on_event(IceEvent::SendData {
-            socket: pair.socket,
+            component: pair.component,
             data: stun_response,
             source: Some(self.local_candidates[local_id].base.ip()),
             target: pkt.source,
@@ -929,7 +931,7 @@ impl IceAgent {
             };
 
             on_event(IceEvent::SendData {
-                socket: pair.socket,
+                component: pair.component,
                 data: stun_request,
                 source: Some(source),
                 target,
@@ -964,7 +966,7 @@ impl IceAgent {
             *retransmit_at += self.stun_config.retransmit_delta(*retransmits);
 
             on_event(IceEvent::SendData {
-                socket: pair.socket,
+                component: pair.component,
                 data: stun_request.clone(),
                 source: Some(*source),
                 target: *target,
@@ -973,21 +975,24 @@ impl IceAgent {
     }
 
     fn poll_nomination(&mut self, mut on_event: impl FnMut(IceEvent)) {
-        self.poll_nomination_of_component(&mut on_event, SocketUse::Rtp);
+        self.poll_nomination_of_component(&mut on_event, Component::Rtp);
 
         if !self.rtcp_mux {
-            self.poll_nomination_of_component(&mut on_event, SocketUse::Rtcp);
+            self.poll_nomination_of_component(&mut on_event, Component::Rtcp);
         }
     }
 
     fn poll_nomination_of_component(
         &mut self,
         mut on_event: impl FnMut(IceEvent),
-        socket: SocketUse,
+        component: Component,
     ) {
         if self.is_controlling {
             // Nothing to do, already nominated a pair
-            let skip = self.pairs.iter().any(|p| p.socket == socket && p.nominated);
+            let skip = self
+                .pairs
+                .iter()
+                .any(|p| p.component == component && p.nominated);
             if skip {
                 return;
             }
@@ -995,7 +1000,9 @@ impl IceAgent {
             let best_pair = self
                 .pairs
                 .iter_mut()
-                .filter(|p| p.socket == socket && matches!(p.state, CandidatePairState::Succeeded))
+                .filter(|p| {
+                    p.component == component && matches!(p.state, CandidatePairState::Succeeded)
+                })
                 .max_by_key(|p| p.priority);
 
             let Some(pair) = best_pair else {
@@ -1030,7 +1037,7 @@ impl IceAgent {
                 .pairs
                 .iter_mut()
                 .filter(|p| {
-                    p.socket == socket
+                    p.component == component
                         && p.received_use_candidate
                         && matches!(p.state, CandidatePairState::Succeeded)
                 })
@@ -1044,7 +1051,7 @@ impl IceAgent {
             pair.nominated = true;
 
             on_event(IceEvent::UseAddr {
-                socket,
+                component,
                 target: self.remote_candidates[pair.remote].addr,
             });
         }
@@ -1079,7 +1086,7 @@ impl IceAgent {
 
                 IceCandidate {
                     foundation: c.foundation.clone().into(),
-                    component: c.socket as _,
+                    component: c.component as _,
                     transport: "UDP".into(),
                     priority: c.priority.into(),
                     address: UntaggedAddress::IpAddress(c.addr.ip()),

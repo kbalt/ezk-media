@@ -1,5 +1,5 @@
 use super::{Candidate, IceCredentials, IceEvent, ReceivedPkt};
-use crate::SocketUse;
+use crate::Component;
 use std::{
     cmp::min,
     net::SocketAddr,
@@ -175,7 +175,7 @@ pub(crate) fn verify_integrity(
 
 pub(crate) struct StunServerBinding {
     server: SocketAddr,
-    socket: SocketUse,
+    component: Component,
     state: StunServerBindingState,
     /// Addresses from last STUN response (local-ip, mapped-addr)
     last_mapped_addr: Option<(SocketAddr, SocketAddr)>,
@@ -198,17 +198,17 @@ enum StunServerBindingState {
 }
 
 impl StunServerBinding {
-    pub(crate) fn new(server: SocketAddr, socket: SocketUse) -> Self {
+    pub(crate) fn new(server: SocketAddr, component: Component) -> Self {
         Self {
             server,
-            socket,
+            component,
             state: StunServerBindingState::Waiting,
             last_mapped_addr: None,
         }
     }
 
-    pub(crate) fn socket(&self) -> SocketUse {
-        self.socket
+    pub(crate) fn component(&self) -> Component {
+        self.component
     }
 
     /// Returns if the binding has either been completed or failed to complete
@@ -267,7 +267,7 @@ impl StunServerBinding {
                 *retransmit_at += stun_config.retransmit_delta(*retransmits);
 
                 on_event(IceEvent::SendData {
-                    socket: self.socket,
+                    component: self.component,
                     data: stun_request.clone(),
                     source: None,
                     target: self.server,
@@ -298,7 +298,7 @@ impl StunServerBinding {
         let stun_request = builder.finish();
 
         on_event(IceEvent::SendData {
-            socket: self.socket,
+            component: self.component,
             data: stun_request.clone(),
             source: None,
             target: self.server,

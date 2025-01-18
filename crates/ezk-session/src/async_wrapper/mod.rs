@@ -1,7 +1,7 @@
 use crate::{
     events::TransportChange, Codecs, Event, LocalMediaId, MediaId, Options, ReceivedPkt, SocketId,
 };
-use ezk_ice::SocketUse;
+use ezk_ice::Component;
 use sdp_types::{Direction, SessionDescription};
 use socket::Socket;
 use std::{
@@ -108,7 +108,7 @@ impl AsyncSdpSession {
                     );
 
                     self.sockets
-                        .insert(SocketId(transport_id, SocketUse::Rtp), Socket::new(socket));
+                        .insert(SocketId(transport_id, Component::Rtp), Socket::new(socket));
                 }
                 TransportChange::CreateSocketPair(transport_id) => {
                     println!("Create socket pair {transport_id:?}");
@@ -124,26 +124,26 @@ impl AsyncSdpSession {
                     );
 
                     self.sockets.insert(
-                        SocketId(transport_id, SocketUse::Rtp),
+                        SocketId(transport_id, Component::Rtp),
                         Socket::new(rtp_socket),
                     );
                     self.sockets.insert(
-                        SocketId(transport_id, SocketUse::Rtcp),
+                        SocketId(transport_id, Component::Rtcp),
                         Socket::new(rtcp_socket),
                     );
                 }
                 TransportChange::Remove(transport_id) => {
                     println!("Remove {transport_id:?}");
 
-                    self.sockets.remove(&SocketId(transport_id, SocketUse::Rtp));
+                    self.sockets.remove(&SocketId(transport_id, Component::Rtp));
                     self.sockets
-                        .remove(&SocketId(transport_id, SocketUse::Rtcp));
+                        .remove(&SocketId(transport_id, Component::Rtcp));
                 }
                 TransportChange::RemoveRtcpSocket(transport_id) => {
                     println!("Remove rtcp socket of {transport_id:?}");
 
                     self.sockets
-                        .remove(&SocketId(transport_id, SocketUse::Rtcp));
+                        .remove(&SocketId(transport_id, Component::Rtcp));
                 }
             }
         }
@@ -196,7 +196,7 @@ impl AsyncSdpSession {
                         data: buf.filled().to_vec(),
                         source,
                         destination: dst,
-                        socket: socket_id.1
+                        component: socket_id.1
                     };
 
                     self.inner.receive(socket_id.0, pkt);
