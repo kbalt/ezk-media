@@ -6,9 +6,8 @@ use super::{
     TransportKind, TransportRequiredChanges,
 };
 use crate::{
-    ice::{self, IceCredentials},
-    rtp::RtpExtensionIds,
-    ConnectionState, ReceivedPkt, RtcpMuxPolicy, TransportType,
+    ice::IceCredentials, rtp::RtpExtensionIds, ConnectionState, ReceivedPkt, RtcpMuxPolicy,
+    TransportType,
 };
 use core::panic;
 use sdp_types::{Fingerprint, MediaDescription, SessionDescription, Setup};
@@ -193,12 +192,9 @@ impl TransportBuilder {
             .as_ref()
             .or(remote_media_desc.ice_pwd.as_ref());
 
-        println!("abc123");
-
         let ice_agent = if let Some((mut ice_agent, (ufrag, pwd))) =
             self.ice_agent.zip(ice_ufrag.zip(ice_pwd))
         {
-            println!("abc1235576");
             ice_agent.set_remote_credentials(IceCredentials {
                 ufrag: ufrag.ufrag.to_string(),
                 pwd: pwd.pwd.to_string(),

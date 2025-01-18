@@ -223,8 +223,6 @@ async fn main() -> Result<()> {
                     .await
                     .unwrap();
 
-                x.msg.headers.insert("Max-Forwards", "70");
-
                 endpoint.send_outgoing_request(&mut x).await.unwrap();
 
                 let answer = SessionDescription::parse(

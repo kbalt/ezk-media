@@ -8,7 +8,7 @@ use std::{
 use stun_types::{
     attributes::{
         ErrorCode, Fingerprint, IceControlled, IceControlling, MessageIntegrity,
-        MessageIntegrityKey, Priority, Username, XorMappedAddress,
+        MessageIntegrityKey, Priority, UseCandidate, Username, XorMappedAddress,
     },
     Class, Message, MessageBuilder, Method, TransactionId,
 };
@@ -52,6 +52,7 @@ pub(super) fn make_binding_request(
     local_candidate: &Candidate,
     is_controlling: bool,
     control_tie_breaker: u64,
+    use_candidate: bool,
 ) -> Vec<u8> {
     let mut stun_message = MessageBuilder::new(Class::Request, Method::Binding, transaction_id);
 
@@ -63,6 +64,10 @@ pub(super) fn make_binding_request(
         stun_message.add_attr(IceControlling(control_tie_breaker));
     } else {
         stun_message.add_attr(IceControlled(control_tie_breaker));
+    }
+
+    if use_candidate {
+        stun_message.add_attr(UseCandidate);
     }
 
     stun_message.add_attr_with(

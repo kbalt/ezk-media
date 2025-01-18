@@ -773,7 +773,7 @@ impl SdpSession {
                     address: None,
                 }),
                 // always offer rtcp-mux
-                rtcp_mux: true,
+                rtcp_mux: false, // TODO FIXME:  THIS MUST BE TRUE
                 mid: Some(pending_media.mid.as_str().into()),
                 rtpmap,
                 fmtp,
@@ -893,13 +893,11 @@ impl SdpSession {
                     // TODO: return an error here instead, we required BUNDLE, but it is not supported
                     pending_media.standalone_transport.unwrap()
                 };
-                println!("YAYAYAYasddasA");
 
                 // Build transport if necessary
                 if let TransportEntry::TransportBuilder(transport_builder) =
                     &mut self.transports[transport_id]
                 {
-                    println!("YAYAYAYA");
                     let transport_builder =
                         replace(transport_builder, TransportBuilder::placeholder());
 
@@ -1098,8 +1096,6 @@ impl SdpSession {
 
     /// Poll for new events. Call [`pop_event`](Self::pop_event) to handle them.
     pub fn poll(&mut self) {
-        let now = Instant::now();
-
         for (transport_id, transport) in &mut self.transports {
             match transport {
                 TransportEntry::Transport(transport) => {
