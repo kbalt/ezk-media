@@ -773,7 +773,7 @@ impl SdpSession {
                     address: None,
                 }),
                 // always offer rtcp-mux
-                rtcp_mux: false, // TODO FIXME:  THIS MUST BE TRUE
+                rtcp_mux: true,
                 mid: Some(pending_media.mid.as_str().into()),
                 rtpmap,
                 fmtp,

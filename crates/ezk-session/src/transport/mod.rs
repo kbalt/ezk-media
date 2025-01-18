@@ -142,12 +142,13 @@ impl Transport {
 
         let ice_agent = if let Some((ufrag, pwd)) = ice_ufrag.zip(ice_pwd) {
             let mut ice_agent = IceAgent::new_from_answer(
-                false,
                 state.ice_credentials(),
                 IceCredentials {
                     ufrag: ufrag.ufrag.to_string(),
                     pwd: pwd.pwd.to_string(),
                 },
+                false,
+                remote_media_desc.rtcp_mux,
             );
 
             for server in &state.stun_servers {

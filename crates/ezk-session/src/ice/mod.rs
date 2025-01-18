@@ -50,43 +50,60 @@ pub(crate) struct IceAgent {
 
     stun_server: Vec<StunServerBinding>,
 
+    rtcp_mux: bool,
     is_controlling: bool,
     control_tie_breaker: u64,
-
     max_pairs: usize,
+
+    gathering_state: IceGatheringState,
+    connection_state: IceConnectionState,
+
     pairs: Vec<CandidatePair>,
     triggered_check_queue: VecDeque<(LocalCandidateId, RemoteCandidateId)>,
 
     last_ta_trigger: Option<Instant>,
 }
 
-pub enum IceConnectionState {
+/// State of gathering candidates from external (STUN/TURN) servers.
+/// If no STUN server is configured this state will jump directly to `Complete`.
+pub enum IceGatheringState {
+    /// The ICE agent was just created
     New,
+    /// The ICE agent is in the process of gathering candidates
+    Gathering,
+    /// The ICE agent has finished gathering candidates. If something happens that requires collecting new candidates,
+    /// such as a new interface being added or the addition of a new ICE server, the state will revert to `Gathering` to
+    /// gather those candidates.
+    Complete,
+}
+
+/// State of the ICE agent
+pub enum IceConnectionState {
+    /// The ICE agent is awaiting local & remote ice candidates
+    New,
+    /// The ICE agent is in the process of checking candidates pairs
     Checking,
+    /// The ICE agent has found a valid pair for all components
     Connected,
-    Completed,
+
+    // TODO: this state is currently unreachable since the first valid pair is instantly nominated
+    //Completed,
+
+    // The ICE agent has failed to find a valid candidate pair for all components
+    Failed,
+    // Checks to ensure that components are still connected failed for at least one component.
+    // This is a less stringent test than failed and may trigger intermittently and resolve just as spontaneously on
+    // less reliable networks, or during temporary disconnections.
+    // When the problem resolves, the connection may return to the connected state.
     Disconnected,
-    Failed,
-    Closed,
-}
-
-struct Checklist {
-    state: ChecklistState,
-}
-
-enum ChecklistState {
-    Running,
-    Completed,
-    Failed,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy, Hash)]
-#[repr(u64)]
 enum CandidateKind {
     Host = 126,
     PeerReflexive = 110,
     ServerReflexive = 100,
-    Relayed = 0,
+    // TODO: Relayed = 0,
 }
 
 struct Candidate {
@@ -161,9 +178,10 @@ impl IceCredentials {
 
 impl IceAgent {
     pub(crate) fn new_from_answer(
-        is_controlling: bool,
         local_credentials: IceCredentials,
         remote_credentials: IceCredentials,
+        is_controlling: bool,
+        rtcp_mux: bool,
     ) -> Self {
         IceAgent {
             stun_config: StunConfig::new(),
@@ -171,35 +189,64 @@ impl IceAgent {
             remote_credentials: Some(remote_credentials),
             local_candidates: SlotMap::with_key(),
             remote_candidates: SlotMap::with_key(),
-            max_pairs: 100,
-            pairs: Vec::new(),
-            triggered_check_queue: VecDeque::new(),
             stun_server: vec![],
+            rtcp_mux,
             is_controlling,
             control_tie_breaker: rand::random(),
+            max_pairs: 100,
+            gathering_state: IceGatheringState::New,
+            connection_state: IceConnectionState::New,
+            pairs: Vec::new(),
+            triggered_check_queue: VecDeque::new(),
             last_ta_trigger: None,
         }
     }
 
-    pub(crate) fn new_for_offer(local_credentials: IceCredentials, is_controlling: bool) -> Self {
+    pub(crate) fn new_for_offer(
+        local_credentials: IceCredentials,
+        is_controlling: bool,
+        rtcp_mux: bool,
+    ) -> Self {
         IceAgent {
             stun_config: StunConfig::new(),
             local_credentials,
             remote_credentials: None,
             local_candidates: SlotMap::with_key(),
             remote_candidates: SlotMap::with_key(),
-            max_pairs: 100,
-            pairs: Vec::new(),
-            triggered_check_queue: VecDeque::new(),
             stun_server: vec![],
+            rtcp_mux,
             is_controlling,
             control_tie_breaker: rand::random(),
+            max_pairs: 100,
+            gathering_state: IceGatheringState::New,
+            connection_state: IceConnectionState::New,
+            pairs: Vec::new(),
+            triggered_check_queue: VecDeque::new(),
             last_ta_trigger: None,
         }
     }
 
-    pub(crate) fn set_remote_credentials(&mut self, credentials: IceCredentials) {
+    pub(crate) fn set_remote_data(
+        &mut self,
+        credentials: IceCredentials,
+        candidates: &[IceCandidate],
+        rtcp_mux: bool,
+    ) {
+        // TODO: assert that we can't change from rtcp-mux: true -> false
+        self.rtcp_mux = rtcp_mux;
+
+        // Remove all rtcp candidates and stun server bindings rtcp-mux is enabled
+        if rtcp_mux {
+            self.stun_server.retain(|s| s.socket() == SocketUse::Rtp);
+            self.local_candidates
+                .retain(|_, c| c.socket == SocketUse::Rtp);
+        }
+
         self.remote_credentials = Some(credentials);
+
+        for candidate in candidates {
+            self.add_remote_candidate(candidate);
+        }
     }
 
     pub(crate) fn credentials(&self) -> &IceCredentials {
@@ -225,9 +272,10 @@ impl IceAgent {
         self.stun_server
             .push(StunServerBinding::new(server, SocketUse::Rtp));
 
-        // TODO: only make this if we're using an rtcp socket
-        self.stun_server
-            .push(StunServerBinding::new(server, SocketUse::Rtcp));
+        if !self.rtcp_mux {
+            self.stun_server
+                .push(StunServerBinding::new(server, SocketUse::Rtcp));
+        }
     }
 
     fn add_local_candidate(
@@ -248,15 +296,15 @@ impl IceAgent {
             return;
         }
 
-        println!("add local candidate {socket:?} {kind:?} {addr}");
+        log::debug!("add local candidate {socket:?} {kind:?} {addr}");
 
         // Calculate the candidate priority using offsets + count of candidates of the same type
-        // (trick that I have stolen from str0m's implementation (thank you o/))
+        // (trick that I have stolen from str0m's implementation)
         let local_preference_offset = match kind {
             CandidateKind::Host => (65535 / 4) * 3,
             CandidateKind::PeerReflexive => (65535 / 4) * 2,
             CandidateKind::ServerReflexive => 65535 / 4,
-            CandidateKind::Relayed => 0,
+            // CandidateKind::Relayed => 0,
         };
 
         let local_preference = self
@@ -289,12 +337,16 @@ impl IceAgent {
             _ => return,
         };
 
-        println!("add remote candidate");
-
         let socket = match candidate.component {
             1 => SocketUse::Rtp,
-            2 => SocketUse::Rtcp,
-            _ => return,
+            // Discard candidates for rtcp is rtcp-mux is enabled
+            2 if !self.rtcp_mux => SocketUse::Rtcp,
+            _ => {
+                log::debug!(
+                    "Discard remote candidate with unsupported component candidate:{candidate}"
+                );
+                return;
+            }
         };
 
         let ip = match candidate.address {
@@ -327,19 +379,6 @@ impl IceAgent {
                     continue;
                 }
 
-                // Exclude pairs with different ip version
-                match (local_candidate.addr.ip(), remote_candidate.addr.ip()) {
-                    (IpAddr::V4(..), IpAddr::V4(..)) => { /* ok */ }
-                    // Only pair IPv6 addresses when either both or neither are link local addresses
-                    (IpAddr::V6(l), IpAddr::V6(r))
-                        if l.is_unicast_link_local() == r.is_unicast_link_local() =>
-                    { /* ok */ }
-                    _ => {
-                        // Would make an invalid pair, skip
-                        continue;
-                    }
-                }
-
                 // Check if the pair already exists
                 let already_exists = self
                     .pairs
@@ -348,6 +387,21 @@ impl IceAgent {
 
                 if already_exists {
                     continue;
+                }
+
+                // Exclude pairs with different ip version
+                match (local_candidate.addr.ip(), remote_candidate.addr.ip()) {
+                    (IpAddr::V4(l), IpAddr::V4(r)) if l.is_link_local() == r.is_link_local() => {
+                        /* ok */
+                    }
+                    // Only pair IPv6 addresses when either both or neither are link local addresses
+                    (IpAddr::V6(l), IpAddr::V6(r))
+                        if l.is_unicast_link_local() == r.is_unicast_link_local() =>
+                    { /* ok */ }
+                    _ => {
+                        // Would make an invalid pair, skip
+                        continue;
+                    }
                 }
 
                 Self::add_candidate_pair(
@@ -387,8 +441,9 @@ impl IceAgent {
         let priority = pair_priority(local_candidate, remote_candidate, is_controlling);
 
         log::debug!(
-            "add pair {}, priority: {priority}",
-            DisplayPair(local_candidate, remote_candidate)
+            "add pair {}, priority: {priority}, socket={:?}",
+            DisplayPair(local_candidate, remote_candidate),
+            local_candidate.socket,
         );
 
         pairs.push(CandidatePair {
@@ -738,7 +793,7 @@ impl IceAgent {
             .expect("local_id & remote_id are valid");
 
         pair.received_use_candidate = use_candidate;
-        log::debug!(
+        log::trace!(
             "got connectivity check for pair {}",
             DisplayPair(
                 &self.local_candidates[pair.local],
@@ -902,7 +957,10 @@ impl IceAgent {
 
     fn poll_nomination(&mut self, mut on_event: impl FnMut(IceEvent)) {
         self.poll_nomination_of_component(&mut on_event, SocketUse::Rtp);
-        self.poll_nomination_of_component(&mut on_event, SocketUse::Rtcp);
+
+        if !self.rtcp_mux {
+            self.poll_nomination_of_component(&mut on_event, SocketUse::Rtcp);
+        }
     }
 
     fn poll_nomination_of_component(
@@ -937,8 +995,10 @@ impl IceAgent {
             );
 
             pair.nominated = true;
+
+            // Make another binding request with use-candidate as soon as possible, by pushing it to the front of the queue
             self.triggered_check_queue
-                .push_back((pair.local, pair.remote));
+                .push_front((pair.local, pair.remote));
         } else {
             // Not controlling, check if we have received a use-candidate for a successful pair
 
@@ -971,16 +1031,6 @@ impl IceAgent {
                 target: self.remote_candidates[pair.remote].addr,
             });
         }
-    }
-
-    //
-    fn check_state_of_component(&mut self, now: Instant, socket: SocketUse) {
-
-        // let mut has_nomination = false;
-        // let mut
-        // for pair in self.checklist.pairs.iter().filter(|p| p.socket == socket) {
-
-        // }
     }
 
     pub(crate) fn timeout(&self, now: Instant) -> Option<Duration> {
@@ -1075,8 +1125,7 @@ impl fmt::Display for DisplayPair<'_> {
                 }
                 CandidateKind::ServerReflexive => {
                     write!(f, "server-reflexive(base:{}, server:{})", c.base, c.addr)
-                }
-                CandidateKind::Relayed => write!(f, "relayed(base:{}, relay:{})", c.base, c.addr),
+                } // CandidateKind::Relayed => write!(f, "relayed(base:{}, relay:{})", c.base, c.addr),
             }
         }
 
@@ -1092,8 +1141,13 @@ mod tests {
 
     #[test]
     fn initial_timeout() {
-        let ice_agent =
-            IceAgent::new_from_answer(true, IceCredentials::random(), IceCredentials::random());
+        let ice_agent = IceAgent::new_from_answer(
+            IceCredentials::random(),
+            IceCredentials::random(),
+            true,
+            true,
+        );
+
         assert_eq!(ice_agent.timeout(Instant::now()), Some(Duration::ZERO));
     }
 }

@@ -67,7 +67,11 @@ impl TransportBuilder {
         };
 
         let ice_agent = if offer_ice {
-            let mut ice_agent = IceAgent::new_for_offer(state.ice_credentials(), true);
+            let mut ice_agent = IceAgent::new_for_offer(
+                state.ice_credentials(),
+                true,
+                matches!(rtcp_mux_policy, RtcpMuxPolicy::Require),
+            );
 
             for server in &state.stun_servers {
                 ice_agent.add_stun_server(*server);
@@ -195,14 +199,14 @@ impl TransportBuilder {
         let ice_agent = if let Some((mut ice_agent, (ufrag, pwd))) =
             self.ice_agent.zip(ice_ufrag.zip(ice_pwd))
         {
-            ice_agent.set_remote_credentials(IceCredentials {
-                ufrag: ufrag.ufrag.to_string(),
-                pwd: pwd.pwd.to_string(),
-            });
-
-            for candidate in &remote_media_desc.ice_candidates {
-                ice_agent.add_remote_candidate(candidate);
-            }
+            ice_agent.set_remote_data(
+                IceCredentials {
+                    ufrag: ufrag.ufrag.to_string(),
+                    pwd: pwd.pwd.to_string(),
+                },
+                &remote_media_desc.ice_candidates,
+                remote_media_desc.rtcp_mux,
+            );
 
             Some(ice_agent)
         } else {
