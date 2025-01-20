@@ -1081,22 +1081,28 @@ impl SdpSession {
     }
 
     /// Poll for new events. Call [`pop_event`](Self::pop_event) to handle them.
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self, now: Instant) {
         for (transport_id, transport) in &mut self.transports {
             match transport {
                 TransportEntry::Transport(transport) => {
-                    transport.poll(Self::propagate_transport_events(
-                        &self.state,
-                        &mut self.events,
-                        transport_id,
-                    ));
+                    transport.poll(
+                        now,
+                        Self::propagate_transport_events(
+                            &self.state,
+                            &mut self.events,
+                            transport_id,
+                        ),
+                    );
                 }
                 TransportEntry::TransportBuilder(transport_builder) => {
-                    transport_builder.poll(Self::propagate_transport_events(
-                        &self.state,
-                        &mut self.events,
-                        transport_id,
-                    ));
+                    transport_builder.poll(
+                        now,
+                        Self::propagate_transport_events(
+                            &self.state,
+                            &mut self.events,
+                            transport_id,
+                        ),
+                    );
                 }
             }
         }

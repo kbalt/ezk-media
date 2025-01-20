@@ -83,18 +83,14 @@ pub(super) fn make_binding_request(
 pub(super) fn make_success_response(
     transaction_id: TransactionId,
     local_credentials: &IceCredentials,
-    remote_credentials: &IceCredentials,
     source: SocketAddr,
 ) -> Vec<u8> {
     let mut stun_message = MessageBuilder::new(Class::Success, Method::Binding, transaction_id);
 
-    let username = format!("{}:{}", local_credentials.ufrag, remote_credentials.ufrag);
-
-    stun_message.add_attr(Username::new(&username));
     stun_message.add_attr(XorMappedAddress(source));
     stun_message.add_attr_with(
         MessageIntegrity,
-        MessageIntegrityKey::new(&remote_credentials.pwd),
+        MessageIntegrityKey::new(&local_credentials.pwd),
     );
 
     stun_message.add_attr(Fingerprint);
@@ -162,15 +158,16 @@ pub(crate) fn verify_integrity(
         .attribute_with::<MessageIntegrity>(MessageIntegrityKey::new(key))
         .is_some_and(|r| r.is_ok());
 
-    let expected_username = if is_request {
-        format!("{}:{}", local_credentials.ufrag, remote_credentials.ufrag)
-    } else {
-        format!("{}:{}", remote_credentials.ufrag, local_credentials.ufrag)
-    };
+    if is_request {
+        let expected_username = format!("{}:{}", local_credentials.ufrag, remote_credentials.ufrag);
+        let username = stun_msg.attribute::<Username>().unwrap().unwrap();
 
-    let username = stun_msg.attribute::<Username>().unwrap().unwrap();
+        if username.0 != expected_username {
+            return false;
+        }
+    }
 
-    passed_integrity_check && username.0 == expected_username
+    passed_integrity_check
 }
 
 pub(crate) struct StunServerBinding {
@@ -214,10 +211,6 @@ impl StunServerBinding {
     /// Returns if the binding has either been completed or failed to complete
     pub(crate) fn completed(&self) -> bool {
         self.last_mapped_addr.is_some() || matches!(self.state, StunServerBindingState::Failed)
-    }
-
-    pub(crate) fn discovered_addr(&self) -> Option<(SocketAddr, SocketAddr)> {
-        self.last_mapped_addr
     }
 
     pub(crate) fn timeout(&self, now: Instant) -> Option<Duration> {

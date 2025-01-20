@@ -330,7 +330,7 @@ impl Transport {
         }
     }
 
-    pub(crate) fn poll(&mut self, mut on_event: impl FnMut(TransportEvent)) {
+    pub(crate) fn poll(&mut self, now: Instant, mut on_event: impl FnMut(TransportEvent)) {
         match &mut self.kind {
             TransportKind::Rtp => {}
             TransportKind::SdesSrtp { .. } => {}
@@ -349,11 +349,14 @@ impl Transport {
         }
 
         if let Some(ice_agent) = &mut self.ice_agent {
-            ice_agent.poll(Self::handle_ice_event(
-                &mut on_event,
-                &mut self.remote_rtp_address,
-                &mut self.remote_rtcp_address,
-            ));
+            ice_agent.poll(
+                now,
+                Self::handle_ice_event(
+                    &mut on_event,
+                    &mut self.remote_rtp_address,
+                    &mut self.remote_rtcp_address,
+                ),
+            );
         }
     }
 
@@ -364,6 +367,8 @@ impl Transport {
         remote_rtcp_address: &'a mut SocketAddr,
     ) -> impl FnMut(IceEvent) + use<'a, F> {
         move |event| match event {
+            IceEvent::GatheringStateChanged { old, new } => {}
+            IceEvent::ConnectionStateChanged { old, new } => {}
             IceEvent::UseAddr { component, target } => match component {
                 Component::Rtp => *remote_rtp_address = target,
                 Component::Rtcp => *remote_rtcp_address = target,

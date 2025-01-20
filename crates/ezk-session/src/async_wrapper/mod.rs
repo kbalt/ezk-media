@@ -11,13 +11,9 @@ use std::{
     mem::MaybeUninit,
     net::{IpAddr, SocketAddr},
     task::Poll,
+    time::Instant,
 };
-use tokio::{
-    io::ReadBuf,
-    net::UdpSocket,
-    select,
-    time::{sleep_until, Instant},
-};
+use tokio::{io::ReadBuf, net::UdpSocket, select, time::sleep_until};
 
 mod socket;
 
@@ -183,7 +179,7 @@ impl AsyncSdpSession {
         let mut buf = ReadBuf::uninit(&mut buf);
 
         loop {
-            self.inner.poll();
+            self.inner.poll(Instant::now());
 
             self.handle_events().unwrap();
             self.timeout = self.inner.timeout().map(|d| Instant::now() + d);
@@ -214,7 +210,7 @@ impl AsyncSdpSession {
 
 async fn timeout(instant: Option<Instant>) {
     match instant {
-        Some(instant) => sleep_until(instant).await,
+        Some(instant) => sleep_until(instant.into()).await,
         None => pending().await,
     }
 }

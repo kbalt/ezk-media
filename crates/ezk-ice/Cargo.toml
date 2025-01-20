@@ -8,8 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-stun-types = { path = "../../../ezk/crates/stun-types", package = "ezk-stun-types" }
+stun-types = { git = "https://github.com/kbalt/ezk", package = "ezk-stun-types" }
 sdp-types = { git = "https://github.com/kbalt/ezk", package = "ezk-sdp-types" }
 rand = "0.8"
 slotmap = "1.0.7"
 log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11.5"

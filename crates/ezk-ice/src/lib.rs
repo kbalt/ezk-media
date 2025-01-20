@@ -1,3 +1,7 @@
+#![deny(unreachable_pub, unsafe_code)]
+
+//! sans io implementation of an ICE agent
+
 use core::fmt;
 use rand::distributions::{Alphanumeric, DistString};
 use sdp_types::{IceCandidate, UntaggedAddress};
@@ -41,12 +45,17 @@ pub enum Component {
     Rtcp = 2,
 }
 
-new_key_type!(
-    struct LocalCandidateId;
-    struct RemoteCandidateId;
-);
-
+/// ICE related events emitted by the [`IceAgent`]
+#[derive(Debug)]
 pub enum IceEvent {
+    GatheringStateChanged {
+        old: IceGatheringState,
+        new: IceGatheringState,
+    },
+    ConnectionStateChanged {
+        old: IceConnectionState,
+        new: IceConnectionState,
+    },
     UseAddr {
         component: Component,
         target: SocketAddr,
@@ -59,6 +68,7 @@ pub enum IceEvent {
     },
 }
 
+/// The ICE agent state machine
 pub struct IceAgent {
     stun_config: StunConfig,
 
@@ -86,18 +96,19 @@ pub struct IceAgent {
 
 /// State of gathering candidates from external (STUN/TURN) servers.
 /// If no STUN server is configured this state will jump directly to `Complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IceGatheringState {
     /// The ICE agent was just created
     New,
     /// The ICE agent is in the process of gathering candidates
     Gathering,
     /// The ICE agent has finished gathering candidates. If something happens that requires collecting new candidates,
-    /// such as a new interface being added or the addition of a new ICE server, the state will revert to `Gathering` to
-    /// gather those candidates.
+    /// such as the addition of a new ICE server, the state will revert to `Gathering` to gather those candidates.
     Complete,
 }
 
 /// State of the ICE agent
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IceConnectionState {
     /// The ICE agent is awaiting local & remote ice candidates
     New,
@@ -108,15 +119,20 @@ pub enum IceConnectionState {
 
     // TODO: this state is currently unreachable since the first valid pair is instantly nominated
     //Completed,
-
-    // The ICE agent has failed to find a valid candidate pair for all components
+    //
+    /// The ICE agent has failed to find a valid candidate pair for all components
     Failed,
-    // Checks to ensure that components are still connected failed for at least one component.
-    // This is a less stringent test than failed and may trigger intermittently and resolve just as spontaneously on
-    // less reliable networks, or during temporary disconnections.
-    // When the problem resolves, the connection may return to the connected state.
+    /// Checks to ensure that components are still connected failed for at least one component.
+    /// This is a less stringent test than failed and may trigger intermittently and resolve just as spontaneously on
+    /// less reliable networks, or during temporary disconnections.
+    /// When the problem resolves, the connection may return to the connected state.
     Disconnected,
 }
+
+new_key_type!(
+    struct LocalCandidateId;
+    struct RemoteCandidateId;
+);
 
 #[derive(Debug, PartialEq, Clone, Copy, Hash)]
 enum CandidateKind {
@@ -178,6 +194,9 @@ enum CandidatePairState {
     Failed,
 }
 
+/// Credentials of an ICE agent
+///
+/// These must be exchanges using some external signaling protocol like SDP
 #[derive(Clone)]
 pub struct IceCredentials {
     pub ufrag: String,
@@ -245,6 +264,7 @@ impl IceAgent {
         }
     }
 
+    /// Set all the remote information in one step. This function is usually set once after receiving a SDP answer.
     pub fn set_remote_data(
         &mut self,
         credentials: IceCredentials,
@@ -268,10 +288,13 @@ impl IceAgent {
         }
     }
 
+    /// Return the ice-agent's ice credentials
     pub fn credentials(&self) -> &IceCredentials {
         &self.local_credentials
     }
 
+    /// Register a host address for a given ICE component. This will be used to create a host candidate.
+    /// For the ICE agent to work properly, all available ip addresses of the host system should be provided.
     pub fn add_host_addr(&mut self, component: Component, addr: SocketAddr) {
         if addr.ip().is_loopback() || addr.ip().is_unspecified() {
             return;
@@ -287,6 +310,7 @@ impl IceAgent {
         self.add_local_candidate(component, CandidateKind::Host, addr, addr);
     }
 
+    /// Add a STUN server which the ICE agent should use to gather additional (server-reflexive) candidates.
     pub fn add_stun_server(&mut self, server: SocketAddr) {
         self.stun_server
             .push(StunServerBinding::new(server, Component::Rtp));
@@ -295,6 +319,16 @@ impl IceAgent {
             self.stun_server
                 .push(StunServerBinding::new(server, Component::Rtcp));
         }
+    }
+
+    /// Returns the current ICE candidate gathering state
+    pub fn gathering_state(&self) -> IceGatheringState {
+        self.gathering_state
+    }
+
+    /// Returns the current ICE connection state
+    pub fn connection_state(&self) -> IceConnectionState {
+        self.connection_state
     }
 
     fn add_local_candidate(
@@ -349,6 +383,7 @@ impl IceAgent {
         self.form_pairs();
     }
 
+    /// Add a peer's ice-candidate which has been received using an extern signaling protocol
     pub fn add_remote_candidate(&mut self, candidate: &IceCandidate) {
         let kind = match candidate.typ.as_str() {
             "host" => CandidateKind::Host,
@@ -356,9 +391,14 @@ impl IceAgent {
             _ => return,
         };
 
+        // TODO: currently only udp transport is supported
+        if !candidate.transport.eq_ignore_ascii_case("udp") {
+            return;
+        }
+
         let component = match candidate.component {
             1 => Component::Rtp,
-            // Discard candidates for rtcp is rtcp-mux is enabled
+            // Discard candidates for rtcp if rtcp-mux is enabled
             2 if !self.rtcp_mux => Component::Rtcp,
             _ => {
                 log::debug!(
@@ -703,8 +743,6 @@ impl IceAgent {
         let priority = stun_msg.attribute::<Priority>().unwrap().unwrap();
         let use_candidate = stun_msg.attribute::<UseCandidate>().is_some();
 
-        // compile_error!("todo: finish the nomination state");
-
         // Detect and handle role conflict
         if self.is_controlling {
             if let Some(Ok(ice_controlling)) = stun_msg.attribute::<IceControlling>() {
@@ -764,7 +802,10 @@ impl IceAgent {
         {
             Some((id, _)) => id,
             None => {
-                // TODO: unlucky?
+                log::warn!(
+                    "Failed to find matching local candidate for incoming STUN request ({})?",
+                    pkt.destination
+                );
                 return;
             }
         };
@@ -823,9 +864,6 @@ impl IceAgent {
         let stun_response = stun::make_success_response(
             stun_msg.transaction_id(),
             &self.local_credentials,
-            self.remote_credentials
-                .as_ref()
-                .expect("already check that remote credentials are available"),
             pkt.source,
         );
 
@@ -842,15 +880,16 @@ impl IceAgent {
         }
     }
 
-    pub fn poll(&mut self, mut on_event: impl FnMut(IceEvent)) {
-        let now = Instant::now();
-
+    /// Drive the ICE agent forward. This must be called after the duration returned by [`timeout`](IceAgent::timeout).
+    pub fn poll(&mut self, now: Instant, mut on_event: impl FnMut(IceEvent)) {
         // Handle pending stun retransmissions
         self.poll_retransmit(now, &mut on_event);
 
         for stun_server_bindings in &mut self.stun_server {
             stun_server_bindings.poll(now, &self.stun_config, &mut on_event);
         }
+
+        self.poll_state(&mut on_event);
 
         // Skip anything beyond this before we received the remote credentials & candidates
         if self.remote_credentials.is_none() {
@@ -974,6 +1013,83 @@ impl IceAgent {
         }
     }
 
+    fn poll_state(&mut self, mut on_event: impl FnMut(IceEvent)) {
+        // Check gathering state
+        let mut all_completed = true;
+        for stun_server in &self.stun_server {
+            if !stun_server.completed() {
+                all_completed = false;
+            }
+        }
+
+        if all_completed && self.gathering_state != IceGatheringState::Complete {
+            on_event(IceEvent::GatheringStateChanged {
+                old: self.gathering_state,
+                new: IceGatheringState::Complete,
+            });
+
+            self.gathering_state = IceGatheringState::Complete;
+        } else if !all_completed && self.gathering_state != IceGatheringState::Gathering {
+            on_event(IceEvent::GatheringStateChanged {
+                old: self.gathering_state,
+                new: IceGatheringState::Gathering,
+            });
+
+            self.gathering_state = IceGatheringState::Gathering;
+        }
+
+        // Check connection state
+        let mut has_rtp_nomination = false;
+        let mut has_rtcp_nomination = false;
+
+        compile_error!("Check if there's still valid/waiting pairs, and set state to failed if all pairs have failed");
+
+        for pair in &self.pairs {
+            if pair.nominated && matches!(pair.state, CandidatePairState::Succeeded) {
+                match pair.component {
+                    Component::Rtp => has_rtp_nomination = true,
+                    Component::Rtcp => has_rtcp_nomination = true,
+                }
+            }
+        }
+
+        let has_nomination_for_all = if self.rtcp_mux {
+            has_rtp_nomination
+        } else {
+            has_rtp_nomination && has_rtcp_nomination
+        };
+
+        if has_nomination_for_all && self.connection_state != IceConnectionState::Connected {
+            self.set_connection_state(IceConnectionState::Connected, on_event);
+        } else if !has_nomination_for_all {
+            match self.connection_state {
+                IceConnectionState::New => {
+                    self.set_connection_state(IceConnectionState::Checking, on_event);
+                }
+                IceConnectionState::Checking => {}
+                IceConnectionState::Connected => {
+                    self.set_connection_state(IceConnectionState::Disconnected, on_event);
+                }
+                IceConnectionState::Failed => {}
+                IceConnectionState::Disconnected => {}
+            }
+        }
+    }
+
+    fn set_connection_state(
+        &mut self,
+        new: IceConnectionState,
+        mut on_event: impl FnMut(IceEvent),
+    ) {
+        if self.connection_state != new {
+            on_event(IceEvent::ConnectionStateChanged {
+                old: self.connection_state,
+                new,
+            });
+            self.connection_state = new;
+        }
+    }
+
     fn poll_nomination(&mut self, mut on_event: impl FnMut(IceEvent)) {
         self.poll_nomination_of_component(&mut on_event, Component::Rtp);
 
@@ -1057,6 +1173,7 @@ impl IceAgent {
         }
     }
 
+    /// Returns a duration after which to call [`poll`](IceAgent::poll)
     pub fn timeout(&self, now: Instant) -> Option<Duration> {
         // Next TA trigger
         let ta = self
@@ -1073,6 +1190,7 @@ impl IceAgent {
         opt_min(ta, stun_bindings)
     }
 
+    /// Returns all discovered local ice agents, does not include peer-reflexive candidates
     pub fn ice_candidates(&self) -> Vec<IceCandidate> {
         self.local_candidates
             .values()

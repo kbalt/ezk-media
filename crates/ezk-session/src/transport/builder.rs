@@ -131,9 +131,11 @@ impl TransportBuilder {
         }
     }
 
-    pub(crate) fn poll(&mut self, mut on_event: impl FnMut(TransportEvent)) {
+    pub(crate) fn poll(&mut self, now: Instant, mut on_event: impl FnMut(TransportEvent)) {
         if let Some(ice_agent) = &mut self.ice_agent {
-            ice_agent.poll(|event| match event {
+            ice_agent.poll(now, |event| match event {
+                IceEvent::GatheringStateChanged { old, new } => {}
+                IceEvent::ConnectionStateChanged { old, new } => {}
                 IceEvent::UseAddr { .. } => unreachable!(),
                 IceEvent::SendData {
                     component,
