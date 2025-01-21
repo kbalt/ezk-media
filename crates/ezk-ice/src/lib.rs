@@ -72,13 +72,16 @@ pub enum IceEvent {
 pub struct IceAgent {
     stun_config: StunConfig,
 
+    stun_server: Vec<StunServerBinding>,
+
     local_credentials: IceCredentials,
     remote_credentials: Option<IceCredentials>,
 
     local_candidates: SlotMap<LocalCandidateId, Candidate>,
     remote_candidates: SlotMap<RemoteCandidateId, Candidate>,
 
-    stun_server: Vec<StunServerBinding>,
+    pairs: Vec<CandidatePair>,
+    triggered_check_queue: VecDeque<(LocalCandidateId, RemoteCandidateId)>,
 
     rtcp_mux: bool,
     is_controlling: bool,
@@ -87,9 +90,6 @@ pub struct IceAgent {
 
     gathering_state: IceGatheringState,
     connection_state: IceConnectionState,
-
-    pairs: Vec<CandidatePair>,
-    triggered_check_queue: VecDeque<(LocalCandidateId, RemoteCandidateId)>,
 
     last_ta_trigger: Option<Instant>,
 }
@@ -223,19 +223,19 @@ impl IceAgent {
     ) -> Self {
         IceAgent {
             stun_config: StunConfig::new(),
+            stun_server: vec![],
             local_credentials,
             remote_credentials: Some(remote_credentials),
             local_candidates: SlotMap::with_key(),
             remote_candidates: SlotMap::with_key(),
-            stun_server: vec![],
+            pairs: Vec::new(),
+            triggered_check_queue: VecDeque::new(),
             rtcp_mux,
             is_controlling,
             control_tie_breaker: rand::random(),
             max_pairs: 100,
             gathering_state: IceGatheringState::New,
             connection_state: IceConnectionState::New,
-            pairs: Vec::new(),
-            triggered_check_queue: VecDeque::new(),
             last_ta_trigger: None,
         }
     }
@@ -247,19 +247,19 @@ impl IceAgent {
     ) -> Self {
         IceAgent {
             stun_config: StunConfig::new(),
+            stun_server: vec![],
             local_credentials,
             remote_credentials: None,
             local_candidates: SlotMap::with_key(),
             remote_candidates: SlotMap::with_key(),
-            stun_server: vec![],
+            pairs: Vec::new(),
+            triggered_check_queue: VecDeque::new(),
             rtcp_mux,
             is_controlling,
             control_tie_breaker: rand::random(),
             max_pairs: 100,
             gathering_state: IceGatheringState::New,
             connection_state: IceConnectionState::New,
-            pairs: Vec::new(),
-            triggered_check_queue: VecDeque::new(),
             last_ta_trigger: None,
         }
     }
@@ -574,8 +574,7 @@ impl IceAgent {
                 continue;
             }
 
-            let Some(addr) =
-                stun_server_binding.receive_stun_response(&self.stun_config, pkt, stun_msg)
+            let Some(addr) = stun_server_binding.receive_stun_response(&self.stun_config, stun_msg)
             else {
                 // TODO; no xor mapped in response, discard message
                 return;
@@ -1042,13 +1041,24 @@ impl IceAgent {
         let mut has_rtp_nomination = false;
         let mut has_rtcp_nomination = false;
 
-        compile_error!("Check if there's still valid/waiting pairs, and set state to failed if all pairs have failed");
+        let mut rtp_in_progress = false;
+        let mut rtcp_in_progress = false;
 
         for pair in &self.pairs {
             if pair.nominated && matches!(pair.state, CandidatePairState::Succeeded) {
                 match pair.component {
                     Component::Rtp => has_rtp_nomination = true,
                     Component::Rtcp => has_rtcp_nomination = true,
+                }
+            }
+
+            if matches!(
+                pair.state,
+                CandidatePairState::Waiting | CandidatePairState::InProgress { .. }
+            ) {
+                match pair.component {
+                    Component::Rtp => rtp_in_progress = true,
+                    Component::Rtcp => rtcp_in_progress = true,
                 }
             }
         }
@@ -1059,19 +1069,29 @@ impl IceAgent {
             has_rtp_nomination && has_rtcp_nomination
         };
 
+        let still_possible = if self.rtcp_mux {
+            rtp_in_progress
+        } else {
+            rtp_in_progress && rtcp_in_progress
+        };
+
         if has_nomination_for_all && self.connection_state != IceConnectionState::Connected {
             self.set_connection_state(IceConnectionState::Connected, on_event);
         } else if !has_nomination_for_all {
-            match self.connection_state {
-                IceConnectionState::New => {
-                    self.set_connection_state(IceConnectionState::Checking, on_event);
+            if still_possible {
+                match self.connection_state {
+                    IceConnectionState::New => {
+                        self.set_connection_state(IceConnectionState::Checking, on_event);
+                    }
+                    IceConnectionState::Checking => {}
+                    IceConnectionState::Connected => {
+                        self.set_connection_state(IceConnectionState::Disconnected, on_event);
+                    }
+                    IceConnectionState::Failed => {}
+                    IceConnectionState::Disconnected => {}
                 }
-                IceConnectionState::Checking => {}
-                IceConnectionState::Connected => {
-                    self.set_connection_state(IceConnectionState::Disconnected, on_event);
-                }
-                IceConnectionState::Failed => {}
-                IceConnectionState::Disconnected => {}
+            } else {
+                self.set_connection_state(IceConnectionState::Failed, on_event);
             }
         }
     }

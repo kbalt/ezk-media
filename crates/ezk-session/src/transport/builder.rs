@@ -152,10 +152,10 @@ impl TransportBuilder {
         }
     }
 
-    pub(crate) fn receive(&mut self, pkt: ReceivedPkt) {
+    pub(crate) fn receive(&mut self, mut on_event: impl FnMut(TransportEvent), pkt: ReceivedPkt) {
         if let Some(ice_agent) = &mut self.ice_agent {
             if matches!(is_stun_message(&pkt.data), IsStunMessageInfo::Yes { .. }) {
-                ice_agent.receive(|_| unreachable!(), &pkt);
+                ice_agent.receive(|_| todo!(), &pkt);
                 return;
             }
         }

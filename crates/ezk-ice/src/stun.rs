@@ -1,4 +1,4 @@
-use super::{Candidate, IceCredentials, IceEvent, ReceivedPkt};
+use super::{Candidate, IceCredentials, IceEvent};
 use crate::Component;
 use std::{
     cmp::min,
@@ -174,8 +174,8 @@ pub(crate) struct StunServerBinding {
     server: SocketAddr,
     component: Component,
     state: StunServerBindingState,
-    /// Addresses from last STUN response (local-ip, mapped-addr)
-    last_mapped_addr: Option<(SocketAddr, SocketAddr)>,
+    /// XorMappedAddress from last STUN response
+    last_mapped_addr: Option<SocketAddr>,
 }
 
 enum StunServerBindingState {
@@ -315,7 +315,6 @@ impl StunServerBinding {
     pub(crate) fn receive_stun_response(
         &mut self,
         stun_config: &StunConfig,
-        pkt: &ReceivedPkt,
         mut stun_msg: Message,
     ) -> Option<SocketAddr> {
         let mapped = stun_msg.attribute::<XorMappedAddress>()?.unwrap();
@@ -323,7 +322,7 @@ impl StunServerBinding {
         self.state = StunServerBindingState::WaitingForRefresh {
             refresh_at: Instant::now() + stun_config.binding_refresh_interval,
         };
-        self.last_mapped_addr = Some((pkt.destination, mapped.0));
+        self.last_mapped_addr = Some(mapped.0);
 
         Some(mapped.0)
     }

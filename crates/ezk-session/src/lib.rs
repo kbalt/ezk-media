@@ -1170,7 +1170,10 @@ impl SdpSession {
         let transport = match &mut self.transports[transport_id] {
             TransportEntry::Transport(transport) => transport,
             TransportEntry::TransportBuilder(transport_builder) => {
-                transport_builder.receive(pkt);
+                transport_builder.receive(
+                    Self::propagate_transport_events(&self.state, &mut self.events, transport_id),
+                    pkt,
+                );
                 return;
             }
         };
