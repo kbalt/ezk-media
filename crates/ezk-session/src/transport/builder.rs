@@ -2,14 +2,17 @@ use super::{
     dtls_srtp::{to_openssl_digest, DtlsSetup, DtlsSrtpSession},
     resolve_rtp_and_rtcp_address,
     sdes_srtp::{self, SdesSrtpOffer},
-    IceAgent, IceEvent, ReceivedPacket, SessionTransportState, Transport, TransportEvent,
-    TransportKind, TransportRequiredChanges,
+    IceAgent, ReceivedPacket, SessionTransportState, Transport, TransportEvent, TransportKind,
+    TransportRequiredChanges,
 };
 use crate::{rtp::RtpExtensionIds, ConnectionState, ReceivedPkt, RtcpMuxPolicy, TransportType};
 use core::panic;
-use ezk_ice::IceCredentials;
+use ezk_ice::{IceCredentials, IceEvent};
 use sdp_types::{Fingerprint, MediaDescription, SessionDescription, Setup};
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 use stun_types::{is_stun_message, IsStunMessageInfo};
 
 /// Builder for a transport which has yet to be negotiated
@@ -131,31 +134,37 @@ impl TransportBuilder {
         }
     }
 
-    pub(crate) fn poll(&mut self, now: Instant, mut on_event: impl FnMut(TransportEvent)) {
-        if let Some(ice_agent) = &mut self.ice_agent {
-            ice_agent.poll(now, |event| match event {
-                IceEvent::GatheringStateChanged { old, new } => {}
-                IceEvent::ConnectionStateChanged { old, new } => {}
-                IceEvent::UseAddr { .. } => unreachable!(),
-                IceEvent::SendData {
-                    component,
-                    data,
-                    source,
-                    target,
-                } => on_event(TransportEvent::SendData {
-                    component,
-                    data,
-                    source,
-                    target,
-                }),
-            });
+    pub(crate) fn pop_event(&mut self) -> Option<TransportEvent> {
+        let ice_agent = self.ice_agent.as_mut()?;
+
+        match ice_agent.pop_event()? {
+            IceEvent::GatheringStateChanged { .. } => unreachable!(),
+            IceEvent::ConnectionStateChanged { .. } => unreachable!(),
+            IceEvent::UseAddr { .. } => unreachable!(),
+            IceEvent::SendData {
+                component,
+                data,
+                source,
+                target,
+            } => Some(TransportEvent::SendData {
+                component,
+                data,
+                source,
+                target,
+            }),
         }
     }
 
-    pub(crate) fn receive(&mut self, mut on_event: impl FnMut(TransportEvent), pkt: ReceivedPkt) {
+    pub(crate) fn poll(&mut self, now: Instant) {
+        if let Some(ice_agent) = &mut self.ice_agent {
+            ice_agent.poll(now);
+        }
+    }
+
+    pub(crate) fn receive(&mut self, pkt: ReceivedPkt) {
         if let Some(ice_agent) = &mut self.ice_agent {
             if matches!(is_stun_message(&pkt.data), IsStunMessageInfo::Yes { .. }) {
-                ice_agent.receive(|_| todo!(), &pkt);
+                ice_agent.receive(pkt);
                 return;
             }
         }
@@ -171,7 +180,6 @@ impl TransportBuilder {
 
     pub(crate) fn build_from_answer(
         mut self,
-        mut on_event: impl FnMut(TransportEvent),
         state: &mut SessionTransportState,
         mut required_changes: TransportRequiredChanges<'_>,
         session_desc: &SessionDescription,
@@ -224,6 +232,7 @@ impl TransportBuilder {
                 extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                 state: ConnectionState::Connected,
                 kind: TransportKind::Rtp,
+                events: VecDeque::new(),
             },
             TransportBuilderKind::SdesSrtp(offer) => {
                 let (crypto, inbound, outbound) = offer.receive_answer(&remote_media_desc.crypto);
@@ -242,6 +251,7 @@ impl TransportBuilder {
                         inbound,
                         outbound,
                     },
+                    events: VecDeque::new(),
                 }
             }
             TransportBuilderKind::DtlsSrtp { fingerprint } => {
@@ -279,22 +289,23 @@ impl TransportBuilder {
                         dtls,
                         srtp: None,
                     },
+                    events: VecDeque::new(),
                 }
             }
         };
 
         if transport.state != ConnectionState::New {
-            on_event(TransportEvent::ConnectionState {
+            transport.events.push_back(TransportEvent::ConnectionState {
                 old: ConnectionState::New,
                 new: transport.state,
             });
         }
 
         // Feed the already received messages into the transport
-        for mut pkt in self.backlog {
-            match transport.receive(&mut on_event, &mut pkt) {
-                ReceivedPacket::Rtp => todo!("handle early rtp"),
-                ReceivedPacket::Rtcp => todo!("handle early rtcp"),
+        for pkt in self.backlog {
+            match transport.receive(pkt) {
+                ReceivedPacket::Rtp(_) => todo!("handle early rtp"),
+                ReceivedPacket::Rtcp(_) => todo!("handle early rtcp"),
                 ReceivedPacket::TransportSpecific => {}
             };
         }

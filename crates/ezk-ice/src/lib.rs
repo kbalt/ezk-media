@@ -10,6 +10,7 @@ use std::{
     cmp::{max, min},
     collections::VecDeque,
     hash::{DefaultHasher, Hash, Hasher},
+    mem::take,
     net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
@@ -25,9 +26,9 @@ use stun_types::{
 mod stun;
 
 /// A message received on a UDP socket
-pub struct ReceivedPkt {
+pub struct ReceivedPkt<D = Vec<u8>> {
     /// The received data
-    pub data: Vec<u8>,
+    pub data: D,
     /// Source address of the message
     pub source: SocketAddr,
     /// Local socket destination address of the message
@@ -92,6 +93,10 @@ pub struct IceAgent {
     connection_state: IceConnectionState,
 
     last_ta_trigger: Option<Instant>,
+
+    backlog: Vec<ReceivedPkt<Message>>,
+
+    events: VecDeque<IceEvent>,
 }
 
 /// State of gathering candidates from external (STUN/TURN) servers.
@@ -237,6 +242,8 @@ impl IceAgent {
             gathering_state: IceGatheringState::New,
             connection_state: IceConnectionState::New,
             last_ta_trigger: None,
+            backlog: vec![],
+            events: VecDeque::new(),
         }
     }
 
@@ -261,6 +268,8 @@ impl IceAgent {
             gathering_state: IceGatheringState::New,
             connection_state: IceConnectionState::New,
             last_ta_trigger: None,
+            backlog: vec![],
+            events: VecDeque::new(),
         }
     }
 
@@ -285,6 +294,10 @@ impl IceAgent {
 
         for candidate in candidates {
             self.add_remote_candidate(candidate);
+        }
+
+        for pkt in take(&mut self.backlog) {
+            self.receive_stun(pkt);
         }
     }
 
@@ -538,9 +551,8 @@ impl IceAgent {
     }
 
     /// Receive network packets for this ICE agent
-    pub fn receive(&mut self, on_event: impl FnMut(IceEvent), pkt: &ReceivedPkt) {
-        // TODO: avoid clone here, this should be free
-        let mut stun_msg = Message::parse(pkt.data.clone()).unwrap();
+    pub fn receive(&mut self, pkt: ReceivedPkt) {
+        let mut stun_msg = Message::parse(pkt.data).unwrap();
 
         let passed_fingerprint_check = stun_msg
             .attribute::<Fingerprint>()
@@ -554,27 +566,33 @@ impl IceAgent {
             return;
         }
 
-        match stun_msg.class() {
-            Class::Request => self.receive_stun_request(on_event, pkt, stun_msg),
+        let pkt = ReceivedPkt {
+            data: stun_msg,
+            source: pkt.source,
+            destination: pkt.destination,
+            component: pkt.component,
+        };
+
+        self.receive_stun(pkt);
+    }
+
+    fn receive_stun(&mut self, pkt: ReceivedPkt<Message>) {
+        match pkt.data.class() {
+            Class::Request => self.receive_stun_request(pkt),
             Class::Indication => { /* ignore */ }
-            Class::Success => self.receive_stun_success(on_event, pkt, stun_msg),
-            Class::Error => self.receive_stun_error(stun_msg),
+            Class::Success => self.receive_stun_success(pkt),
+            Class::Error => self.receive_stun_error(pkt),
         }
     }
 
-    fn receive_stun_success(
-        &mut self,
-        mut on_event: impl FnMut(IceEvent),
-        pkt: &ReceivedPkt,
-        mut stun_msg: Message,
-    ) {
+    fn receive_stun_success(&mut self, mut pkt: ReceivedPkt<Message>) {
         // Check our stun server binding checks before verifying integrity since these aren't authenticated
         for stun_server_binding in &mut self.stun_server {
-            if !stun_server_binding.wants_stun_response(stun_msg.transaction_id()) {
+            if !stun_server_binding.wants_stun_response(pkt.data.transaction_id()) {
                 continue;
             }
 
-            let Some(addr) = stun_server_binding.receive_stun_response(&self.stun_config, stun_msg)
+            let Some(addr) = stun_server_binding.receive_stun_response(&self.stun_config, pkt.data)
             else {
                 // TODO; no xor mapped in response, discard message
                 return;
@@ -591,11 +609,13 @@ impl IceAgent {
             return;
         }
 
-        if !stun::verify_integrity(
-            &self.local_credentials,
-            &self.remote_credentials,
-            &mut stun_msg,
-        ) {
+        // Store messages later if the remote credentials aren't set yet
+        let Some(remote_credentials) = &self.remote_credentials else {
+            self.backlog.push(pkt);
+            return;
+        };
+
+        if !stun::verify_integrity(&self.local_credentials, remote_credentials, &mut pkt.data) {
             log::debug!("Incoming stun success failed the integrity check, discarding");
             return;
         }
@@ -609,7 +629,7 @@ impl IceAgent {
             .pairs
             .iter_mut()
             .find(|p| {
-                matches!(p.state, CandidatePairState::InProgress { transaction_id, .. } if stun_msg.transaction_id() == transaction_id)
+                matches!(p.state, CandidatePairState::InProgress { transaction_id, .. } if pkt.data.transaction_id() == transaction_id)
             }) else {
                 log::debug!("Failed to find transaction for STUN success, discarding");
                 return;
@@ -634,7 +654,7 @@ impl IceAgent {
                 let local_candidate = &self.local_candidates[pair.local];
                 let remote_candidate = &self.remote_candidates[pair.remote];
 
-                on_event(IceEvent::UseAddr {
+                self.events.push_back(IceEvent::UseAddr {
                     component: local_candidate.component,
                     target: remote_candidate.addr,
                 });
@@ -660,7 +680,7 @@ impl IceAgent {
         }
 
         // Check if we discover a new peer-reflexive candidate here
-        let mapped_addr = stun_msg.attribute::<XorMappedAddress>().unwrap().unwrap();
+        let mapped_addr = pkt.data.attribute::<XorMappedAddress>().unwrap().unwrap();
         if mapped_addr.0 != self.local_candidates[pair.local].addr {
             let component = pair.component;
             self.add_local_candidate(
@@ -672,12 +692,13 @@ impl IceAgent {
         }
     }
 
-    fn receive_stun_error(&mut self, mut stun_msg: Message) {
-        if !stun::verify_integrity(
-            &self.local_credentials,
-            &self.remote_credentials,
-            &mut stun_msg,
-        ) {
+    fn receive_stun_error(&mut self, mut pkt: ReceivedPkt<Message>) {
+        let Some(remote_credentials) = &self.remote_credentials else {
+            self.backlog.push(pkt);
+            return;
+        };
+
+        if !stun::verify_integrity(&self.local_credentials, remote_credentials, &mut pkt.data) {
             log::debug!("Incoming stun error response failed the integrity check, discarding");
             return;
         }
@@ -686,13 +707,13 @@ impl IceAgent {
             .pairs
             .iter_mut()
             .find(|p| {
-                matches!(p.state, CandidatePairState::InProgress { transaction_id, .. } if stun_msg.transaction_id() == transaction_id)
+                matches!(p.state, CandidatePairState::InProgress { transaction_id, .. } if pkt.data.transaction_id() == transaction_id)
             }) else {
                 log::debug!("Failed to find transaction for STUN error, discarding");
                 return;
             };
 
-        if let Some(Ok(error_code)) = stun_msg.attribute::<ErrorCode>() {
+        if let Some(Ok(error_code)) = pkt.data.attribute::<ErrorCode>() {
             log::debug!(
                 "Candidate pair failed with code={}, reason={}",
                 error_code.number,
@@ -704,9 +725,9 @@ impl IceAgent {
             // the agent MUST switch to the controlling role.
             // If the agent included an ICE-CONTROLLING attribute in the request, the agent MUST switch to the controlled role.
             if error_code.number == 487 {
-                if stun_msg.attribute::<IceControlled>().is_some() {
+                if pkt.data.attribute::<IceControlled>().is_some() {
                     self.is_controlling = true;
-                } else if stun_msg.attribute::<IceControlling>().is_some() {
+                } else if pkt.data.attribute::<IceControlling>().is_some() {
                     self.is_controlling = false;
                 }
 
@@ -724,30 +745,26 @@ impl IceAgent {
         }
     }
 
-    fn receive_stun_request(
-        &mut self,
-        mut on_event: impl FnMut(IceEvent),
-        pkt: &ReceivedPkt,
-        mut stun_msg: Message,
-    ) {
-        if !stun::verify_integrity(
-            &self.local_credentials,
-            &self.remote_credentials,
-            &mut stun_msg,
-        ) {
+    fn receive_stun_request(&mut self, mut pkt: ReceivedPkt<Message>) {
+        let Some(remote_credentials) = &self.remote_credentials else {
+            self.backlog.push(pkt);
+            return;
+        };
+
+        if !stun::verify_integrity(&self.local_credentials, remote_credentials, &mut pkt.data) {
             log::debug!("Incoming stun request failed the integrity check, discarding");
             return;
         }
 
-        let priority = stun_msg.attribute::<Priority>().unwrap().unwrap();
-        let use_candidate = stun_msg.attribute::<UseCandidate>().is_some();
+        let priority = pkt.data.attribute::<Priority>().unwrap().unwrap();
+        let use_candidate = pkt.data.attribute::<UseCandidate>().is_some();
 
         // Detect and handle role conflict
         if self.is_controlling {
-            if let Some(Ok(ice_controlling)) = stun_msg.attribute::<IceControlling>() {
+            if let Some(Ok(ice_controlling)) = pkt.data.attribute::<IceControlling>() {
                 if self.control_tie_breaker >= ice_controlling.0 {
                     let response = stun::make_role_error(
-                        stun_msg.transaction_id(),
+                        pkt.data.transaction_id(),
                         &self.local_credentials,
                         self.remote_credentials.as_ref().unwrap(),
                         pkt.source,
@@ -755,7 +772,7 @@ impl IceAgent {
                         self.control_tie_breaker,
                     );
 
-                    on_event(IceEvent::SendData {
+                    self.events.push_back(IceEvent::SendData {
                         component: pkt.component,
                         data: response,
                         source: Some(pkt.destination.ip()),
@@ -769,10 +786,10 @@ impl IceAgent {
                 }
             }
         } else if !self.is_controlling {
-            if let Some(Ok(ice_controlled)) = stun_msg.attribute::<IceControlled>() {
+            if let Some(Ok(ice_controlled)) = pkt.data.attribute::<IceControlled>() {
                 if self.control_tie_breaker >= ice_controlled.0 {
                     let response = stun::make_role_error(
-                        stun_msg.transaction_id(),
+                        pkt.data.transaction_id(),
                         &self.local_credentials,
                         self.remote_credentials.as_ref().unwrap(),
                         pkt.source,
@@ -780,7 +797,7 @@ impl IceAgent {
                         self.control_tie_breaker,
                     );
 
-                    on_event(IceEvent::SendData {
+                    self.events.push_back(IceEvent::SendData {
                         component: pkt.component,
                         data: response,
                         source: Some(pkt.destination.ip()),
@@ -861,12 +878,12 @@ impl IceAgent {
         );
 
         let stun_response = stun::make_success_response(
-            stun_msg.transaction_id(),
+            pkt.data.transaction_id(),
             &self.local_credentials,
             pkt.source,
         );
 
-        on_event(IceEvent::SendData {
+        self.events.push_back(IceEvent::SendData {
             component: pair.component,
             data: stun_response,
             source: Some(self.local_candidates[local_id].base.ip()),
@@ -875,25 +892,26 @@ impl IceAgent {
 
         // Check nomination state if we received a use-candidate
         if use_candidate {
-            self.poll_nomination(on_event);
+            self.poll_nomination();
         }
     }
 
     /// Drive the ICE agent forward. This must be called after the duration returned by [`timeout`](IceAgent::timeout).
-    pub fn poll(&mut self, now: Instant, mut on_event: impl FnMut(IceEvent)) {
-        // Handle pending stun retransmissions
-        self.poll_retransmit(now, &mut on_event);
-
+    pub fn poll(&mut self, now: Instant) {
+        // Progress all STUN-server bindings (used to create and maintain server-reflexive candidates)
         for stun_server_bindings in &mut self.stun_server {
-            stun_server_bindings.poll(now, &self.stun_config, &mut on_event);
+            stun_server_bindings.poll(now, &self.stun_config, |event| self.events.push_back(event));
         }
 
-        self.poll_state(&mut on_event);
+        // Handle pending stun retransmissions
+        self.poll_retransmit(now);
+        self.poll_state();
+        self.poll_nomination();
 
         // Skip anything beyond this before we received the remote credentials & candidates
-        if self.remote_credentials.is_none() {
+        let Some(remote_credentials) = &self.remote_credentials else {
             return;
-        }
+        };
 
         // Limit new checks to 1 per 50ms
         if let Some(it) = self.last_ta_trigger {
@@ -902,8 +920,6 @@ impl IceAgent {
             }
         }
         self.last_ta_trigger = Some(now);
-
-        self.poll_nomination(&mut on_event);
 
         // If the triggered-check queue associated with the checklist
         // contains one or more candidate pairs, the agent removes the top
@@ -947,9 +963,7 @@ impl IceAgent {
             let stun_request = stun::make_binding_request(
                 transaction_id,
                 &self.local_credentials,
-                self.remote_credentials
-                    .as_ref()
-                    .expect("cannot make pairs without remote credentials"),
+                remote_credentials,
                 &self.local_candidates[pair.local],
                 self.is_controlling,
                 self.control_tie_breaker,
@@ -968,7 +982,7 @@ impl IceAgent {
                 target,
             };
 
-            on_event(IceEvent::SendData {
+            self.events.push_back(IceEvent::SendData {
                 component: pair.component,
                 data: stun_request,
                 source: Some(source),
@@ -977,7 +991,8 @@ impl IceAgent {
         }
     }
 
-    fn poll_retransmit(&mut self, now: Instant, mut on_event: impl FnMut(IceEvent)) {
+    /// Check all pending STUN transactions for pending retransmits
+    fn poll_retransmit(&mut self, now: Instant) {
         for pair in &mut self.pairs {
             let CandidatePairState::InProgress {
                 transaction_id: _,
@@ -1003,7 +1018,7 @@ impl IceAgent {
             *retransmits += 1;
             *retransmit_at += self.stun_config.retransmit_delta(*retransmits);
 
-            on_event(IceEvent::SendData {
+            self.events.push_back(IceEvent::SendData {
                 component: pair.component,
                 data: stun_request.clone(),
                 source: Some(*source),
@@ -1012,7 +1027,7 @@ impl IceAgent {
         }
     }
 
-    fn poll_state(&mut self, mut on_event: impl FnMut(IceEvent)) {
+    fn poll_state(&mut self) {
         // Check gathering state
         let mut all_completed = true;
         for stun_server in &self.stun_server {
@@ -1022,14 +1037,14 @@ impl IceAgent {
         }
 
         if all_completed && self.gathering_state != IceGatheringState::Complete {
-            on_event(IceEvent::GatheringStateChanged {
+            self.events.push_back(IceEvent::GatheringStateChanged {
                 old: self.gathering_state,
                 new: IceGatheringState::Complete,
             });
 
             self.gathering_state = IceGatheringState::Complete;
         } else if !all_completed && self.gathering_state != IceGatheringState::Gathering {
-            on_event(IceEvent::GatheringStateChanged {
+            self.events.push_back(IceEvent::GatheringStateChanged {
                 old: self.gathering_state,
                 new: IceGatheringState::Gathering,
             });
@@ -1076,33 +1091,29 @@ impl IceAgent {
         };
 
         if has_nomination_for_all && self.connection_state != IceConnectionState::Connected {
-            self.set_connection_state(IceConnectionState::Connected, on_event);
+            self.set_connection_state(IceConnectionState::Connected);
         } else if !has_nomination_for_all {
             if still_possible {
                 match self.connection_state {
                     IceConnectionState::New => {
-                        self.set_connection_state(IceConnectionState::Checking, on_event);
+                        self.set_connection_state(IceConnectionState::Checking);
                     }
                     IceConnectionState::Checking => {}
                     IceConnectionState::Connected => {
-                        self.set_connection_state(IceConnectionState::Disconnected, on_event);
+                        self.set_connection_state(IceConnectionState::Disconnected);
                     }
                     IceConnectionState::Failed => {}
                     IceConnectionState::Disconnected => {}
                 }
             } else {
-                self.set_connection_state(IceConnectionState::Failed, on_event);
+                self.set_connection_state(IceConnectionState::Failed);
             }
         }
     }
 
-    fn set_connection_state(
-        &mut self,
-        new: IceConnectionState,
-        mut on_event: impl FnMut(IceEvent),
-    ) {
+    fn set_connection_state(&mut self, new: IceConnectionState) {
         if self.connection_state != new {
-            on_event(IceEvent::ConnectionStateChanged {
+            self.events.push_back(IceEvent::ConnectionStateChanged {
                 old: self.connection_state,
                 new,
             });
@@ -1110,19 +1121,16 @@ impl IceAgent {
         }
     }
 
-    fn poll_nomination(&mut self, mut on_event: impl FnMut(IceEvent)) {
-        self.poll_nomination_of_component(&mut on_event, Component::Rtp);
+    /// Progress the nomination state of the agent.
+    fn poll_nomination(&mut self) {
+        self.poll_nomination_of_component(Component::Rtp);
 
         if !self.rtcp_mux {
-            self.poll_nomination_of_component(&mut on_event, Component::Rtcp);
+            self.poll_nomination_of_component(Component::Rtcp);
         }
     }
-
-    fn poll_nomination_of_component(
-        &mut self,
-        mut on_event: impl FnMut(IceEvent),
-        component: Component,
-    ) {
+    /// Progress the candidate nomination for a given component
+    fn poll_nomination_of_component(&mut self, component: Component) {
         if self.is_controlling {
             // Nothing to do, already nominated a pair
             let skip = self
@@ -1186,11 +1194,18 @@ impl IceAgent {
 
             pair.nominated = true;
 
-            on_event(IceEvent::UseAddr {
+            self.events.push_back(IceEvent::UseAddr {
                 component,
                 target: self.remote_candidates[pair.remote].addr,
             });
         }
+    }
+
+    /// Returns the next event to process
+    ///
+    /// This must be called until it returns None
+    pub fn pop_event(&mut self) -> Option<IceEvent> {
+        self.events.pop_front()
     }
 
     /// Returns a duration after which to call [`poll`](IceAgent::poll)
@@ -1200,14 +1215,14 @@ impl IceAgent {
             .last_ta_trigger
             .map(|it| {
                 let poll_at = it + Duration::from_millis(50);
-                poll_at.checked_duration_since(now)
+                poll_at.checked_duration_since(now).unwrap_or_default()
             })
             .unwrap_or_default();
 
         // Next stun binding refresh/retransmit
         let stun_bindings = self.stun_server.iter().filter_map(|b| b.timeout(now)).min();
 
-        opt_min(ta, stun_bindings)
+        opt_min(Some(ta), stun_bindings)
     }
 
     /// Returns all discovered local ice agents, does not include peer-reflexive candidates

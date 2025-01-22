@@ -416,6 +416,23 @@ impl SdpSession {
         media_id
     }
 
+    /// Mark the media as deleted
+    ///
+    /// The actual deletion will be performed with the next SDP exchange
+    pub fn remove_media(&mut self, media_id: MediaId) {
+        if self.state.iter().any(|e| e.id == media_id) {
+            self.pending_changes
+                .push(PendingChange::RemoveMedia(media_id))
+        }
+    }
+
+    pub fn update_media(&mut self, media_id: MediaId, new_direction: Direction) {
+        if self.state.iter().any(|e| e.id == media_id) {
+            self.pending_changes
+                .push(PendingChange::ChangeDirection(media_id, new_direction))
+        }
+    }
+
     /// Receive a SDP offer in this session.
     ///
     /// Returns an opaque response state object which can be used to create the actual response SDP.
@@ -440,7 +457,7 @@ impl SdpSession {
 
             if let Some(position) = matched_position {
                 let mut media = self.state.remove(position);
-                self.update_media(requested_direction, &mut media);
+                self.update_active_media(requested_direction, &mut media);
                 response.push(SdpResponseEntry::Active(media.id));
                 new_state.push(media);
                 continue;
@@ -539,7 +556,11 @@ impl SdpSession {
         });
     }
 
-    fn update_media(&mut self, requested_direction: DirectionBools, media: &mut ActiveMedia) {
+    fn update_active_media(
+        &mut self,
+        requested_direction: DirectionBools,
+        media: &mut ActiveMedia,
+    ) {
         // let transport = self.transports[media.transport].unwrap_mut();
 
         if media.direction != requested_direction {
@@ -888,11 +909,6 @@ impl SdpSession {
                         replace(transport_builder, TransportBuilder::placeholder());
 
                     let transport = transport_builder.build_from_answer(
-                        Self::propagate_transport_events(
-                            &self.state,
-                            &mut self.events,
-                            transport_id,
-                        ),
                         &mut self.transport_state,
                         TransportRequiredChanges::new(transport_id, &mut self.transport_changes),
                         &answer,
@@ -1095,14 +1111,7 @@ impl SdpSession {
                     );
                 }
                 TransportEntry::TransportBuilder(transport_builder) => {
-                    transport_builder.poll(
-                        now,
-                        Self::propagate_transport_events(
-                            &self.state,
-                            &mut self.events,
-                            transport_id,
-                        ),
-                    );
+                    transport_builder.poll(now);
                 }
             }
         }
@@ -1166,24 +1175,18 @@ impl SdpSession {
         self.events.pop()
     }
 
-    pub fn receive(&mut self, transport_id: TransportId, mut pkt: ReceivedPkt) {
+    pub fn receive(&mut self, transport_id: TransportId, pkt: ReceivedPkt) {
         let transport = match &mut self.transports[transport_id] {
             TransportEntry::Transport(transport) => transport,
             TransportEntry::TransportBuilder(transport_builder) => {
-                transport_builder.receive(
-                    Self::propagate_transport_events(&self.state, &mut self.events, transport_id),
-                    pkt,
-                );
+                transport_builder.receive(pkt);
                 return;
             }
         };
 
-        match transport.receive(
-            Self::propagate_transport_events(&self.state, &mut self.events, transport_id),
-            &mut pkt,
-        ) {
-            ReceivedPacket::Rtp => {
-                let rtp_packet = match RtpPacket::parse(&pkt.data) {
+        match transport.receive(pkt) {
+            ReceivedPacket::Rtp(pkt_data) => {
+                let rtp_packet = match RtpPacket::parse(&pkt_data) {
                     Ok(rtp_packet) => rtp_packet,
                     Err(e) => {
                         log::debug!("Failed to parse RTP packet, {e:?}");
@@ -1220,8 +1223,8 @@ impl SdpSession {
                     log::warn!("Failed to find media for RTP packet ssrc={}", packet.ssrc());
                 }
             }
-            ReceivedPacket::Rtcp => {
-                let rtcp_compound = match Compound::parse(&pkt.data) {
+            ReceivedPacket::Rtcp(pkt_data) => {
+                let rtcp_compound = match Compound::parse(&pkt_data) {
                     Ok(rtcp_compound) => rtcp_compound,
                     Err(e) => {
                         log::debug!("Failed to parse incoming RTCP packet, {e}");

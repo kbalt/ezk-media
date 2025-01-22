@@ -136,13 +136,9 @@ pub(super) fn make_role_error(
 
 pub(crate) fn verify_integrity(
     local_credentials: &IceCredentials,
-    remote_credentials: &Option<IceCredentials>,
+    remote_credentials: &IceCredentials,
     stun_msg: &mut Message,
 ) -> bool {
-    let Some(remote_credentials) = remote_credentials else {
-        return false;
-    };
-
     let is_request = match stun_msg.class() {
         Class::Request | Class::Indication => true,
         Class::Success | Class::Error => false,

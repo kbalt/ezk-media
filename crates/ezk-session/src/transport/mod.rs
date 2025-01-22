@@ -90,6 +90,8 @@ pub(crate) struct Transport {
 
     state: ConnectionState,
     kind: TransportKind,
+
+    events: VecDeque<TransportEvent>,
 }
 
 enum TransportKind {
@@ -173,6 +175,7 @@ impl Transport {
                 extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
                 state: ConnectionState::Connected,
                 kind: TransportKind::Rtp,
+                events: VecDeque::new(),
             },
             TransportProtocol::RtpSavp => {
                 let (crypto, inbound, outbound) =
@@ -192,6 +195,7 @@ impl Transport {
                         inbound,
                         outbound,
                     },
+                    events: VecDeque::new(),
                 }
             }
             TransportProtocol::UdpTlsRtpSavp => Self::dtls_srtp_from_offer(
@@ -277,6 +281,7 @@ impl Transport {
                 dtls,
                 srtp: None,
             },
+            events: VecDeque::new(),
         })
     }
 
@@ -330,6 +335,34 @@ impl Transport {
         }
     }
 
+    pub(crate) fn pop_event(&mut self) -> Option<TransportEvent> {
+        while let Some(ice_event) = self.ice_agent.as_mut().and_then(IceAgent::pop_event) {
+            match ice_event {
+                IceEvent::GatheringStateChanged { old, new } => {}
+                IceEvent::ConnectionStateChanged { old, new } => {}
+                IceEvent::UseAddr { component, target } => match component {
+                    Component::Rtp => self.remote_rtp_address = target,
+                    Component::Rtcp => self.remote_rtcp_address = target,
+                },
+                IceEvent::SendData {
+                    component,
+                    data,
+                    source,
+                    target,
+                } => {
+                    return Some(TransportEvent::SendData {
+                        component,
+                        data,
+                        source,
+                        target,
+                    })
+                }
+            }
+        }
+
+        self.events.pop_front()
+    }
+
     pub(crate) fn poll(&mut self, now: Instant, mut on_event: impl FnMut(TransportEvent)) {
         match &mut self.kind {
             TransportKind::Rtp => {}
@@ -349,51 +382,11 @@ impl Transport {
         }
 
         if let Some(ice_agent) = &mut self.ice_agent {
-            ice_agent.poll(
-                now,
-                Self::handle_ice_event(
-                    &mut on_event,
-                    &mut self.remote_rtp_address,
-                    &mut self.remote_rtcp_address,
-                ),
-            );
+            ice_agent.poll(now);
         }
     }
 
-    /// Create a closure to handle events emitted by the IceAgent
-    fn handle_ice_event<'a, F: FnMut(TransportEvent) + 'a>(
-        mut on_event: F,
-        remote_rtp_address: &'a mut SocketAddr,
-        remote_rtcp_address: &'a mut SocketAddr,
-    ) -> impl FnMut(IceEvent) + use<'a, F> {
-        move |event| match event {
-            IceEvent::GatheringStateChanged { old, new } => {}
-            IceEvent::ConnectionStateChanged { old, new } => {}
-            IceEvent::UseAddr { component, target } => match component {
-                Component::Rtp => *remote_rtp_address = target,
-                Component::Rtcp => *remote_rtcp_address = target,
-            },
-            IceEvent::SendData {
-                component,
-                data,
-                source,
-                target,
-            } => {
-                on_event(TransportEvent::SendData {
-                    component,
-                    data,
-                    source,
-                    target,
-                });
-            }
-        }
-    }
-
-    pub(crate) fn receive(
-        &mut self,
-        mut on_event: impl FnMut(TransportEvent),
-        pkt: &mut ReceivedPkt,
-    ) -> ReceivedPacket {
+    pub(crate) fn receive(&mut self, mut pkt: ReceivedPkt) -> ReceivedPacket {
         match PacketKind::identify(&pkt.data) {
             PacketKind::Rtp => {
                 // Handle incoming RTP packet
@@ -406,7 +399,7 @@ impl Transport {
                     inbound.unprotect(&mut pkt.data).unwrap();
                 }
 
-                ReceivedPacket::Rtp
+                ReceivedPacket::Rtp(pkt.data)
             }
             PacketKind::Rtcp => {
                 // Handle incoming RTCP packet
@@ -419,52 +412,39 @@ impl Transport {
                     inbound.unprotect_rtcp(&mut pkt.data).unwrap();
                 }
 
-                ReceivedPacket::Rtcp
+                ReceivedPacket::Rtcp(pkt.data)
             }
             PacketKind::Stun => {
                 if let Some(ice_agent) = &mut self.ice_agent {
-                    ice_agent.receive(
-                        Self::handle_ice_event(
-                            on_event,
-                            &mut self.remote_rtp_address,
-                            &mut self.remote_rtcp_address,
-                        ),
-                        pkt,
-                    );
+                    ice_agent.receive(pkt);
                 }
 
                 ReceivedPacket::TransportSpecific
             }
             PacketKind::Dtls => {
-                println!("received dtls1");
-
                 // We only expect DTLS traffic on the rtp socket
                 if pkt.component != Component::Rtp {
                     return ReceivedPacket::TransportSpecific;
                 }
 
-                println!("received dtls");
-
                 if let TransportKind::DtlsSrtp { dtls, srtp, .. } = &mut self.kind {
                     dtls.receive(pkt.data.clone());
 
                     if let Some((inbound, outbound)) = dtls.handshake().unwrap() {
-                        Self::update_connection_state(
-                            &mut on_event,
-                            &mut self.state,
-                            ConnectionState::Connected,
-                        );
-
                         *srtp = Some((inbound.into_session(), outbound.into_session()));
                     }
 
                     while let Some(data) = dtls.pop_to_send() {
-                        on_event(TransportEvent::SendData {
+                        self.events.push_back(TransportEvent::SendData {
                             component: Component::Rtp,
                             data,
                             source: None, // TODO: set this
                             target: self.remote_rtp_address,
                         });
+                    }
+
+                    if srtp.is_some() {
+                        self.update_connection_state(ConnectionState::Connected);
                     }
                 }
 
@@ -510,18 +490,14 @@ impl Transport {
     }
 
     // Set the a new connection state and emit an event if the state differs from the old one
-    fn update_connection_state(
-        mut on_event: impl FnMut(TransportEvent),
-        state: &mut ConnectionState,
-        new: ConnectionState,
-    ) {
-        if *state != new {
-            on_event(TransportEvent::ConnectionState {
-                old: *state,
+    fn update_connection_state(&mut self, new: ConnectionState) {
+        if self.state != new {
+            self.events.push_back(TransportEvent::ConnectionState {
+                old: self.state,
                 new: ConnectionState::Connected,
             });
 
-            *state = ConnectionState::Connected;
+            self.state = ConnectionState::Connected;
         }
     }
 }
@@ -529,8 +505,8 @@ impl Transport {
 #[derive(Debug)]
 #[must_use]
 pub(crate) enum ReceivedPacket {
-    Rtp,
-    Rtcp,
+    Rtp(Vec<u8>),
+    Rtcp(Vec<u8>),
     TransportSpecific,
 }
 

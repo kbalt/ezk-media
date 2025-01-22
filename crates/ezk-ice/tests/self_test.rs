@@ -41,65 +41,43 @@ fn same_network() {
     while a.connection_state() != IceConnectionState::Connected
         && b.connection_state() != IceConnectionState::Connected
     {
-        poll_agent(&mut a, &mut b, a_addr, b_addr, now);
+        a.poll(now);
+        b.poll(now);
+
+        let mut to_a = Vec::new();
+        let mut to_b = Vec::new();
+
+        while {
+            poll_agent(&mut a, a_addr, &mut to_b, &mut to_a);
+            poll_agent(&mut b, b_addr, &mut to_a, &mut to_b);
+
+            !to_a.is_empty() || !to_b.is_empty()
+        } {}
 
         now += opt_min(a.timeout(now), b.timeout(now)).unwrap();
     }
 }
 
 fn poll_agent(
-    a: &mut IceAgent,
-    b: &mut IceAgent,
-    a_addr: SocketAddr,
-    b_addr: SocketAddr,
-    now: Instant,
-) {
-    loop {
-        let mut a_events = Vec::new();
-        let mut b_events = Vec::new();
-
-        a.poll(now, handle_events(a_addr, &mut a_events));
-        b.poll(now, handle_events(b_addr, &mut b_events));
-
-        if a_events.is_empty() && b_events.is_empty() {
-            return;
-        }
-
-        while !a_events.is_empty() || !b_events.is_empty() {
-            feed_agent_events(a, a_addr, &mut a_events, &mut b_events);
-            feed_agent_events(b, b_addr, &mut b_events, &mut a_events);
-        }
-    }
-}
-
-fn feed_agent_events(
     agent: &mut IceAgent,
     agent_addr: SocketAddr,
     to_peer: &mut Vec<Packet>,
     from_peer: &mut Vec<Packet>,
 ) {
     for packet in take(from_peer) {
-        agent.receive(
-            handle_events(agent_addr, to_peer),
-            &ReceivedPkt {
-                data: packet.data,
-                source: packet.source,
-                destination: packet.destination,
-                component: Component::Rtp,
-            },
-        );
+        agent.receive(ReceivedPkt {
+            data: packet.data,
+            source: packet.source,
+            destination: packet.destination,
+            component: Component::Rtp,
+        });
     }
-}
 
-fn handle_events(
-    agent_addr: SocketAddr,
-    to_peer: &mut Vec<Packet>,
-) -> impl FnMut(IceEvent) + use<'_> {
-    move |event| {
+    while let Some(event) = agent.pop_event() {
         if let IceEvent::SendData {
-            component,
+            component: _,
             data,
-            source,
+            source: _,
             target,
         } = event
         {
@@ -107,8 +85,8 @@ fn handle_events(
                 data,
                 source: agent_addr,
                 destination: target,
-            })
-        };
+            });
+        }
     }
 }
 
