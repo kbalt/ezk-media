@@ -1171,7 +1171,49 @@ impl SdpSession {
         }
     }
 
+    /// Returns the next event to process. Must be called until it return None.
     pub fn pop_event(&mut self) -> Option<Event> {
+        for (transport_id, transport) in &mut self.transports {
+            let event = match transport {
+                TransportEntry::Transport(transport) => transport.pop_event(),
+                TransportEntry::TransportBuilder(transport_builder) => {
+                    transport_builder.pop_event()
+                }
+            };
+
+            let Some(event) = event else {
+                continue;
+            };
+
+            match event {
+                TransportEvent::ConnectionState { old, new } => {
+                    // Emit a connection state change for every media using the transport
+                    for media in &self.state {
+                        if media.transport == transport_id {
+                            self.events.push(Event::ConnectionState {
+                                media_id: media.id,
+                                old,
+                                new,
+                            });
+                        }
+                    }
+                }
+                TransportEvent::SendData {
+                    component,
+                    data,
+                    source,
+                    target,
+                } => {
+                    return Some(Event::SendData {
+                        socket: SocketId(transport_id, component),
+                        data,
+                        source,
+                        target,
+                    })
+                }
+            }
+        }
+
         self.events.pop()
     }
 

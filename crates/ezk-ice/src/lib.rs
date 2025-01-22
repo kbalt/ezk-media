@@ -94,6 +94,7 @@ pub struct IceAgent {
 
     last_ta_trigger: Option<Instant>,
 
+    /// STUN Messages that are received before the remote credentials are available
     backlog: Vec<ReceivedPkt<Message>>,
 
     events: VecDeque<IceEvent>,
