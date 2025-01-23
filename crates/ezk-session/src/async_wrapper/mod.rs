@@ -162,12 +162,10 @@ impl AsyncSdpSession {
                         println!("invalid socket id")
                     }
                 }
-                Event::ConnectionState { media_id, old, new } => {
-                    println!("Connection state of {media_id:?} changed from {old:?} to {new:?}");
-                }
                 Event::ReceiveRTP { media_id, packet } => {
-                    // println!("Received RTP on {media_id:?}");
+                    println!("Received RTP on {media_id:?}");
                 }
+                _ => todo!(),
             }
         }
 

@@ -5,7 +5,10 @@ use super::{
     IceAgent, ReceivedPacket, SessionTransportState, Transport, TransportEvent, TransportKind,
     TransportRequiredChanges,
 };
-use crate::{rtp::RtpExtensionIds, ConnectionState, ReceivedPkt, RtcpMuxPolicy, TransportType};
+use crate::{
+    events::TransportConnectionState, rtp::RtpExtensionIds, ReceivedPkt, RtcpMuxPolicy,
+    TransportType,
+};
 use core::panic;
 use ezk_ice::{IceCredentials, IceEvent};
 use sdp_types::{Fingerprint, MediaDescription, SessionDescription, Setup};
@@ -230,7 +233,7 @@ impl TransportBuilder {
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
                 extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
-                state: ConnectionState::Connected,
+                state: TransportConnectionState::Connected,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
             },
@@ -245,7 +248,7 @@ impl TransportBuilder {
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
                     extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
-                    state: ConnectionState::Connected,
+                    state: TransportConnectionState::Connected,
                     kind: TransportKind::SdesSrtp {
                         crypto: vec![crypto],
                         inbound,
@@ -279,7 +282,7 @@ impl TransportBuilder {
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
                     extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
-                    state: ConnectionState::New,
+                    state: TransportConnectionState::New,
                     kind: TransportKind::DtlsSrtp {
                         fingerprint,
                         setup: match setup {
@@ -294,11 +297,14 @@ impl TransportBuilder {
             }
         };
 
-        if transport.state != ConnectionState::New {
-            transport.events.push_back(TransportEvent::ConnectionState {
-                old: ConnectionState::New,
-                new: transport.state,
-            });
+        if transport.state != TransportConnectionState::New {
+            // todo: do not set state to connected if an ice agent is used
+            transport
+                .events
+                .push_back(TransportEvent::TransportConnectionState {
+                    old: TransportConnectionState::New,
+                    new: transport.state,
+                });
         }
 
         // Feed the already received messages into the transport

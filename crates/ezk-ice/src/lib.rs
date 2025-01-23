@@ -546,14 +546,29 @@ impl IceAgent {
     /// Prune the lowest priority pairs until `max_pairs` is reached
     fn prune_pairs(&mut self) {
         while self.pairs.len() > self.max_pairs {
-            let pair = self.pairs.pop().unwrap();
-            log::debug!("Pruned pair {:?}:{:?}", pair.local, pair.remote);
+            let pair = self
+                .pairs
+                .pop()
+                .expect("just checked that self.pairs.len() > self.max_pairs");
+            log::debug!(
+                "Pruned pair {}",
+                DisplayPair(
+                    &self.local_candidates[pair.local],
+                    &self.remote_candidates[pair.remote]
+                )
+            );
         }
     }
 
     /// Receive network packets for this ICE agent
     pub fn receive(&mut self, pkt: ReceivedPkt) {
-        let mut stun_msg = Message::parse(pkt.data).unwrap();
+        let mut stun_msg = match Message::parse(pkt.data) {
+            Ok(stun_msg) => stun_msg,
+            Err(e) => {
+                log::debug!("Failed to parse stun message {e}");
+                return;
+            }
+        };
 
         let passed_fingerprint_check = stun_msg
             .attribute::<Fingerprint>()
@@ -681,15 +696,18 @@ impl IceAgent {
         }
 
         // Check if we discover a new peer-reflexive candidate here
-        let mapped_addr = pkt.data.attribute::<XorMappedAddress>().unwrap().unwrap();
-        if mapped_addr.0 != self.local_candidates[pair.local].addr {
-            let component = pair.component;
-            self.add_local_candidate(
-                component,
-                CandidateKind::PeerReflexive,
-                pkt.destination,
-                mapped_addr.0,
-            );
+        if let Some(Ok(mapped_addr)) = pkt.data.attribute::<XorMappedAddress>() {
+            if mapped_addr.0 != self.local_candidates[pair.local].addr {
+                let component = pair.component;
+                self.add_local_candidate(
+                    component,
+                    CandidateKind::PeerReflexive,
+                    pkt.destination,
+                    mapped_addr.0,
+                );
+            }
+        } else {
+            log::trace!("no (valid) XOR-MAPPED-ADDRESS attribute in STUN success response");
         }
     }
 
@@ -1032,7 +1050,7 @@ impl IceAgent {
         // Check gathering state
         let mut all_completed = true;
         for stun_server in &self.stun_server {
-            if !stun_server.completed() {
+            if !stun_server.is_completed() {
                 all_completed = false;
             }
         }
@@ -1079,7 +1097,7 @@ impl IceAgent {
             }
         }
 
-        let has_nomination_for_all = if self.rtcp_mux {
+        let has_nomination_for_all_components = if self.rtcp_mux {
             has_rtp_nomination
         } else {
             has_rtp_nomination && has_rtcp_nomination
@@ -1091,9 +1109,11 @@ impl IceAgent {
             rtp_in_progress && rtcp_in_progress
         };
 
-        if has_nomination_for_all && self.connection_state != IceConnectionState::Connected {
+        if has_nomination_for_all_components
+            && self.connection_state != IceConnectionState::Connected
+        {
             self.set_connection_state(IceConnectionState::Connected);
-        } else if !has_nomination_for_all {
+        } else if !has_nomination_for_all_components {
             if still_possible {
                 match self.connection_state {
                     IceConnectionState::New => {

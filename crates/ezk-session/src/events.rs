@@ -1,4 +1,5 @@
 use crate::{MediaId, SocketId, TransportId};
+use ezk_ice::{IceConnectionState, IceGatheringState};
 use ezk_rtp::RtpPacket;
 use std::{
     collections::VecDeque,
@@ -6,21 +7,39 @@ use std::{
 };
 
 pub enum Event {
+    /// The gathering state of the ICE agent used by the transport changed state
+    ///
+    /// This event will only trigger on transports which use an ICE agent
+    IceGatheringState {
+        transport_id: TransportId,
+        old: IceGatheringState,
+        new: IceGatheringState,
+    },
+
+    /// The connection state of the ICE agent used by the transport changed state
+    ///
+    /// This event will only trigger on transports which use an ICE agent
+    IceConnectionState {
+        transport_id: TransportId,
+        old: IceConnectionState,
+        new: IceConnectionState,
+    },
+
+    /// The transport's connection state changed.
+    ///
+    /// Note that not all states are reachable depending on the transport kind (RTP, SDES-RTP or DTLS-SRTP).
+    TransportConnectionState {
+        transport_id: TransportId,
+        old: TransportConnectionState,
+        new: TransportConnectionState,
+    },
+
     /// Send data
     SendData {
         socket: SocketId,
         data: Vec<u8>,
         source: Option<IpAddr>,
         target: SocketAddr,
-    },
-
-    /// Connection state of the media has changed
-    ///
-    /// This is emitted for every track even if they are bundled on the same transport
-    ConnectionState {
-        media_id: MediaId,
-        old: ConnectionState,
-        new: ConnectionState,
     },
 
     /// Receive RTP on a track
@@ -30,17 +49,33 @@ pub enum Event {
     },
 }
 
-/// Connection state of a media track
-///
-/// Each track has its own connection state, since tracks may not always be bundled on the same transport.
+/// Connection state of a transport
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionState {
+pub enum TransportConnectionState {
+    /// The transport has just been created
     New,
+
+    /// # DTLS-SRTP
+    ///
+    /// DTLS is in the process of negotiating a secure connection and verifying the remote fingerprint.
     Connecting,
+
+    /// # DTLS-SRTP
+    ///
+    /// DTLS has completed negotiation of a secure connection and verified the remote fingerprint.
+    ///
+    /// # RTP or SDES-SRTP
+    ///
+    /// This state is reached as soon as the SDP exchange has concluded or (if used) the ICE agent has established a connection.
     Connected,
-    Disconnected,
-    Failed,
+
+    // TODO: is this a state we need? Unused transport are usually deleted
     Closed,
+
+    /// # DTLS-SRTP
+    ///
+    /// The transport has failed as the result of an error (such as receipt of an error alert or failure to validate the remote fingerprint).
+    Failed,
 }
 
 #[derive(Default)]

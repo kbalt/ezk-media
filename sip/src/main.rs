@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
         invite_layer,
     });
 
-    Udp::spawn(&mut builder, "0.0.0.0:5060").await?;
+    Udp::spawn(&mut builder, "0.0.0.0:5066").await?;
     // builder.add_transport_factory(Arc::new(TcpConnector::new()));
 
     // Build endpoint to start the SIP Stack
@@ -188,17 +188,17 @@ async fn main() -> Result<()> {
         dialog_layer,
         invite_layer,
         NameAddr::uri(SipUri::new(
-            "172.23.97.79:5060".parse::<SocketAddr>().unwrap().into(),
+            "10.6.0.3:5066".parse::<SocketAddr>().unwrap().into(),
         )),
         Contact::new(NameAddr::uri(SipUri::new(
-            "172.23.97.79:5060".parse::<SocketAddr>().unwrap().into(),
+            "10.6.0.3:5066".parse::<SocketAddr>().unwrap().into(),
         ))),
         Box::new(SipUri::new(
-            "172.23.96.1:5062".parse::<SocketAddr>().unwrap().into(),
+            "10.6.0.3:5067".parse::<SocketAddr>().unwrap().into(),
         )),
     );
 
-    let mut sess = AsyncSdpSession::new("172.23.97.79".parse().unwrap());
+    let mut sess = AsyncSdpSession::new("10.6.0.3".parse().unwrap());
     sess.add_stun_server("15.197.250.192:3478".parse().unwrap());
     let audio_id = sess.add_local_media(
         Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),

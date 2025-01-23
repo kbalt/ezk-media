@@ -109,7 +109,6 @@ pub(super) fn make_role_error(
     let mut stun_message = MessageBuilder::new(Class::Success, Method::Binding, transaction_id);
 
     let username = format!("{}:{}", local_credentials.ufrag, remote_credentials.ufrag);
-
     stun_message.add_attr(Username::new(&username));
 
     stun_message.add_attr(ErrorCode {
@@ -128,7 +127,6 @@ pub(super) fn make_role_error(
         MessageIntegrity,
         MessageIntegrityKey::new(&remote_credentials.pwd),
     );
-
     stun_message.add_attr(Fingerprint);
 
     stun_message.finish()
@@ -154,16 +152,32 @@ pub(crate) fn verify_integrity(
         .attribute_with::<MessageIntegrity>(MessageIntegrityKey::new(key))
         .is_some_and(|r| r.is_ok());
 
+    if !passed_integrity_check {
+        return false;
+    }
+
     if is_request {
+        // STUN requests require the USERNAME attribute to be set, validate that is contains the one we expect
         let expected_username = format!("{}:{}", local_credentials.ufrag, remote_credentials.ufrag);
-        let username = stun_msg.attribute::<Username>().unwrap().unwrap();
+        let username = match stun_msg.attribute::<Username>() {
+            Some(Ok(username)) => username,
+            Some(Err(e)) => {
+                log::debug!("Failed to parse STUN username attribute, {e}");
+                return false;
+            }
+            None => {
+                log::debug!("STUN request is missing the USERNAME attribute");
+                return false;
+            }
+        };
 
         if username.0 != expected_username {
             return false;
         }
     }
 
-    passed_integrity_check
+    // All checks passed
+    true
 }
 
 pub(crate) struct StunServerBinding {
@@ -205,7 +219,7 @@ impl StunServerBinding {
     }
 
     /// Returns if the binding has either been completed or failed to complete
-    pub(crate) fn completed(&self) -> bool {
+    pub(crate) fn is_completed(&self) -> bool {
         self.last_mapped_addr.is_some() || matches!(self.state, StunServerBindingState::Failed)
     }
 

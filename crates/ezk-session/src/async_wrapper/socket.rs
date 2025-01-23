@@ -91,8 +91,6 @@ impl Socket {
 
                 buf.set_filled(meta[0].len);
 
-                println!("Received {} from {}", meta[0].len, meta[0].addr);
-
                 Ok((
                     meta[0]
                         .dst_ip

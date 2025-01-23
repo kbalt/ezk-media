@@ -30,11 +30,10 @@ mod local_media;
 mod options;
 mod rtp;
 mod transport;
-mod wrapper;
 
 pub use async_wrapper::AsyncSdpSession;
 pub use codecs::{Codec, Codecs};
-pub use events::{ConnectionState, Event, Events};
+pub use events::{Event, Events, TransportConnectionState};
 pub use options::{BundlePolicy, Options, RtcpMuxPolicy, TransportType};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -591,7 +590,6 @@ impl SdpSession {
             self.transports
                 .try_insert_with_key(|id| -> Result<TransportEntry, Option<_>> {
                     Transport::create_from_offer(
-                        Self::propagate_transport_events(&self.state, &mut self.events, id),
                         &mut self.transport_state,
                         TransportRequiredChanges::new(id, &mut self.transport_changes),
                         session_desc,
@@ -1098,17 +1096,10 @@ impl SdpSession {
 
     /// Poll for new events. Call [`pop_event`](Self::pop_event) to handle them.
     pub fn poll(&mut self, now: Instant) {
-        for (transport_id, transport) in &mut self.transports {
+        for transport in &mut self.transports.values_mut() {
             match transport {
                 TransportEntry::Transport(transport) => {
-                    transport.poll(
-                        now,
-                        Self::propagate_transport_events(
-                            &self.state,
-                            &mut self.events,
-                            transport_id,
-                        ),
-                    );
+                    transport.poll(now);
                 }
                 TransportEntry::TransportBuilder(transport_builder) => {
                     transport_builder.poll(now);
@@ -1136,41 +1127,6 @@ impl SdpSession {
         }
     }
 
-    /// "Converts" the the transport's event to the session events
-    fn propagate_transport_events<'a>(
-        state: &'a [ActiveMedia],
-        events: &'a mut Events,
-        transport_id: TransportId,
-    ) -> impl FnMut(TransportEvent) + use<'a> {
-        move |event| {
-            match event {
-                TransportEvent::ConnectionState { old, new } => {
-                    // Emit the connection state event for every track that uses the transport
-                    for media in state.iter().filter(|m| m.transport == transport_id) {
-                        events.push(Event::ConnectionState {
-                            media_id: media.id,
-                            old,
-                            new,
-                        });
-                    }
-                }
-                TransportEvent::SendData {
-                    component,
-                    data,
-                    source,
-                    target,
-                } => {
-                    events.push(Event::SendData {
-                        socket: SocketId(transport_id, component),
-                        data,
-                        source,
-                        target,
-                    });
-                }
-            }
-        }
-    }
-
     /// Returns the next event to process. Must be called until it return None.
     pub fn pop_event(&mut self) -> Option<Event> {
         for (transport_id, transport) in &mut self.transports {
@@ -1186,17 +1142,26 @@ impl SdpSession {
             };
 
             match event {
-                TransportEvent::ConnectionState { old, new } => {
-                    // Emit a connection state change for every media using the transport
-                    for media in &self.state {
-                        if media.transport == transport_id {
-                            self.events.push(Event::ConnectionState {
-                                media_id: media.id,
-                                old,
-                                new,
-                            });
-                        }
-                    }
+                TransportEvent::IceConnectionState { old, new } => {
+                    return Some(Event::IceConnectionState {
+                        transport_id,
+                        old,
+                        new,
+                    })
+                }
+                TransportEvent::IceGatheringState { old, new } => {
+                    return Some(Event::IceGatheringState {
+                        transport_id,
+                        old,
+                        new,
+                    })
+                }
+                TransportEvent::TransportConnectionState { old, new } => {
+                    return Some(Event::TransportConnectionState {
+                        transport_id,
+                        old,
+                        new,
+                    })
                 }
                 TransportEvent::SendData {
                     component,

@@ -1,9 +1,14 @@
 use crate::{
-    events::TransportRequiredChanges, opt_min, rtp::RtpExtensionIds, ConnectionState, Error,
-    TransportType,
+    events::{TransportConnectionState, TransportRequiredChanges},
+    opt_min,
+    rtp::RtpExtensionIds,
+    Error, TransportType,
 };
 use dtls_srtp::{make_ssl_context, DtlsSetup, DtlsSrtpSession};
-use ezk_ice::{Component, IceAgent, IceCredentials, IceEvent, ReceivedPkt};
+use ezk_ice::{
+    Component, IceAgent, IceConnectionState, IceCredentials, IceEvent, IceGatheringState,
+    ReceivedPkt,
+};
 use openssl::{hash::MessageDigest, ssl::SslContext};
 use sdp_types::{
     Connection, Fingerprint, FingerprintAlgorithm, MediaDescription, SessionDescription, Setup,
@@ -62,9 +67,17 @@ impl SessionTransportState {
 }
 
 pub(crate) enum TransportEvent {
-    ConnectionState {
-        old: ConnectionState,
-        new: ConnectionState,
+    IceGatheringState {
+        old: IceGatheringState,
+        new: IceGatheringState,
+    },
+    IceConnectionState {
+        old: IceConnectionState,
+        new: IceConnectionState,
+    },
+    TransportConnectionState {
+        old: TransportConnectionState,
+        new: TransportConnectionState,
     },
     SendData {
         component: Component,
@@ -88,7 +101,7 @@ pub(crate) struct Transport {
     // TODO: either split these up in send / receive ids or just make then receive and always use RtpExtensionIds::new() for send
     pub(crate) extension_ids: RtpExtensionIds,
 
-    state: ConnectionState,
+    state: TransportConnectionState,
     kind: TransportKind,
 
     events: VecDeque<TransportEvent>,
@@ -115,7 +128,6 @@ enum TransportKind {
 impl Transport {
     // TODO: rethink the return type here, this Result<Option<T>> business isn't really working out on the caller site
     pub(crate) fn create_from_offer(
-        mut on_event: impl FnMut(TransportEvent),
         state: &mut SessionTransportState,
         mut required_changes: TransportRequiredChanges<'_>,
         session_desc: &SessionDescription,
@@ -164,7 +176,7 @@ impl Transport {
             None
         };
 
-        let transport = match &remote_media_desc.media.proto {
+        let mut transport = match &remote_media_desc.media.proto {
             TransportProtocol::RtpAvp => Transport {
                 local_rtp_port: None,
                 local_rtcp_port: None,
@@ -173,7 +185,7 @@ impl Transport {
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
                 extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
-                state: ConnectionState::Connected,
+                state: TransportConnectionState::Connected,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
             },
@@ -189,7 +201,7 @@ impl Transport {
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
                     extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
-                    state: ConnectionState::Connected,
+                    state: TransportConnectionState::Connected,
                     kind: TransportKind::SdesSrtp {
                         crypto,
                         inbound,
@@ -208,11 +220,13 @@ impl Transport {
             _ => return Ok(None),
         };
 
-        if transport.state != ConnectionState::New {
-            on_event(TransportEvent::ConnectionState {
-                old: ConnectionState::New,
-                new: transport.state,
-            })
+        if transport.state != TransportConnectionState::New {
+            transport
+                .events
+                .push_back(TransportEvent::TransportConnectionState {
+                    old: TransportConnectionState::New,
+                    new: transport.state,
+                })
         }
 
         Ok(Some(transport))
@@ -271,7 +285,7 @@ impl Transport {
             rtcp_mux: remote_media_desc.rtcp_mux,
             ice_agent,
             extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
-            state: ConnectionState::New,
+            state: TransportConnectionState::New,
             kind: TransportKind::DtlsSrtp {
                 fingerprint: vec![state.dtls_fingerprint()],
                 setup: match setup {
@@ -338,8 +352,12 @@ impl Transport {
     pub(crate) fn pop_event(&mut self) -> Option<TransportEvent> {
         while let Some(ice_event) = self.ice_agent.as_mut().and_then(IceAgent::pop_event) {
             match ice_event {
-                IceEvent::GatheringStateChanged { old, new } => {}
-                IceEvent::ConnectionStateChanged { old, new } => {}
+                IceEvent::GatheringStateChanged { old, new } => {
+                    return Some(TransportEvent::IceGatheringState { old, new })
+                }
+                IceEvent::ConnectionStateChanged { old, new } => {
+                    return Some(TransportEvent::IceConnectionState { old, new })
+                }
                 IceEvent::UseAddr { component, target } => match component {
                     Component::Rtp => self.remote_rtp_address = target,
                     Component::Rtcp => self.remote_rtcp_address = target,
@@ -363,7 +381,7 @@ impl Transport {
         self.events.pop_front()
     }
 
-    pub(crate) fn poll(&mut self, now: Instant, mut on_event: impl FnMut(TransportEvent)) {
+    pub(crate) fn poll(&mut self, now: Instant) {
         match &mut self.kind {
             TransportKind::Rtp => {}
             TransportKind::SdesSrtp { .. } => {}
@@ -371,7 +389,7 @@ impl Transport {
                 assert!(dtls.handshake().unwrap().is_none());
 
                 while let Some(data) = dtls.pop_to_send() {
-                    on_event(TransportEvent::SendData {
+                    self.events.push_back(TransportEvent::SendData {
                         component: Component::Rtp,
                         data,
                         source: None, // TODO: set this
@@ -444,7 +462,7 @@ impl Transport {
                     }
 
                     if srtp.is_some() {
-                        self.update_connection_state(ConnectionState::Connected);
+                        self.update_connection_state(TransportConnectionState::Connected);
                     }
                 }
 
@@ -490,14 +508,15 @@ impl Transport {
     }
 
     // Set the a new connection state and emit an event if the state differs from the old one
-    fn update_connection_state(&mut self, new: ConnectionState) {
+    fn update_connection_state(&mut self, new: TransportConnectionState) {
         if self.state != new {
-            self.events.push_back(TransportEvent::ConnectionState {
-                old: self.state,
-                new: ConnectionState::Connected,
-            });
+            self.events
+                .push_back(TransportEvent::TransportConnectionState {
+                    old: self.state,
+                    new: TransportConnectionState::Connected,
+                });
 
-            self.state = ConnectionState::Connected;
+            self.state = TransportConnectionState::Connected;
         }
     }
 }
