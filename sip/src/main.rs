@@ -9,10 +9,8 @@ use sip_types::uri::NameAddr;
 use sip_types::{Code, Method};
 use sip_ua::dialog::{Dialog, DialogLayer};
 use sip_ua::invite::acceptor::Acceptor;
-use sip_ua::invite::initiator::{Initiator, Response};
 use sip_ua::invite::session::{Event, Session};
 use sip_ua::invite::{create_ack, InviteLayer};
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -39,6 +37,7 @@ impl Layer for InviteAcceptLayer {
         let ip = local_ip_address::local_ip().unwrap();
 
         let mut sdp_session = AsyncSdpSession::new(ip);
+        sdp_session.add_stun_server("15.197.250.192:3478".parse().unwrap());
         sdp_session.add_local_media(
             Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),
             1,
@@ -131,7 +130,7 @@ async fn add_video_stream(
 
     sdp_session.add_media(v, Direction::SendRecv);
 
-    let offer = sdp_session.create_offer().await;
+    let offer = sdp_session.create_offer().await.unwrap();
 
     let mut request = session.dialog.create_request(Method::INVITE);
 
@@ -177,66 +176,66 @@ async fn main() -> Result<()> {
         invite_layer,
     });
 
-    Udp::spawn(&mut builder, "0.0.0.0:5066").await?;
+    Udp::spawn(&mut builder, "0.0.0.0:5060").await?;
     // builder.add_transport_factory(Arc::new(TcpConnector::new()));
 
     // Build endpoint to start the SIP Stack
     let endpoint = builder.build();
 
-    let mut initiator = Initiator::new(
-        endpoint.clone(),
-        dialog_layer,
-        invite_layer,
-        NameAddr::uri(SipUri::new(
-            "10.6.0.3:5066".parse::<SocketAddr>().unwrap().into(),
-        )),
-        Contact::new(NameAddr::uri(SipUri::new(
-            "10.6.0.3:5066".parse::<SocketAddr>().unwrap().into(),
-        ))),
-        Box::new(SipUri::new(
-            "10.6.0.3:5067".parse::<SocketAddr>().unwrap().into(),
-        )),
-    );
+    // let mut initiator = Initiator::new(
+    //     endpoint.clone(),
+    //     dialog_layer,
+    //     invite_layer,
+    //     NameAddr::uri(SipUri::new(
+    //         "10.6.0.3:5066".parse::<SocketAddr>().unwrap().into(),
+    //     )),
+    //     Contact::new(NameAddr::uri(SipUri::new(
+    //         "10.6.0.3:5066".parse::<SocketAddr>().unwrap().into(),
+    //     ))),
+    //     Box::new(SipUri::new(
+    //         "10.6.0.3:5067".parse::<SocketAddr>().unwrap().into(),
+    //     )),
+    // );
 
-    let mut sess = AsyncSdpSession::new("10.6.0.3".parse().unwrap());
-    sess.add_stun_server("15.197.250.192:3478".parse().unwrap());
-    let audio_id = sess.add_local_media(
-        Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),
-        1,
-        Direction::RecvOnly,
-    );
-    let _m = sess.add_media(audio_id, Direction::SendRecv);
-    let offer = sess.create_offer().await;
+    // let mut sess = AsyncSdpSession::new("10.6.0.3".parse().unwrap());
+    // sess.add_stun_server("15.197.250.192:3478".parse().unwrap());
+    // let audio_id = sess.add_local_media(
+    //     Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),
+    //     1,
+    //     Direction::RecvOnly,
+    // );
+    // let _m = sess.add_media(audio_id, Direction::SendRecv);
+    // let offer = sess.create_offer().await;
 
-    let mut invite = initiator.create_invite();
-    invite.headers.insert("Content-Type", "application/sdp");
-    invite.body = offer.to_string().into();
+    // let mut invite = initiator.create_invite();
+    // invite.headers.insert("Content-Type", "application/sdp");
+    // invite.body = offer.to_string().into();
 
-    initiator.send_invite(invite).await.unwrap();
-    while let Ok(response) = initiator.receive().await {
-        match response {
-            Response::Provisional(..) => {}
-            Response::Failure(..) => break,
-            Response::Early(..) => todo!(),
-            Response::Session(session, tsx_response) => {
-                let mut x = create_ack(&session.dialog, tsx_response.base_headers.cseq.cseq)
-                    .await
-                    .unwrap();
+    // initiator.send_invite(invite).await.unwrap();
+    // while let Ok(response) = initiator.receive().await {
+    //     match response {
+    //         Response::Provisional(..) => {}
+    //         Response::Failure(..) => break,
+    //         Response::Early(..) => todo!(),
+    //         Response::Session(session, tsx_response) => {
+    //             let mut x = create_ack(&session.dialog, tsx_response.base_headers.cseq.cseq)
+    //                 .await
+    //                 .unwrap();
 
-                endpoint.send_outgoing_request(&mut x).await.unwrap();
+    //             endpoint.send_outgoing_request(&mut x).await.unwrap();
 
-                let answer = SessionDescription::parse(
-                    &BytesStr::from_utf8_bytes(tsx_response.body).unwrap(),
-                )
-                .unwrap();
+    //             let answer = SessionDescription::parse(
+    //                 &BytesStr::from_utf8_bytes(tsx_response.body).unwrap(),
+    //             )
+    //             .unwrap();
 
-                sess.receive_sdp_answer(answer).await.unwrap();
+    //             sess.receive_sdp_answer(answer).await.unwrap();
 
-                sess.run().await.unwrap();
-            }
-            Response::Finished => break,
-        };
-    }
+    //             sess.run().await.unwrap();
+    //         }
+    //         Response::Finished => break,
+    //     };
+    // }
 
     // Busy sleep loop
     loop {

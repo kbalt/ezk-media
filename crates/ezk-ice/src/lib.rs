@@ -102,7 +102,7 @@ pub struct IceAgent {
 
 /// State of gathering candidates from external (STUN/TURN) servers.
 /// If no STUN server is configured this state will jump directly to `Complete`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IceGatheringState {
     /// The ICE agent was just created
     New,
@@ -1212,6 +1212,14 @@ impl IceAgent {
                 // no pair to nominate
                 return;
             };
+
+            log::debug!(
+                "using pair {}",
+                DisplayPair(
+                    &self.local_candidates[pair.local],
+                    &self.remote_candidates[pair.remote]
+                )
+            );
 
             pair.nominated = true;
 

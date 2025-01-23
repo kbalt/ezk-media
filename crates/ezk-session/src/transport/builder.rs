@@ -6,11 +6,12 @@ use super::{
     TransportRequiredChanges,
 };
 use crate::{
-    events::TransportConnectionState, rtp::RtpExtensionIds, ReceivedPkt, RtcpMuxPolicy,
-    TransportType,
+    events::TransportConnectionState, rtp::extensions::RtpExtensionIdsExt, ReceivedPkt,
+    RtcpMuxPolicy, TransportType,
 };
 use core::panic;
 use ezk_ice::{IceCredentials, IceEvent};
+use ezk_rtp::RtpExtensionIds;
 use sdp_types::{Fingerprint, MediaDescription, SessionDescription, Setup};
 use std::{
     collections::VecDeque,
@@ -96,7 +97,7 @@ impl TransportBuilder {
     }
 
     pub(crate) fn populate_desc(&self, desc: &mut MediaDescription) {
-        desc.extmap.extend(RtpExtensionIds::new().to_extmap());
+        desc.extmap.extend(RtpExtensionIds::offer().to_extmap());
 
         match &self.kind {
             TransportBuilderKind::Rtp => {}
@@ -117,7 +118,6 @@ impl TransportBuilder {
             desc.ice_pwd = Some(sdp_types::IcePassword {
                 pwd: ice_agent.credentials().pwd.clone().into(),
             });
-            desc.ice_end_of_candidates = true;
         }
     }
 
@@ -232,7 +232,7 @@ impl TransportBuilder {
                 remote_rtcp_address,
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
-                extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
+                extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
                 state: TransportConnectionState::Connected,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
@@ -247,7 +247,7 @@ impl TransportBuilder {
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
-                    extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
+                    extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
                     state: TransportConnectionState::Connected,
                     kind: TransportKind::SdesSrtp {
                         crypto: vec![crypto],
@@ -281,7 +281,7 @@ impl TransportBuilder {
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
-                    extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
+                    extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
                     state: TransportConnectionState::New,
                     kind: TransportKind::DtlsSrtp {
                         fingerprint,

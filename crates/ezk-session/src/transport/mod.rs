@@ -1,7 +1,7 @@
 use crate::{
     events::{TransportConnectionState, TransportRequiredChanges},
     opt_min,
-    rtp::RtpExtensionIds,
+    rtp::extensions::RtpExtensionIdsExt,
     Error, TransportType,
 };
 use dtls_srtp::{make_ssl_context, DtlsSetup, DtlsSrtpSession};
@@ -9,6 +9,7 @@ use ezk_ice::{
     Component, IceAgent, IceConnectionState, IceCredentials, IceEvent, IceGatheringState,
     ReceivedPkt,
 };
+use ezk_rtp::{RtpExtensionIds, RtpPacket};
 use openssl::{hash::MessageDigest, ssl::SslContext};
 use sdp_types::{
     Connection, Fingerprint, FingerprintAlgorithm, MediaDescription, SessionDescription, Setup,
@@ -94,7 +95,7 @@ pub(crate) struct Transport {
     pub(crate) remote_rtp_address: SocketAddr,
     pub(crate) remote_rtcp_address: SocketAddr,
 
-    pub(crate) rtcp_mux: bool,
+    rtcp_mux: bool,
 
     pub(crate) ice_agent: Option<IceAgent>,
 
@@ -126,7 +127,6 @@ enum TransportKind {
 }
 
 impl Transport {
-    // TODO: rethink the return type here, this Result<Option<T>> business isn't really working out on the caller site
     pub(crate) fn create_from_offer(
         state: &mut SessionTransportState,
         mut required_changes: TransportRequiredChanges<'_>,
@@ -184,7 +184,7 @@ impl Transport {
                 remote_rtcp_address,
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
-                extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
+                extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
                 state: TransportConnectionState::Connected,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
@@ -200,7 +200,7 @@ impl Transport {
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
-                    extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
+                    extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
                     state: TransportConnectionState::Connected,
                     kind: TransportKind::SdesSrtp {
                         crypto,
@@ -284,7 +284,7 @@ impl Transport {
             remote_rtcp_address,
             rtcp_mux: remote_media_desc.rtcp_mux,
             ice_agent,
-            extension_ids: RtpExtensionIds::from_desc(remote_media_desc),
+            extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
             state: TransportConnectionState::New,
             kind: TransportKind::DtlsSrtp {
                 fingerprint: vec![state.dtls_fingerprint()],
@@ -331,7 +331,6 @@ impl Transport {
             desc.ice_pwd = Some(sdp_types::IcePassword {
                 pwd: ice_agent.credentials().pwd.clone().into(),
             });
-            desc.ice_end_of_candidates = true;
         }
     }
 
@@ -417,7 +416,13 @@ impl Transport {
                     inbound.unprotect(&mut pkt.data).unwrap();
                 }
 
-                ReceivedPacket::Rtp(pkt.data)
+                match RtpPacket::parse(self.extension_ids, pkt.data) {
+                    Ok(packet) => ReceivedPacket::Rtp(packet),
+                    Err(e) => {
+                        log::warn!("Failed to parse RTP packet, {e}");
+                        ReceivedPacket::TransportSpecific
+                    }
+                }
             }
             PacketKind::Rtcp => {
                 // Handle incoming RTCP packet
@@ -475,7 +480,9 @@ impl Transport {
         }
     }
 
-    pub(crate) fn protect_rtp(&mut self, packet: &mut Vec<u8>) {
+    pub(crate) fn send_rtp(&mut self, packet: RtpPacket) {
+        let mut packet = packet.to_vec(self.extension_ids);
+
         match &mut self.kind {
             TransportKind::DtlsSrtp { srtp: None, .. } => {
                 panic!("Tried to protect RTP on non-ready DTLS-SRTP transport");
@@ -485,13 +492,20 @@ impl Transport {
                 srtp: Some((_, outbound)),
                 ..
             } => {
-                outbound.protect(packet).unwrap();
+                outbound.protect(&mut packet).unwrap();
             }
             _ => (),
         }
+
+        self.events.push_back(TransportEvent::SendData {
+            component: Component::Rtp,
+            data: packet,
+            source: None,
+            target: self.remote_rtp_address,
+        });
     }
 
-    pub(crate) fn protect_rtcp(&mut self, packet: &mut Vec<u8>) {
+    pub(crate) fn send_rtcp(&mut self, mut packet: Vec<u8>) {
         match &mut self.kind {
             TransportKind::DtlsSrtp { srtp: None, .. } => {
                 panic!("Tried to protect RTCP on non-ready DTLS-SRTP transport");
@@ -501,10 +515,23 @@ impl Transport {
                 srtp: Some((_, outbound)),
                 ..
             } => {
-                outbound.protect_rtcp(packet).unwrap();
+                outbound.protect_rtcp(&mut packet).unwrap();
             }
             _ => (),
         }
+
+        let component = if self.rtcp_mux {
+            Component::Rtp
+        } else {
+            Component::Rtcp
+        };
+
+        self.events.push_back(TransportEvent::SendData {
+            component,
+            data: packet,
+            source: None, // TODO: set this according to the transport
+            target: self.remote_rtcp_address,
+        });
     }
 
     // Set the a new connection state and emit an event if the state differs from the old one
@@ -524,7 +551,7 @@ impl Transport {
 #[derive(Debug)]
 #[must_use]
 pub(crate) enum ReceivedPacket {
-    Rtp(Vec<u8>),
+    Rtp(RtpPacket),
     Rtcp(Vec<u8>),
     TransportSpecific,
 }

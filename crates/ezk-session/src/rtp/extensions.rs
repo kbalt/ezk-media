@@ -1,66 +1,23 @@
 use bytesstr::BytesStr;
-use ezk_rtp::{
-    parse_extensions,
-    rtp_types::{RtpPacket, RtpPacketBuilder},
-    RtpExtensionsWriter,
-};
+use ezk_rtp::RtpExtensionIds;
 use sdp_types::{Direction, ExtMap, MediaDescription};
 
 const RTP_MID_HDREXT: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
 
-pub(crate) struct RtpExtensions<'a> {
-    pub(crate) mid: Option<&'a [u8]>,
+pub(crate) trait RtpExtensionIdsExt {
+    fn offer() -> Self;
+    fn from_sdp_media_description(desc: &MediaDescription) -> Self;
+    fn to_extmap(&self) -> Vec<ExtMap>;
 }
 
-impl<'a> RtpExtensions<'a> {
-    pub(crate) fn from_packet(ids: &RtpExtensionIds, packet: &'a RtpPacket<'a>) -> Self {
-        let mut this = Self { mid: None };
-
-        let Some((profile, data)) = packet.extension() else {
-            return this;
-        };
-
-        for (id, data) in parse_extensions(profile, data) {
-            if Some(id) == ids.mid {
-                this.mid = Some(data);
-            }
-        }
-
-        this
+impl RtpExtensionIdsExt for RtpExtensionIds {
+    fn offer() -> Self {
+        RtpExtensionIds { mid: Some(1) }
     }
 
-    /// Write the extension data out and returns the profile-id if anything has been written
-    pub(crate) fn write<'b>(
-        &self,
-        ids: &RtpExtensionIds,
-        packet_builder: RtpPacketBuilder<&'b [u8], Vec<u8>>,
-    ) -> RtpPacketBuilder<&'b [u8], Vec<u8>> {
-        let Some((id, mid)) = ids.mid.zip(self.mid) else {
-            return packet_builder;
-        };
-
-        let mut buf = vec![];
-
-        let profile = RtpExtensionsWriter::new(&mut buf, mid.len() <= 16)
-            .with(id, mid)
-            .finish();
-
-        packet_builder.extension(profile, buf)
-    }
-}
-
-pub(crate) struct RtpExtensionIds {
-    pub(crate) mid: Option<u8>,
-}
-
-impl RtpExtensionIds {
-    pub(crate) fn new() -> Self {
-        Self { mid: Some(1) }
-    }
-
-    pub(crate) fn from_desc(offer: &MediaDescription) -> Self {
-        Self {
-            mid: offer
+    fn from_sdp_media_description(desc: &MediaDescription) -> Self {
+        RtpExtensionIds {
+            mid: desc
                 .extmap
                 .iter()
                 .find(|extmap| extmap.uri == RTP_MID_HDREXT)
@@ -68,7 +25,7 @@ impl RtpExtensionIds {
         }
     }
 
-    pub(crate) fn to_extmap(&self) -> Vec<ExtMap> {
+    fn to_extmap(&self) -> Vec<ExtMap> {
         let mut extmap = vec![];
 
         if let Some(mid_id) = self.mid {

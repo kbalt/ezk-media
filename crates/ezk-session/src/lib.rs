@@ -1,11 +1,11 @@
 #![warn(unreachable_pub)]
 
+use bytes::Bytes;
 use bytesstr::BytesStr;
 use events::{TransportChange, TransportRequiredChanges};
-use ezk_ice::{Component, IceAgent, ReceivedPkt};
+use ezk_ice::{Component, IceAgent, IceGatheringState, ReceivedPkt};
 use ezk_rtp::{rtcp_types::Compound, RtpPacket, RtpSession};
 use local_media::LocalMedia;
-use rtp::RtpExtensions;
 use sdp_types::{
     Connection, Direction, Fmtp, Group, IceOptions, IcePassword, IceUsernameFragment, Media,
     MediaDescription, MediaType, Origin, Rtcp, RtpMap, SessionDescription, Time,
@@ -218,15 +218,6 @@ enum PendingChange {
     AddMedia(PendingMedia),
     RemoveMedia(MediaId),
     ChangeDirection(MediaId, Direction),
-}
-
-impl PendingChange {
-    fn remove_media(&self) -> Option<MediaId> {
-        match self {
-            PendingChange::RemoveMedia(media_id) => Some(*media_id),
-            _ => None,
-        }
-    }
 }
 
 struct PendingMedia {
@@ -861,8 +852,7 @@ impl SdpSession {
                 let pending_removal = self
                     .pending_changes
                     .iter()
-                    .filter_map(PendingChange::remove_media)
-                    .any(|removed| removed == media.id);
+                    .any(|c| matches!(c, PendingChange::RemoveMedia(id) if *id == media.id));
 
                 if pending_removal {
                     // Ignore this active media since it's supposed to be removed
@@ -1192,24 +1182,13 @@ impl SdpSession {
         };
 
         match transport.receive(pkt) {
-            ReceivedPacket::Rtp(pkt_data) => {
-                let rtp_packet = match RtpPacket::parse(&pkt_data) {
-                    Ok(rtp_packet) => rtp_packet,
-                    Err(e) => {
-                        log::debug!("Failed to parse RTP packet, {e:?}");
-                        return;
-                    }
-                };
-
-                let packet = rtp_packet.get();
-                let extensions = RtpExtensions::from_packet(&transport.extension_ids, &packet);
-
+            ReceivedPacket::Rtp(packet) => {
                 // Find the matching media using the mid field
                 let entry = self
                     .state
                     .iter_mut()
                     .filter(|m| m.transport == transport_id)
-                    .find(|e| match (&e.mid, extensions.mid) {
+                    .find(|e| match (&e.mid, &packet.extensions.mid) {
                         (Some(a), Some(b)) => a.as_bytes() == b,
                         _ => false,
                     });
@@ -1221,13 +1200,13 @@ impl SdpSession {
                     self.state
                         .iter_mut()
                         .filter(|m| m.transport == transport_id)
-                        .find(|e| e.codec_pt == packet.payload_type())
+                        .find(|e| e.codec_pt == packet.pt)
                 };
 
                 if let Some(entry) = entry {
-                    entry.rtp_session.recv_rtp(rtp_packet);
+                    entry.rtp_session.recv_rtp(packet);
                 } else {
-                    log::warn!("Failed to find media for RTP packet ssrc={}", packet.ssrc());
+                    log::warn!("Failed to find media for RTP packet ssrc={}", packet.ssrc);
                 }
             }
             ReceivedPacket::Rtcp(pkt_data) => {
@@ -1249,33 +1228,26 @@ impl SdpSession {
         let media = self.state.iter_mut().find(|m| m.id == media_id).unwrap();
         let transport = self.transports[media.transport].unwrap_mut();
 
+        packet.ssrc = media.rtp_session.ssrc();
+        packet.extensions.mid = media.mid.as_ref().map(AsRef::<Bytes>::as_ref).cloned();
+
         // Tell the RTP session that a packet is being sent
         media.rtp_session.send_rtp(&packet);
 
-        // Re-serialize the packet with the extensions set
-        let mut packet_mut = packet.get_mut();
-        packet_mut.set_ssrc(media.rtp_session.ssrc());
+        transport.send_rtp(packet);
+    }
 
-        let extensions = RtpExtensions {
-            mid: media.mid.as_ref().map(|e| e.as_bytes()),
-        };
-        let builder = extensions.write(&transport.extension_ids, rtp::to_builder(&packet_mut));
-        let mut writer = rtp::RtpPacketWriterVec::default();
-        let mut packet = builder.write(&mut writer).unwrap();
-
-        // Use the transport to maybe protect the packet
-        transport.protect_rtp(&mut packet);
-
-        self.events.push(Event::SendData {
-            socket: SocketId(media.transport, Component::Rtp),
-            data: packet,
-            source: None, // TODO: set this according to the transport
-            target: transport.remote_rtp_address,
-        });
+    /// Returns the cumulative gathering state of all ice agents
+    pub fn ice_gathering_state(&self) -> Option<IceGatheringState> {
+        self.transports
+            .values()
+            .filter_map(|t| t.ice_agent())
+            .map(|a| a.gathering_state())
+            .min()
     }
 }
 
-fn send_rtcp_report(events: &mut Events, transport: &mut Transport, media: &mut ActiveMedia) {
+fn send_rtcp_report(transport: &mut Transport, media: &mut ActiveMedia) {
     let mut encode_buf = vec![0u8; 65535];
 
     let len = match media.rtp_session.write_rtcp_report(&mut encode_buf) {
@@ -1287,20 +1259,7 @@ fn send_rtcp_report(events: &mut Events, transport: &mut Transport, media: &mut 
     };
 
     encode_buf.truncate(len);
-    transport.protect_rtcp(&mut encode_buf);
-
-    let socket_use = if transport.rtcp_mux {
-        Component::Rtp
-    } else {
-        Component::Rtcp
-    };
-
-    events.push(Event::SendData {
-        socket: SocketId(media.transport, socket_use),
-        data: encode_buf,
-        source: None, // TODO: set this according to the transport
-        target: transport.remote_rtcp_address,
-    });
+    transport.send_rtcp(encode_buf);
 }
 
 // i'm too lazy to work with the direction type, so using this as a cop out

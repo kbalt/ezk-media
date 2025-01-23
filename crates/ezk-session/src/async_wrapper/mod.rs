@@ -1,7 +1,7 @@
 use crate::{
     events::TransportChange, Codecs, Event, LocalMediaId, MediaId, Options, ReceivedPkt, SocketId,
 };
-use ezk_ice::Component;
+use ezk_ice::{Component, IceGatheringState};
 use sdp_types::{Direction, SessionDescription};
 use socket::Socket;
 use std::{
@@ -22,6 +22,8 @@ pub struct AsyncSdpSession {
     sockets: HashMap<SocketId, Socket>,
     timeout: Option<Instant>,
     ips: Vec<IpAddr>,
+
+    buf: Vec<MaybeUninit<u8>>,
 }
 
 impl AsyncSdpSession {
@@ -35,12 +37,14 @@ impl AsyncSdpSession {
                 },
             ),
             sockets: HashMap::new(),
-            timeout: None,
+            timeout: Some(Instant::now()), // poll immediately
             ips: local_ip_address::linux::list_afinet_netifas()
                 .unwrap()
                 .into_iter()
                 .map(|(_, addr)| addr)
                 .collect(),
+
+            buf: vec![MaybeUninit::uninit(); 65535],
         }
     }
 
@@ -62,9 +66,10 @@ impl AsyncSdpSession {
         self.inner.add_media(local_media_id, direction)
     }
 
-    pub async fn create_offer(&mut self) -> SessionDescription {
-        self.handle_transport_changes().await.unwrap();
-        self.inner.create_sdp_offer()
+    pub async fn create_offer(&mut self) -> Result<SessionDescription, crate::Error> {
+        self.handle_transport_changes().await?;
+        self.run_until_all_candidates_are_gathered().await?;
+        Ok(self.inner.create_sdp_offer())
     }
 
     pub async fn receive_sdp_offer(
@@ -74,6 +79,7 @@ impl AsyncSdpSession {
         let state = self.inner.receive_sdp_offer(offer)?;
 
         self.handle_transport_changes().await?;
+        self.run_until_all_candidates_are_gathered().await?;
 
         Ok(self.inner.create_sdp_answer(state))
     }
@@ -163,44 +169,72 @@ impl AsyncSdpSession {
                     }
                 }
                 Event::ReceiveRTP { media_id, packet } => {
-                    println!("Received RTP on {media_id:?}");
+                    println!("Received RTP on {media_id:?} {}", packet.sequence_number);
                 }
-                _ => todo!(),
+                Event::IceGatheringState {
+                    transport_id,
+                    old,
+                    new,
+                } => println!("transport ice gathering state changed {old:?} -> {new:?}"),
+                Event::IceConnectionState {
+                    transport_id,
+                    old,
+                    new,
+                } => println!("transport ice connection state changed {old:?} -> {new:?}"),
+                Event::TransportConnectionState {
+                    transport_id,
+                    old,
+                    new,
+                } => println!("transport connection state changed {old:?} -> {new:?}"),
             }
         }
 
         Ok(())
     }
 
+    async fn run_until_all_candidates_are_gathered(&mut self) -> Result<(), crate::Error> {
+        while !matches!(
+            self.inner.ice_gathering_state(),
+            None | Some(IceGatheringState::Complete)
+        ) {
+            self.step().await?;
+            self.handle_events()?;
+        }
+
+        Ok(())
+    }
+
     pub async fn run(&mut self) -> io::Result<()> {
-        let mut buf = vec![MaybeUninit::uninit(); 65535];
-        let mut buf = ReadBuf::uninit(&mut buf);
-
         loop {
-            self.inner.poll(Instant::now());
-
+            self.step().await?;
             self.handle_events().unwrap();
-            self.timeout = self.inner.timeout().map(|d| Instant::now() + d);
+        }
+    }
 
-            select! {
-                (socket_id, result) = poll_sockets(&mut self.sockets, &mut buf) => {
-                    let (dst, source) = result?;
+    async fn step(&mut self) -> io::Result<()> {
+        let mut buf = ReadBuf::uninit(&mut self.buf);
 
-                    let pkt = ReceivedPkt {
-                        data: buf.filled().to_vec(),
-                        source,
-                        destination: dst,
-                        component: socket_id.1
-                    };
+        select! {
+            (socket_id, result) = poll_sockets(&mut self.sockets, &mut buf) => {
+                let (dst, source) = result?;
 
-                    self.inner.receive(socket_id.0, pkt);
-                    self.handle_events().unwrap();
+                let pkt = ReceivedPkt {
+                    data: buf.filled().to_vec(),
+                    source,
+                    destination: dst,
+                    component: socket_id.1
+                };
 
-                    buf.set_filled(0);
-                }
-                _ = timeout(self.timeout) => {
-                    continue;
-                }
+                self.inner.receive(socket_id.0, pkt);
+
+                buf.set_filled(0);
+
+                Ok(())
+            }
+            _ = timeout(self.timeout) => {
+                self.inner.poll(Instant::now());
+                self.timeout = self.inner.timeout().map(|d| Instant::now() + d);
+                Ok(())
             }
         }
     }
@@ -217,8 +251,6 @@ async fn poll_sockets(
     sockets: &mut HashMap<SocketId, Socket>,
     buf: &mut ReadBuf<'_>,
 ) -> (SocketId, Result<(SocketAddr, SocketAddr), io::Error>) {
-    buf.set_filled(0);
-
     poll_fn(|cx| {
         for (socket_id, socket) in sockets.iter_mut() {
             socket.send_pending(cx);
