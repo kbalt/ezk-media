@@ -25,9 +25,17 @@ pub(crate) enum DtlsSetup {
     Connect,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DtlsState {
+    Accepting,
+    Connecting,
+    Connected,
+    Failed,
+}
+
 pub(crate) struct DtlsSrtpSession {
     stream: SslStream<IoQueue>,
-    state: Option<DtlsSetup>,
+    state: DtlsState,
 }
 
 impl DtlsSrtpSession {
@@ -68,13 +76,20 @@ impl DtlsSrtpSession {
                     out: VecDeque::new(),
                 },
             )?,
-            state: Some(setup),
+            state: match setup {
+                DtlsSetup::Accept => DtlsState::Accepting,
+                DtlsSetup::Connect => DtlsState::Connecting,
+            },
         };
 
         // Put initial handshake into the IoQueue
         assert!(this.handshake()?.is_none());
 
         Ok(this)
+    }
+
+    pub(crate) fn state(&self) -> DtlsState {
+        self.state
     }
 
     #[cfg(openssl320)]
@@ -101,9 +116,9 @@ impl DtlsSrtpSession {
         )>,
     > {
         let result = match self.state {
-            Some(DtlsSetup::Connect) => self.stream.connect(),
-            Some(DtlsSetup::Accept) => self.stream.accept(),
-            None => {
+            DtlsState::Connecting => self.stream.connect(),
+            DtlsState::Accepting => self.stream.accept(),
+            _ => {
                 assert!(
                     self.stream.get_mut().to_read.is_none(),
                     "IoQueue has something to read, but state is None"
@@ -116,11 +131,12 @@ impl DtlsSrtpSession {
             if e.code() == ErrorCode::WANT_READ {
                 return Ok(None);
             } else {
+                self.state = DtlsState::Failed;
                 return Err(io::Error::other(e));
             }
         }
 
-        self.state = None;
+        self.state = DtlsState::Connected;
 
         let (inbound, outbound) =
             srtp::openssl::session_pair(self.stream.ssl(), Config::default()).unwrap();

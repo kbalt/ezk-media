@@ -141,8 +141,12 @@ impl TransportBuilder {
         let ice_agent = self.ice_agent.as_mut()?;
 
         match ice_agent.pop_event()? {
-            IceEvent::GatheringStateChanged { .. } => unreachable!(),
-            IceEvent::ConnectionStateChanged { .. } => unreachable!(),
+            IceEvent::GatheringStateChanged { old, new } => {
+                Some(TransportEvent::IceGatheringState { old, new })
+            }
+            IceEvent::ConnectionStateChanged { old, new } => {
+                Some(TransportEvent::IceConnectionState { old, new })
+            }
             IceEvent::UseAddr { .. } => unreachable!(),
             IceEvent::SendData {
                 component,
@@ -233,7 +237,7 @@ impl TransportBuilder {
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
                 extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
-                state: TransportConnectionState::Connected,
+                state: TransportConnectionState::New,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
             },
@@ -248,7 +252,7 @@ impl TransportBuilder {
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
                     extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
-                    state: TransportConnectionState::Connected,
+                    state: TransportConnectionState::New,
                     kind: TransportKind::SdesSrtp {
                         crypto: vec![crypto],
                         inbound,
@@ -297,14 +301,13 @@ impl TransportBuilder {
             }
         };
 
-        if transport.state != TransportConnectionState::New {
-            // todo: do not set state to connected if an ice agent is used
-            transport
-                .events
-                .push_back(TransportEvent::TransportConnectionState {
-                    old: TransportConnectionState::New,
-                    new: transport.state,
-                });
+        // RTP & SDES-SRTP transport are instantly set to the connected state if ICE is not used
+        if matches!(
+            transport.kind,
+            TransportKind::Rtp | TransportKind::SdesSrtp { .. }
+        ) && transport.ice_agent.is_none()
+        {
+            transport.set_connection_state(TransportConnectionState::Connecting);
         }
 
         // Feed the already received messages into the transport

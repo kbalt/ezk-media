@@ -52,9 +52,6 @@ slotmap::new_key_type! {
     pub struct TransportId;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SocketId(pub TransportId, pub Component);
-
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -1105,15 +1102,11 @@ impl SdpSession {
                 });
             }
 
-            // if media.next_rtcp <= now {
-            //     send_rtcp_report(
-            //         &mut self.events,
-            //         self.transports[media.transport].unwrap_mut(),
-            //         media,
-            //     );
-
-            //     media.next_rtcp += Duration::from_secs(5);
-            // }
+            // TODO: only emit rtcp if the media's transport state is connected
+            if media.next_rtcp <= now {
+                send_rtcp_report(self.transports[media.transport].unwrap_mut(), media);
+                media.next_rtcp += Duration::from_secs(5);
+            }
         }
     }
 
@@ -1160,7 +1153,8 @@ impl SdpSession {
                     target,
                 } => {
                     return Some(Event::SendData {
-                        socket: SocketId(transport_id, component),
+                        transport_id,
+                        component,
                         data,
                         source,
                         target,

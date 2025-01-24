@@ -1,5 +1,6 @@
 use crate::{
-    events::TransportChange, Codecs, Event, LocalMediaId, MediaId, Options, ReceivedPkt, SocketId,
+    events::TransportChange, Codecs, Event, LocalMediaId, MediaId, Options, ReceivedPkt,
+    TransportId,
 };
 use ezk_ice::{Component, IceGatheringState};
 use sdp_types::{Direction, SessionDescription};
@@ -19,7 +20,7 @@ mod socket;
 
 pub struct AsyncSdpSession {
     inner: super::SdpSession,
-    sockets: HashMap<SocketId, Socket>,
+    sockets: HashMap<(TransportId, Component), Socket>,
     timeout: Option<Instant>,
     ips: Vec<IpAddr>,
 
@@ -110,7 +111,7 @@ impl AsyncSdpSession {
                     );
 
                     self.sockets
-                        .insert(SocketId(transport_id, Component::Rtp), Socket::new(socket));
+                        .insert((transport_id, Component::Rtp), Socket::new(socket));
                 }
                 TransportChange::CreateSocketPair(transport_id) => {
                     println!("Create socket pair {transport_id:?}");
@@ -125,27 +126,21 @@ impl AsyncSdpSession {
                         Some(rtcp_socket.local_addr()?.port()),
                     );
 
-                    self.sockets.insert(
-                        SocketId(transport_id, Component::Rtp),
-                        Socket::new(rtp_socket),
-                    );
-                    self.sockets.insert(
-                        SocketId(transport_id, Component::Rtcp),
-                        Socket::new(rtcp_socket),
-                    );
+                    self.sockets
+                        .insert((transport_id, Component::Rtp), Socket::new(rtp_socket));
+                    self.sockets
+                        .insert((transport_id, Component::Rtcp), Socket::new(rtcp_socket));
                 }
                 TransportChange::Remove(transport_id) => {
                     println!("Remove {transport_id:?}");
 
-                    self.sockets.remove(&SocketId(transport_id, Component::Rtp));
-                    self.sockets
-                        .remove(&SocketId(transport_id, Component::Rtcp));
+                    self.sockets.remove(&(transport_id, Component::Rtp));
+                    self.sockets.remove(&(transport_id, Component::Rtcp));
                 }
                 TransportChange::RemoveRtcpSocket(transport_id) => {
                     println!("Remove rtcp socket of {transport_id:?}");
 
-                    self.sockets
-                        .remove(&SocketId(transport_id, Component::Rtcp));
+                    self.sockets.remove(&(transport_id, Component::Rtcp));
                 }
             }
         }
@@ -157,12 +152,13 @@ impl AsyncSdpSession {
         while let Some(event) = self.inner.pop_event() {
             match event {
                 Event::SendData {
-                    socket,
+                    transport_id,
+                    component,
                     data,
                     source,
                     target,
                 } => {
-                    if let Some(socket) = self.sockets.get_mut(&socket) {
+                    if let Some(socket) = self.sockets.get_mut(&(transport_id, component)) {
                         socket.enqueue(data, source, target);
                     } else {
                         println!("invalid socket id")
@@ -248,9 +244,12 @@ async fn timeout(instant: Option<Instant>) {
 }
 
 async fn poll_sockets(
-    sockets: &mut HashMap<SocketId, Socket>,
+    sockets: &mut HashMap<(TransportId, Component), Socket>,
     buf: &mut ReadBuf<'_>,
-) -> (SocketId, Result<(SocketAddr, SocketAddr), io::Error>) {
+) -> (
+    (TransportId, Component),
+    Result<(SocketAddr, SocketAddr), io::Error>,
+) {
     poll_fn(|cx| {
         for (socket_id, socket) in sockets.iter_mut() {
             socket.send_pending(cx);

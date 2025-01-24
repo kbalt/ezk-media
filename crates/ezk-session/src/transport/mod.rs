@@ -4,7 +4,7 @@ use crate::{
     rtp::extensions::RtpExtensionIdsExt,
     Error, TransportType,
 };
-use dtls_srtp::{make_ssl_context, DtlsSetup, DtlsSrtpSession};
+use dtls_srtp::{make_ssl_context, DtlsSetup, DtlsSrtpSession, DtlsState};
 use ezk_ice::{
     Component, IceAgent, IceConnectionState, IceCredentials, IceEvent, IceGatheringState,
     ReceivedPkt,
@@ -185,7 +185,7 @@ impl Transport {
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
                 extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
-                state: TransportConnectionState::Connected,
+                state: TransportConnectionState::New,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
             },
@@ -201,7 +201,7 @@ impl Transport {
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
                     extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
-                    state: TransportConnectionState::Connected,
+                    state: TransportConnectionState::New,
                     kind: TransportKind::SdesSrtp {
                         crypto,
                         inbound,
@@ -220,13 +220,13 @@ impl Transport {
             _ => return Ok(None),
         };
 
-        if transport.state != TransportConnectionState::New {
-            transport
-                .events
-                .push_back(TransportEvent::TransportConnectionState {
-                    old: TransportConnectionState::New,
-                    new: transport.state,
-                })
+        // RTP & SDES-SRTP transport are instantly set to the connected state if ICE is not used
+        if matches!(
+            transport.kind,
+            TransportKind::Rtp | TransportKind::SdesSrtp { .. }
+        ) && transport.ice_agent.is_none()
+        {
+            transport.set_connection_state(TransportConnectionState::Connected);
         }
 
         Ok(Some(transport))
@@ -398,8 +398,47 @@ impl Transport {
             }
         }
 
+        // update state
         if let Some(ice_agent) = &mut self.ice_agent {
             ice_agent.poll(now);
+
+            match ice_agent.connection_state() {
+                IceConnectionState::New => {}
+                IceConnectionState::Checking => {}
+                IceConnectionState::Connected => self.update_connection_state_on_ice_connected(),
+                IceConnectionState::Failed => {
+                    self.set_connection_state(TransportConnectionState::Failed);
+                }
+                IceConnectionState::Disconnected => {
+                    // unclear if the transport state should change here, since this state may be temporary
+                }
+            }
+        } else {
+            self.update_connection_state_on_ice_connected();
+        }
+    }
+
+    fn update_connection_state_on_ice_connected(&mut self) {
+        match &self.kind {
+            TransportKind::Rtp | TransportKind::SdesSrtp { .. } => {
+                self.set_connection_state(TransportConnectionState::Connected);
+            }
+            TransportKind::DtlsSrtp { dtls, srtp, .. } => match dtls.state() {
+                DtlsState::Accepting | DtlsState::Connecting => {
+                    self.set_connection_state(TransportConnectionState::Connecting);
+                }
+                DtlsState::Connected => {
+                    assert!(
+                        srtp.is_some(),
+                        "SRTP session must exist if DTLS transport is connected"
+                    );
+
+                    self.set_connection_state(TransportConnectionState::Connected);
+                }
+                DtlsState::Failed => {
+                    self.set_connection_state(TransportConnectionState::Failed);
+                }
+            },
         }
     }
 
@@ -464,10 +503,6 @@ impl Transport {
                             source: None, // TODO: set this
                             target: self.remote_rtp_address,
                         });
-                    }
-
-                    if srtp.is_some() {
-                        self.update_connection_state(TransportConnectionState::Connected);
                     }
                 }
 
@@ -535,15 +570,15 @@ impl Transport {
     }
 
     // Set the a new connection state and emit an event if the state differs from the old one
-    fn update_connection_state(&mut self, new: TransportConnectionState) {
+    fn set_connection_state(&mut self, new: TransportConnectionState) {
         if self.state != new {
             self.events
                 .push_back(TransportEvent::TransportConnectionState {
                     old: self.state,
-                    new: TransportConnectionState::Connected,
+                    new,
                 });
 
-            self.state = TransportConnectionState::Connected;
+            self.state = new;
         }
     }
 }

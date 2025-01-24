@@ -1,5 +1,5 @@
-use crate::{MediaId, SocketId, TransportId};
-use ezk_ice::{IceConnectionState, IceGatheringState};
+use crate::{MediaId, TransportId};
+use ezk_ice::{Component, IceConnectionState, IceGatheringState};
 use ezk_rtp::RtpPacket;
 use std::{
     collections::VecDeque,
@@ -36,7 +36,8 @@ pub enum Event {
 
     /// Send data
     SendData {
-        socket: SocketId,
+        transport_id: TransportId,
+        component: Component,
         data: Vec<u8>,
         source: Option<IpAddr>,
         target: SocketAddr,
