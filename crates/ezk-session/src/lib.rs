@@ -13,7 +13,7 @@ use sdp_types::{
 use slotmap::SlotMap;
 use std::{
     cmp::min,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     mem::replace,
     net::{IpAddr, SocketAddr},
@@ -33,7 +33,7 @@ mod transport;
 
 pub use async_wrapper::AsyncSdpSession;
 pub use codecs::{Codec, Codecs};
-pub use events::{Event, Events, TransportConnectionState};
+pub use events::{Event, TransportConnectionState};
 pub use options::{BundlePolicy, Options, RtcpMuxPolicy, TransportType};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -85,7 +85,7 @@ pub struct SdpSession {
     /// Pending changes which will be (maybe partially) applied once the offer/answer exchange has been completed
     pending_changes: Vec<PendingChange>,
     transport_changes: Vec<TransportChange>,
-    events: Events,
+    events: VecDeque<Event>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -279,7 +279,7 @@ impl SdpSession {
             transports: SlotMap::with_key(),
             pending_changes: Vec::new(),
             transport_changes: Vec::new(),
-            events: Events::default(),
+            events: VecDeque::new(),
         }
     }
 
@@ -1096,7 +1096,7 @@ impl SdpSession {
 
         for media in self.state.iter_mut() {
             if let Some(rtp_packet) = media.rtp_session.pop_rtp(None) {
-                self.events.push(Event::ReceiveRTP {
+                self.events.push_back(Event::ReceiveRTP {
                     media_id: media.id,
                     packet: rtp_packet,
                 });
@@ -1163,7 +1163,7 @@ impl SdpSession {
             }
         }
 
-        self.events.pop()
+        self.events.pop_front()
     }
 
     pub fn receive(&mut self, transport_id: TransportId, pkt: ReceivedPkt) {

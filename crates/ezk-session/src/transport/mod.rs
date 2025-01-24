@@ -100,7 +100,7 @@ pub(crate) struct Transport {
     pub(crate) ice_agent: Option<IceAgent>,
 
     // TODO: either split these up in send / receive ids or just make then receive and always use RtpExtensionIds::new() for send
-    pub(crate) extension_ids: RtpExtensionIds,
+    extension_ids: RtpExtensionIds,
 
     state: TransportConnectionState,
     kind: TransportKind,
@@ -263,19 +263,7 @@ impl Transport {
             })
             .collect();
 
-        let mut events = VecDeque::new();
-
-        let mut dtls =
-            DtlsSrtpSession::new(state.ssl_context(), remote_fingerprints.clone(), setup)?;
-        // TODO: Delay this until ice-agent is ready if one is used
-        while let Some(data) = dtls.pop_to_send() {
-            events.push_back(TransportEvent::SendData {
-                component: Component::Rtp,
-                data,
-                source: None,
-                target: remote_rtp_address,
-            });
-        }
+        let dtls = DtlsSrtpSession::new(state.ssl_context(), remote_fingerprints.clone(), setup)?;
 
         Ok(Transport {
             local_rtp_port: None,
@@ -373,6 +361,22 @@ impl Transport {
                         source,
                         target,
                     })
+                }
+            }
+        }
+
+        if matches!(
+            self.state,
+            TransportConnectionState::Connecting | TransportConnectionState::Connected
+        ) {
+            if let TransportKind::DtlsSrtp { dtls, .. } = &mut self.kind {
+                if let Some(data) = dtls.pop_to_send() {
+                    return Some(TransportEvent::SendData {
+                        component: Component::Rtp,
+                        data,
+                        source: None,
+                        target: self.remote_rtp_address,
+                    });
                 }
             }
         }

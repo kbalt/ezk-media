@@ -6,7 +6,7 @@ fn create_pair() -> (IceAgent, IceAgent) {
     let b = IceCredentials::random();
 
     let a_agent = IceAgent::new_from_answer(a.clone(), b.clone(), true, true);
-    let b_agent = IceAgent::new_from_answer(b, a, false, true);
+    let b_agent = IceAgent::new_from_answer(b, a, true, true);
 
     (a_agent, b_agent)
 }

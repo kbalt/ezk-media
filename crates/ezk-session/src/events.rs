@@ -1,11 +1,9 @@
 use crate::{MediaId, TransportId};
 use ezk_ice::{Component, IceConnectionState, IceGatheringState};
 use ezk_rtp::RtpPacket;
-use std::{
-    collections::VecDeque,
-    net::{IpAddr, SocketAddr},
-};
+use std::net::{IpAddr, SocketAddr};
 
+/// Session event returned by [`SdpSession::pop_event`](crate::SdpSession::pop_event)
 pub enum Event {
     /// The gathering state of the ICE agent used by the transport changed state
     ///
@@ -39,6 +37,7 @@ pub enum Event {
         transport_id: TransportId,
         component: Component,
         data: Vec<u8>,
+        /// The local IP address to use to send the datat
         source: Option<IpAddr>,
         target: SocketAddr,
     },
@@ -77,21 +76,6 @@ pub enum TransportConnectionState {
     ///
     /// The transport has failed as the result of an error (such as receipt of an error alert or failure to validate the remote fingerprint).
     Failed,
-}
-
-#[derive(Default)]
-pub struct Events {
-    events: VecDeque<Event>,
-}
-
-impl Events {
-    pub fn pop(&mut self) -> Option<Event> {
-        self.events.pop_front()
-    }
-
-    pub fn push(&mut self, event: Event) {
-        self.events.push_back(event);
-    }
 }
 
 /// Transport changes that have to be made before continuing with SDP negotiation.

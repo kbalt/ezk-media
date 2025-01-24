@@ -1197,7 +1197,7 @@ impl IceAgent {
                 return;
             }
 
-            // Find highest priority pair that received a use-candidate && was successful
+            // Find the highest priority pair that received a use-candidate && was successful
             let pair = self
                 .pairs
                 .iter_mut()
