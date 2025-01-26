@@ -1,4 +1,7 @@
-use crate::{Payloadable, Payloader, Rtp, RtpConfig, RtpConfigRange, RtpPacket};
+use crate::{
+    ExtendedSequenceNumber, Payloadable, Payloader, Rtp, RtpConfig, RtpConfigRange, RtpExtensions,
+    RtpPacket, RtpTimestamp, Ssrc,
+};
 use ezk::{ConfigRange, Frame, NextEventIsCancelSafe, Result, Source, SourceEvent, ValueRange};
 use std::collections::VecDeque;
 
@@ -15,7 +18,7 @@ impl<S: Source<MediaType: Payloadable> + NextEventIsCancelSafe> NextEventIsCance
 
 struct Stream<M: Payloadable> {
     config: RtpConfig,
-    sequence_number: u16,
+    sequence_number: ExtendedSequenceNumber,
 
     queue: VecDeque<RtpPacket>,
     payloader: M::Payloader,
@@ -71,7 +74,7 @@ where
 
         self.stream = Some(Stream {
             config,
-            sequence_number: rand::random(),
+            sequence_number: ExtendedSequenceNumber((rand::random::<u16>() / 2).into()),
             queue: VecDeque::new(),
             payloader: S::MediaType::make_payloader(config_),
         });
@@ -86,9 +89,9 @@ where
 
         loop {
             if let Some(packet) = stream.queue.pop_front() {
-                let timestamp = packet.get().timestamp();
+                let timestamp = packet.timestamp;
 
-                return Ok(SourceEvent::Frame(Frame::new(packet, timestamp as u64)));
+                return Ok(SourceEvent::Frame(Frame::new(packet, timestamp.0 as u64)));
             }
 
             let frame = match self.source.next_event().await? {
@@ -100,15 +103,14 @@ where
             let timestamp = (frame.timestamp & u64::from(u32::MAX)) as u32;
 
             for payload in stream.payloader.payload(frame, self.mtu) {
-                stream.sequence_number = stream.sequence_number.wrapping_add(1);
-
-                let packet = RtpPacket::new(
-                    &rtp_types::RtpPacketBuilder::new()
-                        .sequence_number(stream.sequence_number)
-                        .timestamp(timestamp)
-                        .payload_type(stream.config.pt)
-                        .payload(&payload),
-                );
+                let packet = RtpPacket {
+                    pt: stream.config.pt,
+                    sequence_number: stream.sequence_number.increase_one(),
+                    ssrc: Ssrc(0), // this is set later
+                    timestamp: RtpTimestamp(timestamp),
+                    extensions: RtpExtensions::default(),
+                    payload,
+                };
 
                 stream.queue.push_back(packet);
             }

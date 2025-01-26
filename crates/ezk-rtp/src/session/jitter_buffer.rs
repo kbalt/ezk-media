@@ -1,33 +1,43 @@
-use crate::RtpPacket;
-use std::{
-    cmp,
-    collections::{btree_map::Entry, BTreeMap},
-};
+use crate::{ExtendedRtpTimestamp, ExtendedSequenceNumber, RtpPacket};
+use std::{cmp::Ordering, collections::VecDeque, fmt};
 
-#[derive(Debug)]
+/// A queue based jitter buffer
+///
+/// Front of queue are the oldest packets (lowest sequence number)
+/// Back of queue are the newest packets (highest sequence number)
 pub(crate) struct JitterBuffer {
-    /// maximum number of entries
     max_entries: usize,
-    /// sequence-number -> packet map
-    entries: BTreeMap<u64, JbEntry>,
-    /// highest and lowest sequence number
-    state: Option<State>,
+    queue: VecDeque<QueueEntry>,
 
-    /// num packets dropped
+    /// Track the latest sequence number, to drop late packets
+    last_sequence_number_returned: Option<ExtendedSequenceNumber>,
+
+    /// num packets dropped due to being duplicate, too late or the receiver falling behind
     pub(crate) dropped: u64,
-
     /// num packets received
     pub(crate) received: u64,
     /// num packets not received
     pub(crate) lost: u64,
 }
 
+impl fmt::Debug for JitterBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JitterBuffer")
+            .field("max_entries", &self.max_entries)
+            .field("queue (len)", &self.queue.len())
+            .field("dropped", &self.dropped)
+            .field("received", &self.received)
+            .field("lost", &self.lost)
+            .finish()
+    }
+}
+
 impl Default for JitterBuffer {
     fn default() -> Self {
-        Self {
+        JitterBuffer {
             max_entries: 1000,
-            entries: BTreeMap::new(),
-            state: None,
+            queue: VecDeque::new(),
+            last_sequence_number_returned: None,
             dropped: 0,
             received: 0,
             lost: 0,
@@ -35,162 +45,215 @@ impl Default for JitterBuffer {
     }
 }
 
-#[derive(Debug)]
-struct State {
-    /// highest seq number
-    head: u64,
-    /// lowest seq number
-    tail: u64,
-
-    /// last known timestamp
-    last_timestamp: u64,
+enum QueueEntry {
+    Vacant(ExtendedSequenceNumber),
+    Occupied {
+        timestamp: ExtendedRtpTimestamp,
+        sequence_number: ExtendedSequenceNumber,
+        packet: RtpPacket,
+    },
 }
 
-#[derive(Debug)]
-struct JbEntry {
-    timestamp: u64,
-    packet: RtpPacket,
+impl QueueEntry {
+    fn sequence_number(&self) -> ExtendedSequenceNumber {
+        match self {
+            QueueEntry::Vacant(sequence_number) => *sequence_number,
+            QueueEntry::Occupied {
+                sequence_number, ..
+            } => *sequence_number,
+        }
+    }
+}
+
+impl fmt::Debug for QueueEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vacant(arg0) => f.debug_tuple("Vacant").field(arg0).finish(),
+            Self::Occupied {
+                timestamp: ts,
+                sequence_number: seq,
+                ..
+            } => f
+                .debug_struct("Occupied")
+                .field("ts", ts)
+                .field("seq", seq)
+                .finish(),
+        }
+    }
 }
 
 impl JitterBuffer {
-    pub(crate) fn last_sequence_number(&self) -> Option<u64> {
-        self.state.as_ref().map(|s| s.head)
-    }
+    pub(crate) fn push(
+        &mut self,
+        timestamp: ExtendedRtpTimestamp,
+        sequence_number: ExtendedSequenceNumber,
+        packet: RtpPacket,
+    ) {
+        if let Some(seq) = self.last_sequence_number_returned {
+            if seq >= sequence_number {
+                self.dropped += 1;
+                return;
+            }
+        }
 
-    pub(crate) fn push(&mut self, packet: RtpPacket) {
-        let rtp_packet = packet.get();
-
-        let Some(state) = &mut self.state else {
-            let sequence_number = u64::from(rtp_packet.sequence_number());
-            let timestamp = u64::from(rtp_packet.timestamp());
-
-            self.entries
-                .insert(sequence_number, JbEntry { timestamp, packet });
-
-            self.state = Some(State {
-                head: sequence_number,
-                tail: sequence_number,
-                last_timestamp: timestamp,
+        // front (1 2 3 4 5 6 7 8 9) back
+        let Some(entry) = self.queue.back_mut() else {
+            // queue is empty, insert entry and return
+            self.queue.push_back(QueueEntry::Occupied {
+                timestamp,
+                sequence_number,
+                packet,
             });
 
             return;
         };
 
-        let sequence_number = guess_sequence_number(state.tail, rtp_packet.sequence_number());
-        let timestamp = guess_timestamp(state.last_timestamp, rtp_packet.timestamp());
-        state.last_timestamp = timestamp;
+        match entry.sequence_number().cmp(&sequence_number) {
+            Ordering::Greater => {
+                for entry in self.queue.iter_mut().rev() {
+                    if entry.sequence_number() == sequence_number {
+                        if matches!(entry, QueueEntry::Vacant(..)) {
+                            *entry = QueueEntry::Occupied {
+                                timestamp,
+                                sequence_number,
+                                packet,
+                            };
+                        } else {
+                            self.dropped += 1;
+                        }
+                        return;
+                    }
+                }
+            }
+            Ordering::Equal => {
+                // last entry is equal, insert if its vacant
+                if matches!(entry, QueueEntry::Vacant(..)) {
+                    *entry = QueueEntry::Occupied {
+                        timestamp,
+                        sequence_number,
+                        packet,
+                    };
+                } else {
+                    self.dropped += 1;
+                }
+            }
+            Ordering::Less => {
+                let gap = sequence_number.0 - entry.sequence_number().0;
+                let entry_seq = entry.sequence_number();
 
-        if sequence_number < state.tail {
+                for i in 1..gap {
+                    self.queue
+                        .push_back(QueueEntry::Vacant(ExtendedSequenceNumber(entry_seq.0 + i)));
+                }
+
+                self.queue.push_back(QueueEntry::Occupied {
+                    timestamp,
+                    sequence_number,
+                    packet,
+                });
+            }
+        }
+
+        if self.queue.len() > self.max_entries {
+            self.queue.pop_front();
             self.dropped += 1;
-            return;
         }
-
-        if let Entry::Vacant(entry) = self.entries.entry(sequence_number) {
-            self.received += 1;
-            entry.insert(JbEntry { timestamp, packet });
-        }
-
-        state.head = cmp::max(state.head, sequence_number);
-
-        self.ensure_max_size();
     }
 
-    fn ensure_max_size(&mut self) {
-        if self.entries.len() > self.max_entries {
-            let (seq, _) = self.entries.pop_first().unwrap();
+    pub(crate) fn pop(&mut self, max_timestamp: ExtendedRtpTimestamp) -> Option<RtpPacket> {
+        let num_vacant = self.queue.iter().position(|e| match e {
+            QueueEntry::Vacant(..) => false,
+            QueueEntry::Occupied { timestamp: ts, .. } => ts.0 <= max_timestamp.0,
+        })?;
 
-            if let Some(state) = &mut self.state {
-                state.tail = seq + 1;
+        for _ in 0..num_vacant {
+            assert!(matches!(
+                self.queue.pop_front(),
+                Some(QueueEntry::Vacant(..))
+            ));
+        }
+
+        self.lost += num_vacant as u64;
+
+        match self.queue.pop_front() {
+            Some(QueueEntry::Occupied {
+                packet,
+                sequence_number,
+                ..
+            }) => {
+                self.last_sequence_number_returned = Some(sequence_number);
+                Some(packet)
             }
+            _ => unreachable!(),
         }
     }
 
-    pub(crate) fn pop(&mut self, max_timestamp: u64) -> Option<RtpPacket> {
-        let state = self.state.as_mut()?;
-
-        for i in state.tail..=state.head {
-            let Entry::Occupied(entry) = self.entries.entry(i) else {
-                continue;
-            };
-
-            if entry.get().timestamp > max_timestamp {
-                return None;
-            }
-
-            self.lost += i - state.tail;
-            state.tail = i + 1;
-
-            let packet = entry.remove().packet;
-
-            return Some(packet);
-        }
-
-        None
-    }
-}
-
-fn guess_sequence_number(reference: u64, got: u16) -> u64 {
-    wrapping_counter_to_u64_counter(reference, u64::from(got), u64::from(u16::MAX))
-}
-
-pub(crate) fn guess_timestamp(reference: u64, got: u32) -> u64 {
-    wrapping_counter_to_u64_counter(reference, u64::from(got), u64::from(u32::MAX))
-}
-
-fn wrapping_counter_to_u64_counter(reference: u64, got: u64, max: u64) -> u64 {
-    let mul = (reference / max).saturating_sub(1);
-
-    let low = mul * max + got;
-    let high = (mul + 1) * max + got;
-
-    if low.abs_diff(reference) < high.abs_diff(reference) {
-        low
-    } else {
-        high
+    pub(crate) fn timestamp_of_earliest_packet(&self) -> Option<ExtendedRtpTimestamp> {
+        self.queue.iter().find_map(|e| match e {
+            QueueEntry::Vacant(..) => None,
+            QueueEntry::Occupied { timestamp: ts, .. } => Some(*ts),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use rtp_types::RtpPacketBuilder;
-
     use super::*;
+    use crate::{RtpExtensions, RtpTimestamp, SequenceNumber, Ssrc};
+    use bytes::Bytes;
 
-    fn make_packet(sequence_number: u16, timestamp: u32) -> RtpPacket {
-        RtpPacket::new(
-            &RtpPacketBuilder::new()
-                .sequence_number(sequence_number)
-                .timestamp(timestamp),
-        )
+    fn make_packet(seq: u16) -> RtpPacket {
+        RtpPacket {
+            pt: 0,
+            sequence_number: SequenceNumber(seq),
+            ssrc: Ssrc(0),
+            timestamp: RtpTimestamp(0),
+            extensions: RtpExtensions::default(),
+            payload: Bytes::new(),
+        }
     }
 
     #[test]
     fn flimsy_test() {
         let mut jb = JitterBuffer::default();
 
-        jb.push(make_packet(1, 100));
-        jb.push(make_packet(4, 400));
-        jb.push(make_packet(3, 300));
-
-        assert_eq!(jb.pop(1000).unwrap().get().sequence_number(), 1);
-        assert_eq!(jb.pop(1000).unwrap().get().sequence_number(), 3);
-        assert_eq!(jb.pop(1000).unwrap().get().sequence_number(), 4);
-        assert_eq!(jb.lost, 1)
-    }
-
-    #[test]
-    #[allow(clippy::field_reassign_with_default)]
-    fn sequence_number_guessing() {
-        assert_eq!(guess_sequence_number(0, 0), 0);
-        assert_eq!(guess_sequence_number(1, 65535), 65535);
-        assert_eq!(guess_sequence_number(65536, 1), 65536);
-        assert_eq!(guess_sequence_number(65534, 1), 65536);
-        assert_eq!(guess_sequence_number(u16::MAX as u64 * 2 + 1, 1), 131071);
-        assert_eq!(guess_sequence_number(65535, 65534), 65534);
-        assert_eq!(guess_sequence_number(65534, 65534), 65534);
-        assert_eq!(
-            guess_sequence_number(u16::MAX as u64 * 2 + 1, 65534),
-            131069
+        jb.push(
+            ExtendedRtpTimestamp(100),
+            ExtendedSequenceNumber(1),
+            make_packet(1),
         );
+        assert_eq!(jb.queue.len(), 1);
+        jb.push(
+            ExtendedRtpTimestamp(400),
+            ExtendedSequenceNumber(4),
+            make_packet(4),
+        );
+        assert_eq!(jb.queue.len(), 4);
+
+        jb.push(
+            ExtendedRtpTimestamp(300),
+            ExtendedSequenceNumber(3),
+            make_packet(3),
+        );
+        assert_eq!(jb.queue.len(), 4);
+        assert_eq!(
+            jb.timestamp_of_earliest_packet(),
+            Some(ExtendedRtpTimestamp(100))
+        );
+        assert!(jb.pop(ExtendedRtpTimestamp(99)).is_none());
+        assert_eq!(
+            jb.pop(ExtendedRtpTimestamp(100)).unwrap().sequence_number.0,
+            1
+        );
+        assert!(jb.pop(ExtendedRtpTimestamp(200)).is_none());
+        assert_eq!(
+            jb.pop(ExtendedRtpTimestamp(500)).unwrap().sequence_number.0,
+            3
+        );
+        assert_eq!(
+            jb.pop(ExtendedRtpTimestamp(500)).unwrap().sequence_number.0,
+            4
+        );
+        assert_eq!(jb.lost, 1)
     }
 }

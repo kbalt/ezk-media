@@ -1,10 +1,14 @@
-use crate::{NtpTimestamp, RtpPacket};
-use jitter_buffer::{guess_timestamp, JitterBuffer};
+use crate::{ExtendedRtpTimestamp, ExtendedSequenceNumber, NtpTimestamp, RtpPacket, Ssrc};
+use jitter_buffer::JitterBuffer;
 use rtcp_types::{
-    CompoundBuilder, ReceiverReport, ReportBlock, RtcpPacketWriterExt, RtcpWriteError, SdesBuilder,
-    SdesChunkBuilder, SdesItemBuilder, SenderReport,
+    CompoundBuilder, ReceiverReport, ReceiverReportBuilder, ReportBlock, RtcpPacketWriterExt,
+    RtcpWriteError, SdesBuilder, SdesChunkBuilder, SdesItemBuilder, SenderReport,
+    SenderReportBuilder,
 };
-use std::time::{Duration, Instant};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 use time::ext::InstantExt;
 
 mod jitter_buffer;
@@ -16,9 +20,10 @@ const DEFAULT_JITTERBUFFER_LENGTH: Duration = Duration::from_millis(100);
 /// This can be used to publish a single RTP source and receive others.
 /// It manages a jitterbuffer for every remote ssrc and can generate RTCP reports.
 pub struct RtpSession {
-    ssrc: u32,
+    ssrc: Ssrc,
     clock_rate: u32,
 
+    // TODO: remove me
     /// tag/type, prefix, value
     source_description_items: Vec<(u8, Option<Vec<u8>>, String)>,
 
@@ -26,21 +31,34 @@ pub struct RtpSession {
     receiver: Vec<ReceiverState>,
 }
 
+impl fmt::Debug for RtpSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RtpSession")
+            .field("ssrc", &self.ssrc)
+            .field("clock_rate", &self.clock_rate)
+            .field("source_description_items", &self.source_description_items)
+            .field("sender", &"[opaque]")
+            .field("receiver", &"[opaque]")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
 struct SenderState {
     ntp_timestamp: NtpTimestamp,
-    rtp_timestamp: u64,
+    rtp_timestamp: ExtendedRtpTimestamp,
 
     sender_pkg_count: u32,
     sender_octet_count: u32,
 }
 
-#[derive(Default)]
+#[derive(Debug)]
 struct ReceiverState {
-    ssrc: u32,
+    ssrc: Ssrc,
 
     jitter_buffer: JitterBuffer,
 
-    last_rtp_received: Option<(Instant, u64)>,
+    last_rtp_received: Option<(Instant, ExtendedRtpTimestamp, ExtendedSequenceNumber)>,
     jitter: f32,
 
     last_sr: Option<NtpTimestamp>,
@@ -48,7 +66,7 @@ struct ReceiverState {
 }
 
 impl RtpSession {
-    pub fn new(ssrc: u32, clock_rate: u32) -> Self {
+    pub fn new(ssrc: Ssrc, clock_rate: u32) -> Self {
         Self {
             ssrc,
             source_description_items: vec![],
@@ -75,7 +93,7 @@ impl RtpSession {
     }
 
     /// Sender ssrc of this session
-    pub fn ssrc(&self) -> u32 {
+    pub fn ssrc(&self) -> Ssrc {
         self.ssrc
     }
 
@@ -86,32 +104,27 @@ impl RtpSession {
 
     /// Register an RTP packet before sending it out
     pub fn send_rtp(&mut self, packet: &RtpPacket) {
-        let packet = packet.get();
-
         let sender_status = self.sender.get_or_insert(SenderState {
             ntp_timestamp: NtpTimestamp::ZERO,
-            rtp_timestamp: 0,
+            rtp_timestamp: ExtendedRtpTimestamp(0),
 
             sender_pkg_count: 0,
             sender_octet_count: 0,
         });
 
         sender_status.ntp_timestamp = NtpTimestamp::now();
-        sender_status.rtp_timestamp =
-            guess_timestamp(sender_status.rtp_timestamp, packet.timestamp());
+        sender_status.rtp_timestamp = sender_status.rtp_timestamp.guess_extended(packet.timestamp);
 
         sender_status.sender_pkg_count += 1;
-        sender_status.sender_octet_count += packet.payload_len() as u32;
+        sender_status.sender_octet_count += packet.payload.len() as u32;
     }
 
     /// Receive an RTP packet.
     ///
     /// The session consumes the packet and puts in into a internal jitterbuffer to fix potential reordering.
-    pub fn recv_rtp(&mut self, rtp_packet: RtpPacket) {
-        let packet = rtp_packet.get();
-
+    pub fn recv_rtp(&mut self, packet: RtpPacket) {
         let receiver_status = if let Some(receiver_status) =
-            self.receiver.iter_mut().find(|r| r.ssrc == packet.ssrc())
+            self.receiver.iter_mut().find(|r| r.ssrc == packet.ssrc)
         {
             receiver_status
         } else {
@@ -121,7 +134,7 @@ impl RtpSession {
             }
 
             self.receiver.push(ReceiverState {
-                ssrc: packet.ssrc(),
+                ssrc: packet.ssrc,
                 jitter_buffer: JitterBuffer::default(),
                 last_rtp_received: None,
                 jitter: 0.0,
@@ -135,30 +148,44 @@ impl RtpSession {
         let now = Instant::now();
 
         // Update jitter and find extended timestamp
-        let timestamp = if let Some((last_rtp_instant, last_rtp_timestamp)) =
+        if let Some((last_rtp_instant, last_rtp_timestamp, last_sequence_number)) =
             receiver_status.last_rtp_received
         {
-            // Rj - Ri
-            let a = now - last_rtp_instant;
-            let a = (a.as_secs_f32() * self.clock_rate as f32) as i64;
+            let timestamp = last_rtp_timestamp.guess_extended(packet.timestamp);
+            let sequence_number = last_sequence_number.guess_extended(packet.sequence_number);
 
-            // Sj - Si
-            let b = packet.timestamp() as i64 - last_rtp_timestamp as i64;
+            if timestamp > last_rtp_timestamp {
+                // Only update jitter if the timestamp changes
 
-            // (Rj - Ri) - (Sj - Si)
-            let d = a.abs_diff(b);
+                // Rj - Ri
+                let a = now - last_rtp_instant;
+                let a = (a.as_secs_f32() * self.clock_rate as f32) as i64;
 
-            receiver_status.jitter =
-                receiver_status.jitter + ((d as f32).abs() - receiver_status.jitter) / 16.;
+                // Sj - Si
+                let b = packet.timestamp.0 as i64 - last_rtp_timestamp.truncated().0 as i64;
 
-            guess_timestamp(last_rtp_timestamp, packet.timestamp())
+                // (Rj - Ri) - (Sj - Si)
+                let d = a.abs_diff(b);
+
+                receiver_status.jitter =
+                    receiver_status.jitter + ((d as f32).abs() - receiver_status.jitter) / 16.;
+
+                receiver_status.last_rtp_received = Some((now, timestamp, sequence_number));
+
+                receiver_status
+                    .jitter_buffer
+                    .push(timestamp, sequence_number, packet);
+            }
         } else {
-            packet.timestamp() as u64
-        };
+            let timestamp = ExtendedRtpTimestamp(packet.timestamp.0.into());
+            let sequence_number = ExtendedSequenceNumber(packet.sequence_number.0.into());
 
-        receiver_status.last_rtp_received = Some((now, timestamp));
+            receiver_status.last_rtp_received = Some((now, timestamp, sequence_number));
 
-        receiver_status.jitter_buffer.push(rtp_packet);
+            receiver_status
+                .jitter_buffer
+                .push(timestamp, sequence_number, packet);
+        }
     }
 
     pub fn pop_rtp(&mut self, jitter_buffer_length: Option<Duration>) -> Option<RtpPacket> {
@@ -166,7 +193,7 @@ impl RtpSession {
             Instant::now() - jitter_buffer_length.unwrap_or(DEFAULT_JITTERBUFFER_LENGTH);
 
         for receiver in &mut self.receiver {
-            let Some((last_rtp_received_instant, last_rtp_received_timestamp)) =
+            let Some((last_rtp_received_instant, last_rtp_received_timestamp, _)) =
                 receiver.last_rtp_received
             else {
                 continue;
@@ -187,25 +214,43 @@ impl RtpSession {
         None
     }
 
+    pub fn pop_rtp_after(&self, jitter_buffer_length: Option<Duration>) -> Option<Duration> {
+        let jitter_buffer_length = jitter_buffer_length.unwrap_or(DEFAULT_JITTERBUFFER_LENGTH);
+
+        let now = Instant::now();
+
+        self.receiver
+            .iter()
+            .filter_map(|receiver| {
+                let (last_rtp_received_instant, last_rtp_received_timestamp, _) =
+                    receiver.last_rtp_received?;
+                let earliest_timestamp = receiver.jitter_buffer.timestamp_of_earliest_packet()?;
+
+                let delta = last_rtp_received_timestamp.0 - earliest_timestamp.0;
+                let delta = Duration::from_secs_f32(delta as f32 / self.clock_rate as f32);
+
+                let x = (last_rtp_received_instant - delta) + jitter_buffer_length;
+
+                Some(x.checked_duration_since(now).unwrap_or(Duration::ZERO))
+            })
+            .min()
+    }
+
     pub fn recv_rtcp(&mut self, packet: rtcp_types::Packet<'_>) {
         // TODO: read reports
         if let rtcp_types::Packet::Sr(sr) = packet {
             if let Some(receiver) = self
                 .receiver
                 .iter_mut()
-                .find(|status| status.ssrc == sr.ssrc())
+                .find(|status| status.ssrc.0 == sr.ssrc())
             {
                 receiver.last_sr = Some(NtpTimestamp::now());
             }
         }
     }
 
-    /// Generate RTCP sender or receiver report packet.
-    ///
-    /// This resets the internal received & lost packets counter for every receiver.
-    pub fn write_rtcp_report(&mut self, dst: &mut [u8]) -> Result<usize, RtcpWriteError> {
+    pub fn generate_rtcp_report(&mut self) -> Result<SenderReportBuilder, ReceiverReportBuilder> {
         let now = NtpTimestamp::now();
-
         let mut report_blocks = vec![];
 
         for receiver in &mut self.receiver {
@@ -231,11 +276,11 @@ impl RtpSession {
             };
 
             let last_sequence_number = receiver
-                .jitter_buffer
-                .last_sequence_number()
+                .last_rtp_received
+                .map(|(_, _, seq)| seq.0)
                 .unwrap_or_default();
 
-            let report_block = ReportBlock::builder(receiver.ssrc)
+            let report_block = ReportBlock::builder(receiver.ssrc.0)
                 .fraction_lost(fraction_lost as u8)
                 .cumulative_lost(receiver.total_lost as u32)
                 .extended_sequence_number(lower_32bits(last_sequence_number))
@@ -246,17 +291,14 @@ impl RtpSession {
             report_blocks.push(report_block);
         }
 
-        let mut compound = CompoundBuilder::default();
-
-        // Add report block
         if let Some(sender_info) = &self.sender {
             let rtp_timestamp = {
                 let offset = (self.clock_rate * (now - sender_info.ntp_timestamp)).as_seconds_f64()
                     * self.clock_rate as f64;
-                sender_info.rtp_timestamp + offset as u64
+                sender_info.rtp_timestamp.0 + offset as u64
             };
 
-            let mut sr = SenderReport::builder(self.ssrc)
+            let mut sr = SenderReport::builder(self.ssrc.0)
                 .ntp_timestamp(now.to_fixed_u64())
                 .rtp_timestamp(lower_32bits(rtp_timestamp))
                 .packet_count(sender_info.sender_pkg_count)
@@ -266,33 +308,51 @@ impl RtpSession {
                 sr = sr.add_report_block(report_blocks);
             }
 
-            compound = compound.add_packet(sr);
+            Ok(sr)
         } else {
-            let mut rr = ReceiverReport::builder(self.ssrc);
+            let mut rr = ReceiverReport::builder(self.ssrc.0);
 
             for report_blocks in report_blocks {
                 rr = rr.add_report_block(report_blocks);
             }
 
-            compound = compound.add_packet(rr);
+            Err(rr)
+        }
+    }
+
+    pub fn generate_sdes_chunk(&self) -> Option<SdesChunkBuilder<'_>> {
+        if self.source_description_items.is_empty() {
+            return None;
         }
 
-        // Add source description block
-        if !self.source_description_items.is_empty() {
-            let mut chunk = SdesChunkBuilder::new(self.ssrc);
+        let mut chunk = SdesChunkBuilder::new(self.ssrc.0);
 
-            for (tag, prefix, value) in &self.source_description_items {
-                let mut item = SdesItemBuilder::new(*tag, value);
+        for (tag, prefix, value) in &self.source_description_items {
+            let mut item = SdesItemBuilder::new(*tag, value);
 
-                if let Some(prefix) = prefix {
-                    item = item.prefix(prefix);
-                }
-
-                chunk = chunk.add_item(item);
+            if let Some(prefix) = prefix {
+                item = item.prefix(prefix);
             }
 
-            compound = compound.add_packet(SdesBuilder::default().add_chunk(chunk));
+            chunk = chunk.add_item(item);
+        }
+
+        Some(chunk)
+    }
+
+    /// Generate RTCP sender or receiver report packet.
+    ///
+    /// This resets the internal received & lost packets counter for every receiver.
+    pub fn write_rtcp_report(&mut self, dst: &mut [u8]) -> Result<usize, RtcpWriteError> {
+        let mut compound = match self.generate_rtcp_report() {
+            Ok(sr) => CompoundBuilder::default().add_packet(sr),
+            Err(rr) => CompoundBuilder::default().add_packet(rr),
         };
+
+        // Add source description block
+        if let Some(sdes_chunk) = self.generate_sdes_chunk() {
+            compound = compound.add_packet(SdesBuilder::default().add_chunk(sdes_chunk));
+        }
 
         // write into dst
         compound.write_into(dst)
@@ -301,13 +361,13 @@ impl RtpSession {
 
 fn map_instant_to_rtp_timestamp(
     reference_instant: Instant,
-    reference_timestamp: u64,
+    reference_timestamp: ExtendedRtpTimestamp,
     clock_rate: u32,
     instant: Instant,
-) -> u64 {
+) -> ExtendedRtpTimestamp {
     let delta = instant.signed_duration_since(reference_instant);
     let delta_in_rtp_timesteps = (delta.as_seconds_f32() * clock_rate as f32) as i64;
-    (reference_timestamp as i64 + delta_in_rtp_timesteps) as u64
+    ExtendedRtpTimestamp((reference_timestamp.0 as i64 + delta_in_rtp_timesteps) as u64)
 }
 
 fn lower_32bits(i: u64) -> u32 {

@@ -64,7 +64,7 @@ where
         let frame_timestamp = frame.timestamp;
         let rtp_packet = frame.into_data();
 
-        let data = stream.depayloader.depayload(rtp_packet.get().payload());
+        let data = stream.depayloader.depayload(&rtp_packet.payload);
 
         Ok(SourceEvent::Frame(Frame::new(data, frame_timestamp)))
     }
