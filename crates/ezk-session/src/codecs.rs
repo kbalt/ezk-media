@@ -1,8 +1,6 @@
 use sdp_types::MediaType;
 use std::borrow::Cow;
 
-// TODO: allow ulpfec https://www.rfc-editor.org/rfc/rfc5109?
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Codec {
     /// Either set by the codec itself if it's static, or assigned later when added to a session
@@ -13,6 +11,7 @@ pub struct Codec {
     pub(crate) channels: Option<u32>,
     pub(crate) params: Vec<String>,
 }
+
 impl Codec {
     pub const PCMU: Self = Self::new("PCMU", 8000).with_static_pt(0);
     pub const PCMA: Self = Self::new("PCMA", 8000).with_static_pt(8);
@@ -55,10 +54,10 @@ impl Codec {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Codecs {
     pub(crate) media_type: MediaType,
     pub(crate) codecs: Vec<Codec>,
-    pub(crate) allow_rtx: bool,
     pub(crate) allow_dtmf: bool,
 }
 
@@ -67,14 +66,8 @@ impl Codecs {
         Self {
             media_type,
             codecs: vec![],
-            allow_rtx: false,
             allow_dtmf: false,
         }
-    }
-
-    pub fn allow_rtx(mut self, rtx: bool) -> Self {
-        self.allow_rtx = rtx;
-        self
     }
 
     pub fn allow_dtmf(mut self, dtmf: bool) -> Self {

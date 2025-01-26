@@ -54,12 +54,14 @@ impl AsyncSdpSession {
     }
 
     /// Register codecs for a media type with a limit of how many media session by can be created
+    ///
+    /// Returns `None` if no more payload type numbers are available
     pub fn add_local_media(
         &mut self,
         codecs: Codecs,
         limit: u32,
         direction: Direction,
-    ) -> LocalMediaId {
+    ) -> Option<LocalMediaId> {
         self.inner.add_local_media(codecs, limit, direction)
     }
 
@@ -165,23 +167,29 @@ impl AsyncSdpSession {
                     }
                 }
                 Event::ReceiveRTP { media_id, packet } => {
-                    println!("Received RTP on {media_id:?} {}", packet.sequence_number);
+                    println!("Received RTP on {media_id:?} {:?}", packet.sequence_number);
                 }
                 Event::IceGatheringState {
                     transport_id,
                     old,
                     new,
-                } => println!("transport ice gathering state changed {old:?} -> {new:?}"),
+                } => println!(
+                    "transport {transport_id:?} ice gathering state changed {old:?} -> {new:?}"
+                ),
                 Event::IceConnectionState {
                     transport_id,
                     old,
                     new,
-                } => println!("transport ice connection state changed {old:?} -> {new:?}"),
+                } => println!(
+                    "transport {transport_id:?} ice connection state changed {old:?} -> {new:?}"
+                ),
                 Event::TransportConnectionState {
                     transport_id,
                     old,
                     new,
-                } => println!("transport connection state changed {old:?} -> {new:?}"),
+                } => println!(
+                    "transport {transport_id:?} connection state changed {old:?} -> {new:?}"
+                ),
             }
         }
 

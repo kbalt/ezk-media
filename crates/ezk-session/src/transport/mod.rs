@@ -99,8 +99,8 @@ pub(crate) struct Transport {
 
     pub(crate) ice_agent: Option<IceAgent>,
 
-    // TODO: either split these up in send / receive ids or just make then receive and always use RtpExtensionIds::new() for send
-    extension_ids: RtpExtensionIds,
+    /// The receiving extension ids
+    receive_extension_ids: RtpExtensionIds,
 
     state: TransportConnectionState,
     kind: TransportKind,
@@ -176,6 +176,8 @@ impl Transport {
             None
         };
 
+        let receive_extension_ids = RtpExtensionIds::from_sdp(session_desc, remote_media_desc);
+
         let mut transport = match &remote_media_desc.media.proto {
             TransportProtocol::RtpAvp => Transport {
                 local_rtp_port: None,
@@ -184,7 +186,7 @@ impl Transport {
                 remote_rtcp_address,
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
-                extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
+                receive_extension_ids,
                 state: TransportConnectionState::New,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
@@ -200,7 +202,7 @@ impl Transport {
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
-                    extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
+                    receive_extension_ids,
                     state: TransportConnectionState::New,
                     kind: TransportKind::SdesSrtp {
                         crypto,
@@ -216,6 +218,7 @@ impl Transport {
                 remote_rtp_address,
                 remote_rtcp_address,
                 ice_agent,
+                receive_extension_ids,
             )?,
             _ => return Ok(None),
         };
@@ -238,6 +241,7 @@ impl Transport {
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
         ice_agent: Option<IceAgent>,
+        receive_extension_ids: RtpExtensionIds,
     ) -> Result<Self, Error> {
         let setup = match remote_media_desc.setup {
             Some(Setup::Active) => DtlsSetup::Accept,
@@ -272,7 +276,7 @@ impl Transport {
             remote_rtcp_address,
             rtcp_mux: remote_media_desc.rtcp_mux,
             ice_agent,
-            extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
+            receive_extension_ids,
             state: TransportConnectionState::New,
             kind: TransportKind::DtlsSrtp {
                 fingerprint: vec![state.dtls_fingerprint()],
@@ -296,7 +300,7 @@ impl Transport {
     }
 
     pub(crate) fn populate_desc(&self, desc: &mut MediaDescription) {
-        desc.extmap.extend(self.extension_ids.to_extmap());
+        desc.extmap.extend(RtpExtensionIds::offer().to_extmap());
 
         match &self.kind {
             TransportKind::Rtp => {}
@@ -459,7 +463,7 @@ impl Transport {
                     inbound.unprotect(&mut pkt.data).unwrap();
                 }
 
-                match RtpPacket::parse(self.extension_ids, pkt.data) {
+                match RtpPacket::parse(self.receive_extension_ids, pkt.data) {
                     Ok(packet) => ReceivedPacket::Rtp(packet),
                     Err(e) => {
                         log::warn!("Failed to parse RTP packet, {e}");
@@ -520,7 +524,7 @@ impl Transport {
     }
 
     pub(crate) fn send_rtp(&mut self, packet: RtpPacket) {
-        let mut packet = packet.to_vec(self.extension_ids);
+        let mut packet = packet.to_vec(RtpExtensionIds::offer());
 
         match &mut self.kind {
             TransportKind::DtlsSrtp { srtp: None, .. } => {

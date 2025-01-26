@@ -122,11 +122,13 @@ async fn add_video_stream(
     session: &mut Session,
     sdp_session: &mut AsyncSdpSession,
 ) {
-    let v = sdp_session.add_local_media(
-        Codecs::new(MediaType::Video).with_codec(Codec::AV1),
-        1,
-        Direction::RecvOnly,
-    );
+    let v = sdp_session
+        .add_local_media(
+            Codecs::new(MediaType::Video).with_codec(Codec::AV1),
+            1,
+            Direction::RecvOnly,
+        )
+        .unwrap();
 
     sdp_session.add_media(v, Direction::SendRecv);
 

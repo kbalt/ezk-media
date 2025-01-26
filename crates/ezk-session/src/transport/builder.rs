@@ -228,6 +228,8 @@ impl TransportBuilder {
             None
         };
 
+        let receive_extension_ids = RtpExtensionIds::from_sdp(session_desc, remote_media_desc);
+
         let mut transport = match self.kind {
             TransportBuilderKind::Rtp => Transport {
                 local_rtp_port: self.local_rtp_port,
@@ -236,7 +238,7 @@ impl TransportBuilder {
                 remote_rtcp_address,
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
-                extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
+                receive_extension_ids,
                 state: TransportConnectionState::New,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
@@ -251,7 +253,7 @@ impl TransportBuilder {
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
-                    extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
+                    receive_extension_ids,
                     state: TransportConnectionState::New,
                     kind: TransportKind::SdesSrtp {
                         crypto: vec![crypto],
@@ -285,7 +287,7 @@ impl TransportBuilder {
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
-                    extension_ids: RtpExtensionIds::from_sdp_media_description(remote_media_desc),
+                    receive_extension_ids,
                     state: TransportConnectionState::New,
                     kind: TransportKind::DtlsSrtp {
                         fingerprint,
