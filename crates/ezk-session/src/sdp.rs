@@ -8,7 +8,7 @@ use bytesstr::BytesStr;
 use ezk_rtp::{RtpSession, Ssrc};
 use sdp_types::{
     Connection, Direction, Fmtp, Group, IceOptions, IcePassword, IceUsernameFragment, Media,
-    MediaDescription, MediaType, Origin, Rtcp, RtpMap, SessionDescription, Time,
+    MediaDescription, MediaType, Origin, Rtcp, RtpMap, SessionDescription, Time, TransportProtocol,
 };
 use std::{
     collections::HashMap,
@@ -43,7 +43,7 @@ impl SdpSession {
         let mut new_state = vec![];
         let mut response = vec![];
 
-        for remote_media_desc in &offer.media_descriptions {
+        for (mline, remote_media_desc) in offer.media_descriptions.iter().enumerate() {
             let requested_direction: DirectionBools = remote_media_desc.direction.flipped().into();
 
             // First thing: Search the current state for an entry that matches this description - and update accordingly
@@ -57,17 +57,6 @@ impl SdpSession {
                 self.update_active_media(requested_direction, &mut media);
                 response.push(SdpResponseEntry::Active(media.id));
                 new_state.push(media);
-                continue;
-            }
-
-            // Reject any invalid/inactive media descriptions
-            if remote_media_desc.direction == Direction::Inactive
-                || remote_media_desc.media.port == 0
-            {
-                response.push(SdpResponseEntry::Rejected {
-                    media_type: remote_media_desc.media.media_type,
-                    mid: remote_media_desc.mid.clone(),
-                });
                 continue;
             }
 
@@ -85,6 +74,8 @@ impl SdpSession {
                     media_type: remote_media_desc.media.media_type,
                     mid: remote_media_desc.mid.clone(),
                 });
+
+                log::debug!("Rejecting mline={mline}, no compatible local media found");
                 continue;
             };
 
@@ -99,6 +90,8 @@ impl SdpSession {
                     media_type: remote_media_desc.media.media_type,
                     mid: remote_media_desc.mid.clone(),
                 });
+
+                log::debug!("Rejecting mline={mline}, no compatible transport found");
                 continue;
             };
 
@@ -108,6 +101,7 @@ impl SdpSession {
                 local_media_id,
                 media_type: remote_media_desc.media.media_type,
                 rtp_session: RtpSession::new(Ssrc(rand::random()), codec.clock_rate),
+                avpf: is_avpf(&remote_media_desc.media.proto),
                 next_rtcp: Instant::now() + Duration::from_secs(5),
                 mid: remote_media_desc.mid.clone(),
                 direction: negotiated_direction,
@@ -164,6 +158,8 @@ impl SdpSession {
             // todo: emit direction change event
         }
     }
+
+    fn update_active_media_id(&mut self, requested_direction: DirectionBools, media_id: MediaId) {}
 
     /// Get or create a transport for the given media description
     ///
@@ -333,7 +329,15 @@ impl SdpSession {
                 .standalone_transport
                 .unwrap_or(pending_media.bundle_transport)];
 
-            let (local_rtp_port, local_rtcp_port) = transport.ports();
+            let (local_rtp_port, local_rtcp_port) = match &transport {
+                TransportEntry::Transport(transport) => {
+                    (transport.local_rtp_port, transport.local_rtcp_port)
+                }
+                TransportEntry::TransportBuilder(transport_builder) => (
+                    transport_builder.local_rtp_port,
+                    transport_builder.local_rtcp_port,
+                ),
+            };
 
             let mut rtpmap = vec![];
             let mut fmtp = vec![];
@@ -365,7 +369,7 @@ impl SdpSession {
                     media_type: local_media.codecs.media_type,
                     port: local_rtp_port.expect("rtp port not set for transport"),
                     ports_num: None,
-                    proto: transport.type_().sdp_type(),
+                    proto: transport.type_().sdp_type(pending_media.use_avpf),
                     fmts,
                 },
                 connection: None,
@@ -467,8 +471,10 @@ impl SdpSession {
                 }
 
                 if media.matches(&self.transports, remote_media_desc) {
-                    // TODO: update media
-                    let _ = requested_direction;
+                    // // TODO: update media
+                    // let _ = requested_direction;
+                    let media_id = media.id;
+                    self.update_active_media_id(requested_direction, media_id);
                     continue 'next_media_desc;
                 }
             }
@@ -522,6 +528,7 @@ impl SdpSession {
                     local_media_id: pending_media.local_media_id,
                     media_type: pending_media.media_type,
                     rtp_session: RtpSession::new(Ssrc(rand::random()), codec.clock_rate),
+                    avpf: pending_media.use_avpf,
                     next_rtcp: Instant::now() + Duration::from_secs(5),
                     mid: remote_media_desc.mid.clone(),
                     direction,
@@ -562,7 +569,7 @@ impl SdpSession {
                     .local_rtp_port
                     .expect("Did not set port for RTP socket"),
                 ports_num: None,
-                proto: transport.type_().sdp_type(),
+                proto: transport.type_().sdp_type(active.avpf),
                 fmts: vec![active.codec_pt],
             },
             connection: None,
@@ -622,5 +629,18 @@ impl SdpSession {
                 mids,
             })
             .collect()
+    }
+}
+
+fn is_avpf(t: &TransportProtocol) -> bool {
+    match t {
+        TransportProtocol::RtpAvpf
+        | TransportProtocol::RtpSavpf
+        | TransportProtocol::UdpTlsRtpSavpf => true,
+        TransportProtocol::Unspecified
+        | TransportProtocol::RtpAvp
+        | TransportProtocol::RtpSavp
+        | TransportProtocol::UdpTlsRtpSavp
+        | TransportProtocol::Other(..) => false,
     }
 }

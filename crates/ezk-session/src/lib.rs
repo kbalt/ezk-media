@@ -3,8 +3,11 @@
 use bytes::Bytes;
 use bytesstr::BytesStr;
 use events::{TransportChange, TransportRequiredChanges};
-use ezk_ice::{Component, IceAgent, IceGatheringState, ReceivedPkt};
-use ezk_rtp::{rtcp_types::Compound, RtpPacket, RtpSession};
+use ezk_ice::{Component, IceAgent, IceConnectionState, IceGatheringState, ReceivedPkt};
+use ezk_rtp::{
+    rtcp_types::{Compound, Packet as RtcpPacket},
+    RtpPacket, RtpSession,
+};
 use local_media::LocalMedia;
 use sdp_types::{Direction, MediaDescription, MediaType};
 use slotmap::SlotMap;
@@ -129,18 +132,6 @@ impl TransportEntry {
         }
     }
 
-    fn ports(&self) -> (Option<u16>, Option<u16>) {
-        match self {
-            TransportEntry::Transport(transport) => {
-                (transport.local_rtp_port, transport.local_rtcp_port)
-            }
-            TransportEntry::TransportBuilder(transport_builder) => (
-                transport_builder.local_rtp_port,
-                transport_builder.local_rtcp_port,
-            ),
-        }
-    }
-
     fn ice_agent(&self) -> Option<&IceAgent> {
         match self {
             TransportEntry::Transport(transport) => transport.ice_agent.as_ref(),
@@ -168,6 +159,7 @@ struct ActiveMedia {
 
     /// The RTP session for this media
     rtp_session: RtpSession,
+    avpf: bool,
 
     /// When to send the next RTCP report
     // TODO: do not start rtcp transmitting until transport is ready
@@ -221,6 +213,7 @@ struct PendingMedia {
     media_type: MediaType,
     mid: String,
     direction: Direction,
+    use_avpf: bool,
     /// Transport to use when not bundling
     standalone_transport: Option<TransportId>,
     /// Transport to use when bundling
@@ -242,12 +235,19 @@ impl PendingMedia {
         }
 
         if let Some(standalone_transport) = self.standalone_transport {
-            if transports[standalone_transport].type_().sdp_type() == desc.media.proto {
+            if transports[standalone_transport]
+                .type_()
+                .sdp_type(self.use_avpf)
+                == desc.media.proto
+            {
                 return true;
             }
         }
 
-        transports[self.bundle_transport].type_().sdp_type() == desc.media.proto
+        transports[self.bundle_transport]
+            .type_()
+            .sdp_type(self.use_avpf)
+            == desc.media.proto
     }
 }
 
@@ -388,6 +388,7 @@ impl SdpSession {
                 media_type: self.local_media[local_media_id].codecs.media_type,
                 mid: media_id.0.to_string(),
                 direction,
+                use_avpf: self.options.offer_avpf,
                 standalone_transport,
                 bundle_transport,
             }));
@@ -605,10 +606,50 @@ impl SdpSession {
                 let rtcp_compound = match Compound::parse(&pkt_data) {
                     Ok(rtcp_compound) => rtcp_compound,
                     Err(e) => {
-                        log::debug!("Failed to parse incoming RTCP packet, {e}");
+                        log::warn!("Failed to parse incoming RTCP packet, {e}");
                         return;
                     }
                 };
+
+                let packets: Vec<_> = match rtcp_compound.collect() {
+                    Ok(packets) => packets,
+                    Err(e) => {
+                        log::warn!("Failed to parse incoming RTCP packet, {e}");
+                        return;
+                    }
+                };
+
+                let ssrc = packets.iter().find_map(|packet| match packet {
+                    RtcpPacket::Rr(receiver_report) => Some(receiver_report.ssrc()),
+                    RtcpPacket::Sr(sender_report) => Some(sender_report.ssrc()),
+                    RtcpPacket::App(app) => Some(app.ssrc()),
+                    RtcpPacket::Bye(bye) => bye.ssrcs().next(), // TODO: this could terminate multiple media streams
+                    RtcpPacket::Sdes(_) => None,
+                    RtcpPacket::TransportFeedback(transport_feedback) => {
+                        Some(transport_feedback.sender_ssrc())
+                    }
+                    RtcpPacket::PayloadFeedback(payload_feedback) => {
+                        Some(payload_feedback.sender_ssrc())
+                    }
+                    RtcpPacket::Unknown(_) => None,
+                });
+
+                let Some(ssrc) = ssrc else {
+                    log::warn!("RTCP packet did not contain any SSRC");
+                    return;
+                };
+
+                let media = self
+                    .state
+                    .iter_mut()
+                    .find(|e| e.rtp_session.remote_ssrc().any(|r_ssrc| r_ssrc.0 == ssrc));
+
+                let Some(media) = media else {
+                    log::warn!("Failed to find media for incoming RTCP packet");
+                    return;
+                };
+
+                // media.rtp_session.recv_rtcp();
             }
             ReceivedPacket::TransportSpecific => {
                 // ignore
@@ -635,6 +676,15 @@ impl SdpSession {
             .values()
             .filter_map(|t| t.ice_agent())
             .map(|a| a.gathering_state())
+            .min()
+    }
+
+    /// Returns the cumulative connection state of all ice agents
+    pub fn ice_connection_state(&self) -> Option<IceConnectionState> {
+        self.transports
+            .values()
+            .filter_map(|t| t.ice_agent())
+            .map(|a| a.connection_state())
             .min()
     }
 }

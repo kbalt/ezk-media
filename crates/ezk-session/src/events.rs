@@ -1,10 +1,34 @@
-use crate::{MediaId, TransportId};
+use crate::{LocalMediaId, MediaId, TransportId};
 use ezk_ice::{Component, IceConnectionState, IceGatheringState};
 use ezk_rtp::RtpPacket;
+use sdp_types::{Direction, MediaType};
 use std::net::{IpAddr, SocketAddr};
+
+#[derive(Debug, Clone, Copy)]
+pub struct Stats {
+    /// Number of total bytes sent/received
+    bytes: u64,
+    /// Number of total bytes sent/received
+    packets: u64,
+    /// Packet loss as fraction
+    lost: Option<f32>,
+}
 
 /// Session event returned by [`SdpSession::pop_event`](crate::SdpSession::pop_event)
 pub enum Event {
+    /// New media line was added to the session
+    MediaAdded {
+        id: MediaId,
+        local_media_id: LocalMediaId,
+        direction: Direction,
+    },
+
+    /// Existing media has changed direction
+    MediaChanged { id: MediaId, direction: Direction },
+
+    /// Media was removed from the session
+    MediaRemoved { id: MediaId },
+
     /// The gathering state of the ICE agent used by the transport changed state
     ///
     /// This event will only trigger on transports which use an ICE agent
@@ -32,12 +56,18 @@ pub enum Event {
         new: TransportConnectionState,
     },
 
+    /// Outbound media statistics
+    SendStats { media_id: MediaId, stats: Stats },
+
+    /// Inbound media statistics
+    ReceiveStats { media_id: MediaId, stats: Stats },
+
     /// Send data
     SendData {
         transport_id: TransportId,
         component: Component,
         data: Vec<u8>,
-        /// The local IP address to use to send the datat
+        /// The local IP address to use to send the data
         source: Option<IpAddr>,
         target: SocketAddr,
     },
@@ -68,9 +98,6 @@ pub enum TransportConnectionState {
     ///
     /// This state is reached as soon as the SDP exchange has concluded or (if used) the ICE agent has established a connection.
     Connected,
-
-    // TODO: is this a state we need? Unused transport are usually deleted
-    Closed,
 
     /// # DTLS-SRTP
     ///

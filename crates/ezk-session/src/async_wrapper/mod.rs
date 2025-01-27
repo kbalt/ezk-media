@@ -153,22 +153,13 @@ impl AsyncSdpSession {
     fn handle_events(&mut self) -> Result<(), super::Error> {
         while let Some(event) = self.inner.pop_event() {
             match event {
-                Event::SendData {
-                    transport_id,
-                    component,
-                    data,
-                    source,
-                    target,
-                } => {
-                    if let Some(socket) = self.sockets.get_mut(&(transport_id, component)) {
-                        socket.enqueue(data, source, target);
-                    } else {
-                        println!("invalid socket id")
-                    }
-                }
-                Event::ReceiveRTP { media_id, packet } => {
-                    println!("Received RTP on {media_id:?} {:?}", packet.sequence_number);
-                }
+                Event::MediaAdded {
+                    id,
+                    local_media_id,
+                    direction,
+                } => todo!(),
+                Event::MediaChanged { id, direction } => todo!(),
+                Event::MediaRemoved { id } => todo!(),
                 Event::IceGatheringState {
                     transport_id,
                     old,
@@ -190,6 +181,28 @@ impl AsyncSdpSession {
                 } => println!(
                     "transport {transport_id:?} connection state changed {old:?} -> {new:?}"
                 ),
+                Event::SendStats { media_id, stats } => {
+                    println!("Send statistics of {media_id:?}: {stats:?}")
+                }
+                Event::ReceiveStats { media_id, stats } => {
+                    println!("Receive statistics of {media_id:?}: {stats:?}")
+                }
+                Event::SendData {
+                    transport_id,
+                    component,
+                    data,
+                    source,
+                    target,
+                } => {
+                    if let Some(socket) = self.sockets.get_mut(&(transport_id, component)) {
+                        socket.enqueue(data, source, target);
+                    } else {
+                        println!("invalid socket id")
+                    }
+                }
+                Event::ReceiveRTP { media_id, packet } => {
+                    println!("Received RTP on {media_id:?} {:?}", packet.sequence_number);
+                }
             }
         }
 

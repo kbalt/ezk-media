@@ -114,25 +114,24 @@ pub enum IceGatheringState {
 }
 
 /// State of the ICE agent
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// Ordering might look weird, but it's so the total state of all ice agents can be "combined" using `min`
 pub enum IceConnectionState {
+    /// The ICE agent has failed to find a valid candidate pair for all components
+    Failed,
+
+    /// Checks to ensure that components are still connected failed for at least one component.
+    /// This is a less stringent test than `Failed` and may trigger intermittently and resolve just as spontaneously on
+    /// less reliable networks, or during temporary disconnections.
+    /// When the problem resolves, the connection may return to the `Connected` state.
+    Disconnected,
+
     /// The ICE agent is awaiting local & remote ice candidates
     New,
     /// The ICE agent is in the process of checking candidates pairs
     Checking,
     /// The ICE agent has found a valid pair for all components
     Connected,
-
-    // TODO: this state is currently unreachable since the first valid pair is instantly nominated
-    //Completed,
-    //
-    /// The ICE agent has failed to find a valid candidate pair for all components
-    Failed,
-    /// Checks to ensure that components are still connected failed for at least one component.
-    /// This is a less stringent test than failed and may trigger intermittently and resolve just as spontaneously on
-    /// less reliable networks, or during temporary disconnections.
-    /// When the problem resolves, the connection may return to the connected state.
-    Disconnected,
 }
 
 new_key_type!(
@@ -326,6 +325,7 @@ impl IceAgent {
 
     /// Add a STUN server which the ICE agent should use to gather additional (server-reflexive) candidates.
     pub fn add_stun_server(&mut self, server: SocketAddr) {
+        // TODO: ideally we create a stun server binding for every local interface
         self.stun_server
             .push(StunServerBinding::new(server, Component::Rtp));
 

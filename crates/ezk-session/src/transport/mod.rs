@@ -179,7 +179,7 @@ impl Transport {
         let receive_extension_ids = RtpExtensionIds::from_sdp(session_desc, remote_media_desc);
 
         let mut transport = match &remote_media_desc.media.proto {
-            TransportProtocol::RtpAvp => Transport {
+            TransportProtocol::RtpAvp | TransportProtocol::RtpAvpf => Transport {
                 local_rtp_port: None,
                 local_rtcp_port: None,
                 remote_rtp_address,
@@ -191,7 +191,7 @@ impl Transport {
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
             },
-            TransportProtocol::RtpSavp => {
+            TransportProtocol::RtpSavp | TransportProtocol::RtpSavpf => {
                 let (crypto, inbound, outbound) =
                     sdes_srtp::negotiate_from_offer(&remote_media_desc.crypto)?;
 
@@ -212,14 +212,16 @@ impl Transport {
                     events: VecDeque::new(),
                 }
             }
-            TransportProtocol::UdpTlsRtpSavp => Self::dtls_srtp_from_offer(
-                state,
-                remote_media_desc,
-                remote_rtp_address,
-                remote_rtcp_address,
-                ice_agent,
-                receive_extension_ids,
-            )?,
+            TransportProtocol::UdpTlsRtpSavp | TransportProtocol::UdpTlsRtpSavpf => {
+                Self::dtls_srtp_from_offer(
+                    state,
+                    remote_media_desc,
+                    remote_rtp_address,
+                    remote_rtcp_address,
+                    ice_agent,
+                    receive_extension_ids,
+                )?
+            }
             _ => return Ok(None),
         };
 

@@ -71,8 +71,6 @@ impl Layer for InviteAcceptLayer {
             .headers
             .insert("Content-Type", "application/sdp");
 
-        // Here goes SDP handling
-
         println!("Ready to respond in {:?}", start.elapsed());
 
         let (mut session, _ack) = acceptor.respond_success(response).await.unwrap();
