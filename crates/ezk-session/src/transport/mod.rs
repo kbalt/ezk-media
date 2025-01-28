@@ -100,7 +100,7 @@ pub(crate) struct Transport {
     pub(crate) ice_agent: Option<IceAgent>,
 
     /// The receiving extension ids
-    receive_extension_ids: RtpExtensionIds,
+    negotiated_extension_ids: RtpExtensionIds,
 
     state: TransportConnectionState,
     kind: TransportKind,
@@ -186,7 +186,7 @@ impl Transport {
                 remote_rtcp_address,
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
-                receive_extension_ids,
+                negotiated_extension_ids: receive_extension_ids,
                 state: TransportConnectionState::New,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
@@ -202,7 +202,7 @@ impl Transport {
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
-                    receive_extension_ids,
+                    negotiated_extension_ids: receive_extension_ids,
                     state: TransportConnectionState::New,
                     kind: TransportKind::SdesSrtp {
                         crypto,
@@ -215,6 +215,7 @@ impl Transport {
             TransportProtocol::UdpTlsRtpSavp | TransportProtocol::UdpTlsRtpSavpf => {
                 Self::dtls_srtp_from_offer(
                     state,
+                    session_desc,
                     remote_media_desc,
                     remote_rtp_address,
                     remote_rtcp_address,
@@ -239,6 +240,7 @@ impl Transport {
 
     pub(crate) fn dtls_srtp_from_offer(
         state: &mut SessionTransportState,
+        session_desc: &SessionDescription,
         remote_media_desc: &MediaDescription,
         remote_rtp_address: SocketAddr,
         remote_rtcp_address: SocketAddr,
@@ -258,9 +260,10 @@ impl Transport {
             }
         };
 
-        let remote_fingerprints: Vec<_> = remote_media_desc
+        let remote_fingerprints: Vec<_> = session_desc
             .fingerprint
             .iter()
+            .chain(remote_media_desc.fingerprint.iter())
             .filter_map(|e| {
                 Some((
                     dtls_srtp::to_openssl_digest(&e.algorithm)?,
@@ -278,7 +281,7 @@ impl Transport {
             remote_rtcp_address,
             rtcp_mux: remote_media_desc.rtcp_mux,
             ice_agent,
-            receive_extension_ids,
+            negotiated_extension_ids: receive_extension_ids,
             state: TransportConnectionState::New,
             kind: TransportKind::DtlsSrtp {
                 fingerprint: vec![state.dtls_fingerprint()],
@@ -302,7 +305,8 @@ impl Transport {
     }
 
     pub(crate) fn populate_desc(&self, desc: &mut MediaDescription) {
-        desc.extmap.extend(RtpExtensionIds::offer().to_extmap());
+        desc.extmap
+            .extend(self.negotiated_extension_ids.to_extmap());
 
         match &self.kind {
             TransportKind::Rtp => {}
@@ -465,7 +469,7 @@ impl Transport {
                     inbound.unprotect(&mut pkt.data).unwrap();
                 }
 
-                match RtpPacket::parse(self.receive_extension_ids, pkt.data) {
+                match RtpPacket::parse(self.negotiated_extension_ids, pkt.data) {
                     Ok(packet) => ReceivedPacket::Rtp(packet),
                     Err(e) => {
                         log::warn!("Failed to parse RTP packet, {e}");
@@ -526,7 +530,7 @@ impl Transport {
     }
 
     pub(crate) fn send_rtp(&mut self, packet: RtpPacket) {
-        let mut packet = packet.to_vec(RtpExtensionIds::offer());
+        let mut packet = packet.to_vec(self.negotiated_extension_ids);
 
         match &mut self.kind {
             TransportKind::DtlsSrtp { srtp: None, .. } => {

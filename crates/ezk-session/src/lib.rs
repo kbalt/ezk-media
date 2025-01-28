@@ -503,7 +503,7 @@ impl SdpSession {
 
             // TODO: only emit rtcp if the media's transport state is connected
             if media.next_rtcp <= now {
-                send_rtcp_report(self.transports[media.transport].unwrap_mut(), media);
+                // send_rtcp_report(self.transports[media.transport].unwrap_mut(), media);
                 media.next_rtcp += Duration::from_secs(5);
             }
         }

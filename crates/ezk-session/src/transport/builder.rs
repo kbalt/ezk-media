@@ -238,7 +238,7 @@ impl TransportBuilder {
                 remote_rtcp_address,
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
-                receive_extension_ids,
+                negotiated_extension_ids: receive_extension_ids,
                 state: TransportConnectionState::New,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
@@ -253,7 +253,7 @@ impl TransportBuilder {
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
-                    receive_extension_ids,
+                    negotiated_extension_ids: receive_extension_ids,
                     state: TransportConnectionState::New,
                     kind: TransportKind::SdesSrtp {
                         crypto: vec![crypto],
@@ -270,9 +270,10 @@ impl TransportBuilder {
                     _ => panic!("missing or invalid setup attribute"),
                 };
 
-                let remote_fingerprints: Vec<_> = remote_media_desc
+                let remote_fingerprints: Vec<_> = session_desc
                     .fingerprint
                     .iter()
+                    .chain(remote_media_desc.fingerprint.iter())
                     .filter_map(|e| Some((to_openssl_digest(&e.algorithm)?, e.fingerprint.clone())))
                     .collect();
 
@@ -287,7 +288,7 @@ impl TransportBuilder {
                     remote_rtcp_address,
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
-                    receive_extension_ids,
+                    negotiated_extension_ids: receive_extension_ids,
                     state: TransportConnectionState::New,
                     kind: TransportKind::DtlsSrtp {
                         fingerprint,

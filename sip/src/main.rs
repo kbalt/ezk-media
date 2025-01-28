@@ -4,6 +4,7 @@ use sdp_types::{Direction, MediaType, SessionDescription};
 use sip_core::transport::udp::Udp;
 use sip_core::{Endpoint, IncomingRequest, Layer, LayerKey, MayTake, Result};
 use sip_types::header::typed::{Contact, ContentType};
+use sip_types::msg::Line;
 use sip_types::uri::sip::SipUri;
 use sip_types::uri::NameAddr;
 use sip_types::{Code, Method};
@@ -12,6 +13,7 @@ use sip_ua::invite::acceptor::Acceptor;
 use sip_ua::invite::session::{Event, Session};
 use sip_ua::invite::{create_ack, InviteLayer};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::time::sleep;
 
 /// Custom layer which we use to accept incoming invites
@@ -182,6 +184,22 @@ async fn main() -> Result<()> {
     // Build endpoint to start the SIP Stack
     let endpoint = builder.build();
 
+    let mut out = String::new();
+    loop {
+        let mut line = [0u8; 1024 * 10];
+
+        let len = tokio::io::stdin().read(&mut line).await.unwrap();
+
+        let read = std::str::from_utf8(&line[..len]).unwrap().trim();
+
+        if read.is_empty() {
+            break;
+        }
+
+        out += read;
+        out += "\n";
+    }
+
     // let mut initiator = Initiator::new(
     //     endpoint.clone(),
     //     dialog_layer,
@@ -197,16 +215,25 @@ async fn main() -> Result<()> {
     //     )),
     // );
 
-    // let mut sess = AsyncSdpSession::new("10.6.0.3".parse().unwrap());
+    let mut sess = AsyncSdpSession::new("10.6.0.3".parse().unwrap());
     // sess.add_stun_server("15.197.250.192:3478".parse().unwrap());
-    // let audio_id = sess.add_local_media(
-    //     Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),
-    //     1,
-    //     Direction::RecvOnly,
-    // );
-    // let _m = sess.add_media(audio_id, Direction::SendRecv);
+    let audio_id = sess
+        .add_local_media(
+            Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),
+            1,
+            Direction::RecvOnly,
+        )
+        .unwrap();
+    let _m = sess.add_media(audio_id, Direction::SendRecv);
     // let offer = sess.create_offer().await;
+    let answer = sess
+        .receive_sdp_offer(SessionDescription::parse(&BytesStr::from(out)).unwrap())
+        .await
+        .unwrap();
 
+    println!("\n\n\n\n############################\n\n{answer}");
+
+    sess.run().await.unwrap();
     // let mut invite = initiator.create_invite();
     // invite.headers.insert("Content-Type", "application/sdp");
     // invite.body = offer.to_string().into();
