@@ -10,14 +10,12 @@ build = "build.rs"
 
 [dependencies]
 ezk-rtp.workspace = true
-# stun-types = "0.1"
-stun-types = { path = "../../../ezk/crates/stun-types", package = "ezk-stun-types" }
-# sdp-types = { package = "ezk-sdp-types", version = "0.4" }
-sdp-types = { git = "https://github.com/kbalt/ezk", package = "ezk-sdp-types" }
+stun-types = { package = "ezk-stun-types", version = "0.3" }
+sdp-types = { package = "ezk-sdp-types", version = "0.5" }
 ezk-ice.path = "../ezk-ice"
 log = "0.4"
 thiserror = "2"
-rand = "0.8"
+rand = "0.9"
 tokio = { version = "1", features = ["net"] }
 futures-util = "0.3"
 bytesstr = "1.0.2"

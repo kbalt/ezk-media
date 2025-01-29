@@ -8,9 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-stun-types = { git = "https://github.com/kbalt/ezk", package = "ezk-stun-types" }
-sdp-types = { git = "https://github.com/kbalt/ezk", package = "ezk-sdp-types" }
-rand = "0.8"
+stun-types = { version = "0.3", package = "ezk-stun-types" }
+sdp-types = { version = "0.5", package = "ezk-sdp-types" }
+rand = "0.9"
 slotmap = "1.0.7"
 log = "0.4"
 

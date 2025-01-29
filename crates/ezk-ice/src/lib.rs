@@ -3,7 +3,7 @@
 //! sans io implementation of an ICE agent
 
 use core::fmt;
-use rand::distributions::{Alphanumeric, DistString};
+use rand::distr::{Alphanumeric, SampleString};
 use sdp_types::{IceCandidate, UntaggedAddress};
 use slotmap::{new_key_type, SlotMap};
 use std::{
