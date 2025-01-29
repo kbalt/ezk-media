@@ -9,7 +9,7 @@ use ezk_rtp::{
     RtpPacket, RtpSession,
 };
 use local_media::LocalMedia;
-use sdp_types::{Direction, MediaDescription, MediaType};
+use sdp_types::{Direction, MediaDescription};
 use slotmap::SlotMap;
 use std::{
     cmp::min,
@@ -36,6 +36,7 @@ pub use codecs::{Codec, Codecs};
 pub use events::{Event, TransportConnectionState};
 pub use options::{BundlePolicy, Options, RtcpMuxPolicy, TransportType};
 pub use sdp::SdpAnswerState;
+pub use sdp_types::MediaType;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MediaId(u32);
