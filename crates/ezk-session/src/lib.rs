@@ -291,6 +291,15 @@ impl SdpSession {
         }
     }
 
+    pub fn has_media(&mut self) -> bool {
+        let has_pending_media = self
+            .pending_changes
+            .iter()
+            .any(|c| matches!(c, PendingChange::AddMedia(..)));
+
+        (!self.state.is_empty()) || has_pending_media
+    }
+
     /// Register codecs for a media type with a limit of how many media session by can be created
     ///
     /// Returns `None` if no more payload type numbers are available

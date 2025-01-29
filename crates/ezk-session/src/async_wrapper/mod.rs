@@ -47,6 +47,10 @@ impl AsyncSdpSession {
         self.inner.add_stun_server(server);
     }
 
+    pub fn has_media(&mut self) -> bool {
+        self.inner.has_media()
+    }
+
     /// Register codecs for a media type with a limit of how many media session by can be created
     ///
     /// Returns `None` if no more payload type numbers are available
@@ -96,7 +100,6 @@ impl AsyncSdpSession {
         for change in self.inner.transport_changes() {
             match change {
                 TransportChange::CreateSocket(transport_id) => {
-                    println!("Create socket {transport_id:?}");
                     let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
                     self.inner.set_transport_ports(
@@ -110,8 +113,6 @@ impl AsyncSdpSession {
                         .insert((transport_id, Component::Rtp), Socket::new(socket));
                 }
                 TransportChange::CreateSocketPair(transport_id) => {
-                    println!("Create socket pair {transport_id:?}");
-
                     let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
                     let rtcp_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
@@ -128,14 +129,10 @@ impl AsyncSdpSession {
                         .insert((transport_id, Component::Rtcp), Socket::new(rtcp_socket));
                 }
                 TransportChange::Remove(transport_id) => {
-                    println!("Remove {transport_id:?}");
-
                     self.sockets.remove(&(transport_id, Component::Rtp));
                     self.sockets.remove(&(transport_id, Component::Rtcp));
                 }
                 TransportChange::RemoveRtcpSocket(transport_id) => {
-                    println!("Remove rtcp socket of {transport_id:?}");
-
                     self.sockets.remove(&(transport_id, Component::Rtcp));
                 }
             }
