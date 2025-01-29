@@ -92,14 +92,19 @@ impl DtlsSrtpSession {
         self.state
     }
 
-    #[cfg(openssl320)]
-    pub(crate) fn timeout(&self) -> Option<Duration> {
-        self.stream.ssl().event_timeout().unwrap()
-    }
+    // #[cfg(openssl320)]
+    // pub(crate) fn timeout(&self) -> Option<Duration> {
+    //     self.stream.ssl().event_timeout().unwrap()
+    // }
 
-    #[cfg(not(openssl320))]
+    // #[cfg(not(openssl320))]
     pub(crate) fn timeout(&self) -> Option<Duration> {
-        Some(Duration::from_millis(100))
+        match self.state {
+            DtlsState::Accepting => Some(Duration::from_millis(100)),
+            DtlsState::Connecting => Some(Duration::from_millis(100)),
+            DtlsState::Connected => None,
+            DtlsState::Failed => None,
+        }
     }
 
     pub(crate) fn receive(&mut self, data: Vec<u8>) {
