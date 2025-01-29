@@ -1,5 +1,5 @@
 use bytesstr::BytesStr;
-use ezk_session::{AsyncSdpSession, Codec, Codecs};
+use ezk_session::{AsyncSdpSession, Codec, Codecs, Options};
 use sdp_types::{Direction, MediaType, SessionDescription};
 use sip_core::transport::udp::Udp;
 use sip_core::{Endpoint, IncomingRequest, Layer, LayerKey, MayTake, Result};
@@ -38,7 +38,7 @@ impl Layer for InviteAcceptLayer {
         let start = Instant::now();
         let ip = local_ip_address::local_ip().unwrap();
 
-        let mut sdp_session = AsyncSdpSession::new(ip);
+        let mut sdp_session = AsyncSdpSession::new(ip, Options::default());
         sdp_session.add_stun_server("15.197.250.192:3478".parse().unwrap());
         sdp_session.add_local_media(
             Codecs::new(MediaType::Audio).with_codec(Codec::PCMA),
@@ -215,7 +215,7 @@ async fn main() -> Result<()> {
     //     )),
     // );
 
-    let mut sess = AsyncSdpSession::new("10.6.0.3".parse().unwrap());
+    let mut sess = AsyncSdpSession::new("10.6.0.3".parse().unwrap(), Options::default());
     // sess.add_stun_server("15.197.250.192:3478".parse().unwrap());
     let audio_id = sess
         .add_local_media(

@@ -28,15 +28,9 @@ pub struct AsyncSdpSession {
 }
 
 impl AsyncSdpSession {
-    pub fn new(address: IpAddr) -> Self {
+    pub fn new(address: IpAddr, options: Options) -> Self {
         Self {
-            inner: super::SdpSession::new(
-                address,
-                Options {
-                    offer_ice: true,
-                    ..Options::default()
-                },
-            ),
+            inner: super::SdpSession::new(address, options),
             sockets: HashMap::new(),
             timeout: Some(Instant::now()), // poll immediately
             ips: local_ip_address::linux::list_afinet_netifas()
