@@ -132,7 +132,7 @@ async fn add_video_stream(
 
     sdp_session.add_media(v, Direction::SendRecv);
 
-    let offer = sdp_session.create_offer().await.unwrap();
+    let offer = sdp_session.create_sdp_offer().await.unwrap();
 
     let mut request = session.dialog.create_request(Method::INVITE);
 

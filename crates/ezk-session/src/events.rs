@@ -1,7 +1,7 @@
-use crate::{LocalMediaId, MediaId, TransportId};
+use crate::{codecs::NegotiatedCodec, LocalMediaId, MediaId, TransportId};
 use ezk_ice::{Component, IceConnectionState, IceGatheringState};
 use ezk_rtp::RtpPacket;
-use sdp_types::{Direction, MediaType};
+use sdp_types::Direction;
 use std::net::{IpAddr, SocketAddr};
 
 #[derive(Debug, Clone, Copy)]
@@ -14,47 +14,68 @@ pub struct Stats {
     lost: Option<f32>,
 }
 
+/// New media line was added to the session
+#[derive(Debug)]
+pub struct MediaAdded {
+    pub id: MediaId,
+    pub transport_id: TransportId,
+    pub local_media_id: LocalMediaId,
+    pub direction: Direction,
+    pub codec: NegotiatedCodec,
+}
+
+/// Existing media has changed
+#[derive(Debug)]
+pub struct MediaChanged {
+    pub id: MediaId,
+    pub direction: Direction,
+}
+
+/// The gathering state of the ICE agent used by the transport changed state
+///
+/// This event will only trigger on transports which use an ICE agent
+#[derive(Debug)]
+pub struct IceGatheringStateChanged {
+    pub transport_id: TransportId,
+    pub old: IceGatheringState,
+    pub new: IceGatheringState,
+}
+
+/// The connection state of the ICE agent used by the transport changed state
+///
+/// This event will only trigger on transports which use an ICE agent
+#[derive(Debug)]
+pub struct IceConnectionStateChanged {
+    pub transport_id: TransportId,
+    pub old: IceConnectionState,
+    pub new: IceConnectionState,
+}
+
+/// The transport's connection state changed.
+///
+/// Note that not all states are reachable depending on the transport kind (RTP, SDES-RTP or DTLS-SRTP).
+#[derive(Debug)]
+pub struct TransportConnectionStateChanged {
+    pub transport_id: TransportId,
+    pub old: TransportConnectionState,
+    pub new: TransportConnectionState,
+}
+
 /// Session event returned by [`SdpSession::pop_event`](crate::SdpSession::pop_event)
+#[derive(Debug)]
 pub enum Event {
-    /// New media line was added to the session
-    MediaAdded {
-        id: MediaId,
-        local_media_id: LocalMediaId,
-        direction: Direction,
-    },
-
-    /// Existing media has changed direction
-    MediaChanged { id: MediaId, direction: Direction },
-
+    /// See [`MediaAdded`]
+    MediaAdded(MediaAdded),
+    /// See [`MediaChanged`]
+    MediaChanged(MediaChanged),
     /// Media was removed from the session
-    MediaRemoved { id: MediaId },
-
-    /// The gathering state of the ICE agent used by the transport changed state
-    ///
-    /// This event will only trigger on transports which use an ICE agent
-    IceGatheringState {
-        transport_id: TransportId,
-        old: IceGatheringState,
-        new: IceGatheringState,
-    },
-
-    /// The connection state of the ICE agent used by the transport changed state
-    ///
-    /// This event will only trigger on transports which use an ICE agent
-    IceConnectionState {
-        transport_id: TransportId,
-        old: IceConnectionState,
-        new: IceConnectionState,
-    },
-
-    /// The transport's connection state changed.
-    ///
-    /// Note that not all states are reachable depending on the transport kind (RTP, SDES-RTP or DTLS-SRTP).
-    TransportConnectionState {
-        transport_id: TransportId,
-        old: TransportConnectionState,
-        new: TransportConnectionState,
-    },
+    MediaRemoved(MediaId),
+    /// See [`IceGatheringStateChanged`]
+    IceGatheringState(IceGatheringStateChanged),
+    /// See [`IceConnectionStateChanged`]
+    IceConnectionState(IceConnectionStateChanged),
+    /// See [`TransportConnectionStateChanged`]
+    TransportConnectionState(TransportConnectionStateChanged),
 
     /// Outbound media statistics
     SendStats { media_id: MediaId, stats: Stats },

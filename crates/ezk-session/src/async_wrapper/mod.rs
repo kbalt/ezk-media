@@ -1,12 +1,16 @@
 use crate::{
-    events::TransportChange, Codecs, Event, LocalMediaId, MediaId, Options, ReceivedPkt,
-    TransportId,
+    events::{
+        IceConnectionStateChanged, MediaAdded, MediaChanged, TransportChange,
+        TransportConnectionStateChanged,
+    },
+    Codecs, Error, Event, LocalMediaId, MediaId, Options, ReceivedPkt, TransportId,
 };
 use ezk_ice::{Component, IceGatheringState};
+use ezk_rtp::RtpPacket;
 use sdp_types::{Direction, SessionDescription};
 use socket::Socket;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::{pending, poll_fn},
     io::{self},
     mem::MaybeUninit,
@@ -18,19 +22,42 @@ use tokio::{io::ReadBuf, net::UdpSocket, select, time::sleep_until};
 
 mod socket;
 
+/// Session event returned by [`AsyncSdpSession::run`]
+#[derive(Debug)]
+pub enum AsyncEvent {
+    /// See [`MediaAdded`]
+    MediaAdded(MediaAdded),
+    /// See [`MediaChanged`]
+    MediaChanged(MediaChanged),
+    /// Media was removed from the session
+    MediaRemoved(MediaId),
+    /// See [`IceConnectionStateChanged`]
+    IceConnectionState(IceConnectionStateChanged),
+    /// See [`TransportConnectionStateChanged`]
+    TransportConnectionState(TransportConnectionStateChanged),
+
+    /// Receive RTP on a media
+    ReceiveRTP {
+        media_id: MediaId,
+        packet: RtpPacket,
+    },
+}
+
 pub struct AsyncSdpSession {
-    inner: super::SdpSession,
+    state: super::SdpSession,
     sockets: HashMap<(TransportId, Component), Socket>,
     timeout: Option<Instant>,
     ips: Vec<IpAddr>,
 
     buf: Vec<MaybeUninit<u8>>,
+
+    events: VecDeque<AsyncEvent>,
 }
 
 impl AsyncSdpSession {
     pub fn new(address: IpAddr, options: Options) -> Self {
         Self {
-            inner: super::SdpSession::new(address, options),
+            state: super::SdpSession::new(address, options),
             sockets: HashMap::new(),
             timeout: Some(Instant::now()), // poll immediately
             ips: local_ip_address::linux::list_afinet_netifas()
@@ -40,15 +67,23 @@ impl AsyncSdpSession {
                 .collect(),
 
             buf: vec![MaybeUninit::uninit(); 65535],
+
+            events: VecDeque::new(),
         }
     }
 
+    /// Add a stun server to use to setup ICE
     pub fn add_stun_server(&mut self, server: SocketAddr) {
-        self.inner.add_stun_server(server);
+        self.state.add_stun_server(server);
     }
 
-    pub fn has_media(&mut self) -> bool {
-        self.inner.has_media()
+    /// Returns if any media already configured
+    pub fn has_media(&self) -> bool {
+        self.state.has_media()
+    }
+
+    pub fn send_rtp(&mut self, media_id: MediaId, packet: RtpPacket) {
+        self.state.send_rtp(media_id, packet);
     }
 
     /// Register codecs for a media type with a limit of how many media session by can be created
@@ -60,49 +95,46 @@ impl AsyncSdpSession {
         limit: u32,
         direction: Direction,
     ) -> Option<LocalMediaId> {
-        self.inner.add_local_media(codecs, limit, direction)
+        self.state.add_local_media(codecs, limit, direction)
     }
 
     pub fn add_media(&mut self, local_media_id: LocalMediaId, direction: Direction) -> MediaId {
-        self.inner.add_media(local_media_id, direction)
+        self.state.add_media(local_media_id, direction)
     }
 
-    pub async fn create_offer(&mut self) -> Result<SessionDescription, crate::Error> {
+    pub async fn create_sdp_offer(&mut self) -> Result<SessionDescription, crate::Error> {
         self.handle_transport_changes().await?;
         self.run_until_all_candidates_are_gathered().await?;
-        Ok(self.inner.create_sdp_offer())
+        Ok(self.state.create_sdp_offer())
     }
 
     pub async fn receive_sdp_offer(
         &mut self,
         offer: SessionDescription,
-    ) -> Result<SessionDescription, super::Error> {
-        let state = self.inner.receive_sdp_offer(offer)?;
+    ) -> Result<SessionDescription, Error> {
+        let state = self.state.receive_sdp_offer(offer)?;
 
         self.handle_transport_changes().await?;
         self.run_until_all_candidates_are_gathered().await?;
 
-        Ok(self.inner.create_sdp_answer(state))
+        Ok(self.state.create_sdp_answer(state))
     }
 
-    pub async fn receive_sdp_answer(
-        &mut self,
-        answer: SessionDescription,
-    ) -> Result<(), super::Error> {
-        self.inner.receive_sdp_answer(answer);
+    pub async fn receive_sdp_answer(&mut self, answer: SessionDescription) -> Result<(), Error> {
+        self.state.receive_sdp_answer(answer);
 
         self.handle_transport_changes().await?;
 
         Ok(())
     }
 
-    async fn handle_transport_changes(&mut self) -> Result<(), crate::Error> {
-        for change in self.inner.transport_changes() {
+    async fn handle_transport_changes(&mut self) -> io::Result<()> {
+        for change in self.state.transport_changes() {
             match change {
                 TransportChange::CreateSocket(transport_id) => {
                     let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
-                    self.inner.set_transport_ports(
+                    self.state.set_transport_ports(
                         transport_id,
                         &self.ips,
                         socket.local_addr()?.port(),
@@ -116,7 +148,7 @@ impl AsyncSdpSession {
                     let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
                     let rtcp_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
-                    self.inner.set_transport_ports(
+                    self.state.set_transport_ports(
                         transport_id,
                         &self.ips,
                         rtp_socket.local_addr()?.port(),
@@ -142,41 +174,25 @@ impl AsyncSdpSession {
     }
 
     fn handle_events(&mut self) -> Result<(), super::Error> {
-        while let Some(event) = self.inner.pop_event() {
+        while let Some(event) = self.state.pop_event() {
             match event {
-                Event::MediaAdded {
-                    id,
-                    local_media_id,
-                    direction,
-                } => todo!(),
-                Event::MediaChanged { id, direction } => todo!(),
-                Event::MediaRemoved { id } => todo!(),
-                Event::IceGatheringState {
-                    transport_id,
-                    old,
-                    new,
-                } => println!(
-                    "transport {transport_id:?} ice gathering state changed {old:?} -> {new:?}"
-                ),
-                Event::IceConnectionState {
-                    transport_id,
-                    old,
-                    new,
-                } => println!(
-                    "transport {transport_id:?} ice connection state changed {old:?} -> {new:?}"
-                ),
-                Event::TransportConnectionState {
-                    transport_id,
-                    old,
-                    new,
-                } => println!(
-                    "transport {transport_id:?} connection state changed {old:?} -> {new:?}"
-                ),
+                Event::MediaAdded(event) => self.events.push_back(AsyncEvent::MediaAdded(event)),
+                Event::MediaChanged(event) => {
+                    self.events.push_back(AsyncEvent::MediaChanged(event))
+                }
+                Event::MediaRemoved(id) => self.events.push_back(AsyncEvent::MediaRemoved(id)),
+                Event::IceGatheringState(event) => {}
+                Event::IceConnectionState(event) => {
+                    self.events.push_back(AsyncEvent::IceConnectionState(event))
+                }
+                Event::TransportConnectionState(event) => self
+                    .events
+                    .push_back(AsyncEvent::TransportConnectionState(event)),
                 Event::SendStats { media_id, stats } => {
-                    println!("Send statistics of {media_id:?}: {stats:?}")
+                    // println!("Send statistics of {media_id:?}: {stats:?}")
                 }
                 Event::ReceiveStats { media_id, stats } => {
-                    println!("Receive statistics of {media_id:?}: {stats:?}")
+                    // println!("Receive statistics of {media_id:?}: {stats:?}")
                 }
                 Event::SendData {
                     transport_id,
@@ -188,12 +204,12 @@ impl AsyncSdpSession {
                     if let Some(socket) = self.sockets.get_mut(&(transport_id, component)) {
                         socket.enqueue(data, source, target);
                     } else {
-                        println!("invalid socket id")
+                        log::error!("SdpSession tried to send packet using a non existent socket");
                     }
                 }
-                Event::ReceiveRTP { media_id, packet } => {
-                    println!("Received RTP on {media_id:?} {:?}", packet.sequence_number);
-                }
+                Event::ReceiveRTP { media_id, packet } => self
+                    .events
+                    .push_back(AsyncEvent::ReceiveRTP { media_id, packet }),
             }
         }
 
@@ -202,7 +218,7 @@ impl AsyncSdpSession {
 
     async fn run_until_all_candidates_are_gathered(&mut self) -> Result<(), crate::Error> {
         while !matches!(
-            self.inner.ice_gathering_state(),
+            self.state.ice_gathering_state(),
             None | Some(IceGatheringState::Complete)
         ) {
             self.step().await?;
@@ -212,14 +228,18 @@ impl AsyncSdpSession {
         Ok(())
     }
 
-    pub async fn run(&mut self) -> io::Result<()> {
+    pub async fn run(&mut self) -> Result<AsyncEvent, Error> {
         loop {
+            if let Some(event) = self.events.pop_front() {
+                return Ok(event);
+            }
+
             self.step().await?;
             self.handle_events().unwrap();
         }
     }
 
-    async fn step(&mut self) -> io::Result<()> {
+    async fn step(&mut self) -> Result<(), Error> {
         let mut buf = ReadBuf::uninit(&mut self.buf);
 
         select! {
@@ -233,15 +253,15 @@ impl AsyncSdpSession {
                     component: socket_id.1
                 };
 
-                self.inner.receive(socket_id.0, pkt);
+                self.state.receive(socket_id.0, pkt);
 
                 buf.set_filled(0);
 
                 Ok(())
             }
             _ = timeout(self.timeout) => {
-                self.inner.poll(Instant::now());
-                self.timeout = self.inner.timeout().map(|d| Instant::now() + d);
+                self.state.poll(Instant::now());
+                self.timeout = self.state.timeout().map(|d| Instant::now() + d);
                 Ok(())
             }
         }

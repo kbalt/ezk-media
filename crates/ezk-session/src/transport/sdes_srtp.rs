@@ -36,7 +36,7 @@ pub(super) fn negotiate_from_offer(
     let suite = srtp_suite_to_policy(&crypto.suite).unwrap();
 
     let mut send_key = vec![0u8; suite.key_len()];
-    rand::thread_rng().fill_bytes(&mut send_key);
+    rand::rng().fill_bytes(&mut send_key);
 
     let inbound = srtp::Session::with_inbound_template(srtp::StreamPolicy {
         rtp: suite,
@@ -87,7 +87,7 @@ impl SdesSrtpOffer {
             let policy = srtp_suite_to_policy(&suite).expect("only using known working suites");
 
             let mut send_key = vec![0u8; policy.key_len()];
-            rand::thread_rng().fill_bytes(&mut send_key);
+            rand::rng().fill_bytes(&mut send_key);
 
             keys.push((suite, send_key));
         }

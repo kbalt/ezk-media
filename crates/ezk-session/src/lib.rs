@@ -2,7 +2,10 @@
 
 use bytes::Bytes;
 use bytesstr::BytesStr;
-use events::{TransportChange, TransportRequiredChanges};
+use events::{
+    IceConnectionStateChanged, IceGatheringStateChanged, TransportChange,
+    TransportConnectionStateChanged, TransportRequiredChanges,
+};
 use ezk_ice::{Component, IceAgent, IceConnectionState, IceGatheringState, ReceivedPkt};
 use ezk_rtp::{
     rtcp_types::{Compound, Packet as RtcpPacket},
@@ -31,7 +34,7 @@ mod rtp;
 mod sdp;
 mod transport;
 
-pub use async_wrapper::AsyncSdpSession;
+pub use async_wrapper::{AsyncEvent, AsyncSdpSession};
 pub use codecs::{Codec, Codecs};
 pub use events::{Event, TransportConnectionState};
 pub use options::{BundlePolicy, Options, RtcpMuxPolicy, TransportType};
@@ -291,7 +294,7 @@ impl SdpSession {
         }
     }
 
-    pub fn has_media(&mut self) -> bool {
+    pub fn has_media(&self) -> bool {
         let has_pending_media = self
             .pending_changes
             .iter()
@@ -535,25 +538,27 @@ impl SdpSession {
 
             match event {
                 TransportEvent::IceConnectionState { old, new } => {
-                    return Some(Event::IceConnectionState {
+                    return Some(Event::IceConnectionState(IceConnectionStateChanged {
                         transport_id,
                         old,
                         new,
-                    })
+                    }))
                 }
                 TransportEvent::IceGatheringState { old, new } => {
-                    return Some(Event::IceGatheringState {
+                    return Some(Event::IceGatheringState(IceGatheringStateChanged {
                         transport_id,
                         old,
                         new,
-                    })
+                    }))
                 }
                 TransportEvent::TransportConnectionState { old, new } => {
-                    return Some(Event::TransportConnectionState {
-                        transport_id,
-                        old,
-                        new,
-                    })
+                    return Some(Event::TransportConnectionState(
+                        TransportConnectionStateChanged {
+                            transport_id,
+                            old,
+                            new,
+                        },
+                    ))
                 }
                 TransportEvent::SendData {
                     component,

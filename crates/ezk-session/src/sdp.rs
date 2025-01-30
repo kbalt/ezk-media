@@ -1,7 +1,8 @@
-use crate::events::{TransportChange, TransportRequiredChanges};
+use crate::codecs::NegotiatedCodec;
+use crate::events::{MediaAdded, MediaChanged, TransportChange, TransportRequiredChanges};
 use crate::transport::{Transport, TransportBuilder};
 use crate::{
-    ActiveMedia, DirectionBools, Error, MediaId, PendingChange, SdpSession, TransportEntry,
+    ActiveMedia, DirectionBools, Error, Event, MediaId, PendingChange, SdpSession, TransportEntry,
     TransportId,
 };
 use bytesstr::BytesStr;
@@ -53,8 +54,8 @@ impl SdpSession {
                 .position(|media| media.matches(&self.transports, remote_media_desc));
 
             if let Some(position) = matched_position {
-                let mut media = self.state.remove(position);
-                self.update_active_media(requested_direction, &mut media);
+                self.update_active_media(requested_direction, self.state[position].id);
+                let media = self.state.remove(position);
                 response.push(SdpResponseEntry::Active(media.id));
                 new_state.push(media);
                 continue;
@@ -95,6 +96,28 @@ impl SdpSession {
                 continue;
             };
 
+            let recv_fmtp = remote_media_desc
+                .fmtp
+                .iter()
+                .find(|f| f.format == codec_pt)
+                .map(|f| f.params.to_string());
+
+            self.events.push_back(Event::MediaAdded(MediaAdded {
+                id: media_id,
+                transport_id: transport,
+                local_media_id,
+                direction: negotiated_direction.into(),
+                codec: NegotiatedCodec {
+                    send_pt: codec_pt,
+                    recv_pt: codec_pt,
+                    name: codec.name.clone(),
+                    clock_rate: codec.clock_rate,
+                    channels: codec.channels,
+                    send_fmtp: codec.fmtp.clone(),
+                    recv_fmtp,
+                },
+            }));
+
             response.push(SdpResponseEntry::Active(media_id));
             new_state.push(ActiveMedia {
                 id: media_id,
@@ -112,10 +135,11 @@ impl SdpSession {
         }
 
         // Store new state and destroy all media sessions
-        let remove_media = replace(&mut self.state, new_state);
+        let removed_media = replace(&mut self.state, new_state);
 
-        for media in remove_media {
+        for media in removed_media {
             self.local_media[media.local_media_id].use_count -= 1;
+            self.events.push_back(Event::MediaRemoved(media.id));
         }
 
         self.remove_unused_transports();
@@ -147,19 +171,22 @@ impl SdpSession {
         });
     }
 
-    fn update_active_media(
-        &mut self,
-        requested_direction: DirectionBools,
-        media: &mut ActiveMedia,
-    ) {
-        // let transport = self.transports[media.transport].unwrap_mut();
+    fn update_active_media(&mut self, requested_direction: DirectionBools, media_id: MediaId) {
+        let media = self
+            .state
+            .iter_mut()
+            .find(|m| m.id == media_id)
+            .expect("media_id must be valid");
 
         if media.direction != requested_direction {
-            // todo: emit direction change event
+            media.direction = requested_direction;
+
+            self.events.push_back(Event::MediaChanged(MediaChanged {
+                id: media_id,
+                direction: requested_direction.into(),
+            }));
         }
     }
-
-    fn update_active_media_id(&mut self, requested_direction: DirectionBools, media_id: MediaId) {}
 
     /// Get or create a transport for the given media description
     ///
@@ -356,10 +383,10 @@ impl SdpSession {
                 });
 
                 // TODO: are multiple fmtps allowed?
-                for param in &codec.params {
+                if let Some(param) = &codec.fmtp {
                     fmtp.push(Fmtp {
                         format: pt,
-                        params: param.clone().into(),
+                        params: param.as_str().into(),
                     });
                 }
             }
@@ -450,7 +477,9 @@ impl SdpSession {
 
     /// Receive a SDP answer after sending an offer.
     pub fn receive_sdp_answer(&mut self, answer: SessionDescription) {
-        'next_media_desc: for remote_media_desc in &answer.media_descriptions {
+        'next_media_desc: for (mline, remote_media_desc) in
+            answer.media_descriptions.iter().enumerate()
+        {
             // Skip any rejected answers
             if remote_media_desc.direction == Direction::Inactive {
                 continue;
@@ -474,7 +503,7 @@ impl SdpSession {
                     // // TODO: update media
                     // let _ = requested_direction;
                     let media_id = media.id;
-                    self.update_active_media_id(requested_direction, media_id);
+                    self.update_active_media(requested_direction, media_id);
                     continue 'next_media_desc;
                 }
             }
@@ -523,6 +552,28 @@ impl SdpSession {
                     .choose_codec_from_answer(remote_media_desc)
                     .unwrap();
 
+                let recv_fmtp = remote_media_desc
+                    .fmtp
+                    .iter()
+                    .find(|f| f.format == codec_pt)
+                    .map(|f| f.params.to_string());
+
+                self.events.push_back(Event::MediaAdded(MediaAdded {
+                    id: pending_media.id,
+                    transport_id,
+                    local_media_id: pending_media.local_media_id,
+                    direction: direction.into(),
+                    codec: NegotiatedCodec {
+                        send_pt: codec_pt,
+                        recv_pt: codec_pt,
+                        name: codec.name.clone(),
+                        clock_rate: codec.clock_rate,
+                        channels: codec.channels,
+                        send_fmtp: codec.fmtp.clone(),
+                        recv_fmtp,
+                    },
+                }));
+
                 self.state.push(ActiveMedia {
                     id: pending_media.id,
                     local_media_id: pending_media.local_media_id,
@@ -536,7 +587,12 @@ impl SdpSession {
                     codec_pt,
                     codec,
                 });
+
+                continue 'next_media_desc;
             }
+
+            // TODO: hard error?
+            log::warn!("Failed to match mline={mline} to any offered media");
         }
 
         self.pending_changes.clear();
@@ -555,7 +611,7 @@ impl SdpSession {
             params: Default::default(),
         };
 
-        let fmtps = active.codec.params.iter().map(|param| Fmtp {
+        let fmtp = active.codec.fmtp.as_ref().map(|param| Fmtp {
             format: active.codec_pt,
             params: param.as_str().into(),
         });
@@ -582,7 +638,7 @@ impl SdpSession {
             rtcp_mux: transport.remote_rtp_address == transport.remote_rtcp_address,
             mid: active.mid.clone(),
             rtpmap: vec![rtpmap],
-            fmtp: fmtps.collect(),
+            fmtp: fmtp.into_iter().collect(),
             ice_ufrag: None,
             ice_pwd: None,
             ice_candidates: vec![],
