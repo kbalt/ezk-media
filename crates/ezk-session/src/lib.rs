@@ -29,6 +29,7 @@ mod async_wrapper;
 mod codecs;
 mod events;
 mod local_media;
+mod media;
 mod options;
 mod rtp;
 mod sdp;
@@ -169,7 +170,7 @@ struct ActiveMedia {
     // TODO: do not start rtcp transmitting until transport is ready
     next_rtcp: Instant,
 
-    /// Optional mid, this is only one if both offer and answer have the mid attribute set
+    /// Optional mid, this is only Some if both offer and answer have the mid attribute set
     mid: Option<BytesStr>,
 
     /// SDP Send/Recv direction
@@ -239,6 +240,7 @@ impl PendingMedia {
         }
 
         if let Some(standalone_transport) = self.standalone_transport {
+            // TODO: some sip endpoints push back on the AVPF offer and set AVP in their answer so we might need to match that here as well and adjust
             if transports[standalone_transport]
                 .type_()
                 .sdp_type(self.use_avpf)
@@ -634,25 +636,43 @@ impl SdpSession {
                     }
                 };
 
-                let ssrc = packets.iter().find_map(|packet| match packet {
-                    RtcpPacket::Rr(receiver_report) => Some(receiver_report.ssrc()),
-                    RtcpPacket::Sr(sender_report) => Some(sender_report.ssrc()),
-                    RtcpPacket::App(app) => Some(app.ssrc()),
-                    RtcpPacket::Bye(bye) => bye.ssrcs().next(), // TODO: this could terminate multiple media streams
-                    RtcpPacket::Sdes(_) => None,
-                    RtcpPacket::TransportFeedback(transport_feedback) => {
-                        Some(transport_feedback.sender_ssrc())
-                    }
-                    RtcpPacket::PayloadFeedback(payload_feedback) => {
-                        Some(payload_feedback.sender_ssrc())
-                    }
-                    RtcpPacket::Unknown(_) => None,
-                });
+                println!("GOT RTCP: \n\n{packets:?}");
 
-                let Some(ssrc) = ssrc else {
-                    log::warn!("RTCP packet did not contain any SSRC");
+                if packets.is_empty() {
+                    log::warn!("Discarding empty RTCP compound packet");
                     return;
+                }
+
+                // Find out what kind of rtcp packet this is
+                let ssrc = match &packets[0] {
+                    RtcpPacket::App(..) => {
+                        // ignore
+                        log::debug!("ignoring app RTCP packet");
+                        return;
+                    }
+                    RtcpPacket::Bye(..) => {
+                        // TODO: implement bye handling
+                        log::warn!("ignoring BYE RTCP packet");
+                        return;
+                    }
+                    RtcpPacket::Rr(receiver_report) => receiver_report.ssrc(),
+                    RtcpPacket::Sdes(..) => {
+                        // what
+                        log::debug!("ignoring invalid RTCP packet");
+                        return;
+                    }
+                    RtcpPacket::Sr(sender_report) => sender_report.ssrc(),
+                    RtcpPacket::TransportFeedback(transport_feedback) => {
+                        transport_feedback.sender_ssrc()
+                    }
+                    RtcpPacket::PayloadFeedback(payload_feedback) => payload_feedback.sender_ssrc(),
+                    RtcpPacket::Unknown(..) => {
+                        log::debug!("ignoring unknown RTCP packet");
+                        return;
+                    }
                 };
+
+                println!("SSRC: {ssrc}");
 
                 let media = self
                     .state
@@ -664,7 +684,10 @@ impl SdpSession {
                     return;
                 };
 
-                // media.rtp_session.recv_rtcp();
+                for packet in packets {
+                    // TODO: handle the RTCP packets properly
+                    media.rtp_session.recv_rtcp(packet);
+                }
             }
             ReceivedPacket::TransportSpecific => {
                 // ignore
