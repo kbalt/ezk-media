@@ -254,6 +254,7 @@ impl AsyncSdpSession {
                 };
 
                 self.state.receive(socket_id.0, pkt);
+                self.timeout = self.state.timeout().map(|d| Instant::now() + d);
 
                 buf.set_filled(0);
 

@@ -179,12 +179,13 @@ impl SdpSession {
             .expect("media_id must be valid");
 
         if media.direction != requested_direction {
-            media.direction = requested_direction;
-
             self.events.push_back(Event::MediaChanged(MediaChanged {
                 id: media_id,
-                direction: requested_direction.into(),
+                old_direction: media.direction.into(),
+                new_direction: requested_direction.into(),
             }));
+
+            media.direction = requested_direction;
         }
     }
 

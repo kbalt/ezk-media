@@ -210,7 +210,7 @@ pub struct IceCredentials {
 
 impl IceCredentials {
     pub fn random() -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         Self {
             ufrag: Alphanumeric.sample_string(&mut rng, 8),

@@ -29,14 +29,13 @@ mod async_wrapper;
 mod codecs;
 mod events;
 mod local_media;
-mod media;
 mod options;
 mod rtp;
 mod sdp;
 mod transport;
 
 pub use async_wrapper::{AsyncEvent, AsyncSdpSession};
-pub use codecs::{Codec, Codecs};
+pub use codecs::{Codec, Codecs, NegotiatedCodec};
 pub use events::{Event, TransportConnectionState};
 pub use options::{BundlePolicy, Options, RtcpMuxPolicy, TransportType};
 pub use sdp::SdpAnswerState;
@@ -428,7 +427,7 @@ impl SdpSession {
         }
     }
 
-    /// Returns an iterator which contains all pending transport changes
+    /// Returns an list all pending transport changes
     pub fn transport_changes(&mut self) -> Vec<TransportChange> {
         std::mem::take(&mut self.transport_changes)
     }
@@ -483,7 +482,7 @@ impl SdpSession {
         }
 
         for media in self.state.iter() {
-            timeout = opt_min(timeout, media.rtp_session.pop_rtp_after(None));
+            timeout = opt_min(timeout, dbg!(media.rtp_session.pop_rtp_after(None)));
 
             let rtcp_send_timeout = media
                 .next_rtcp
@@ -636,8 +635,6 @@ impl SdpSession {
                     }
                 };
 
-                println!("GOT RTCP: \n\n{packets:?}");
-
                 if packets.is_empty() {
                     log::warn!("Discarding empty RTCP compound packet");
                     return;
@@ -671,8 +668,6 @@ impl SdpSession {
                         return;
                     }
                 };
-
-                println!("SSRC: {ssrc}");
 
                 let media = self
                     .state

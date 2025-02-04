@@ -28,7 +28,8 @@ pub struct MediaAdded {
 #[derive(Debug)]
 pub struct MediaChanged {
     pub id: MediaId,
-    pub direction: Direction,
+    pub old_direction: Direction,
+    pub new_direction: Direction,
 }
 
 /// The gathering state of the ICE agent used by the transport changed state
