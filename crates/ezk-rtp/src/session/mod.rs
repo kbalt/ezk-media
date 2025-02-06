@@ -97,6 +97,11 @@ impl RtpSession {
         self.ssrc
     }
 
+    /// Returns an iterator of remote SSRCs
+    pub fn remote_ssrc(&self) -> impl Iterator<Item = Ssrc> + use<'_> {
+        self.receiver.iter().map(|r| r.ssrc)
+    }
+
     /// Clock rate of the RTP timestamp
     pub fn clock_rate(&self) -> u32 {
         self.clock_rate

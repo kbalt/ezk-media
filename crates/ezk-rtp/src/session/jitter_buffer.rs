@@ -163,7 +163,7 @@ impl JitterBuffer {
     pub(crate) fn pop(&mut self, max_timestamp: ExtendedRtpTimestamp) -> Option<RtpPacket> {
         let num_vacant = self.queue.iter().position(|e| match e {
             QueueEntry::Vacant(..) => false,
-            QueueEntry::Occupied { timestamp: ts, .. } => ts.0 <= max_timestamp.0,
+            QueueEntry::Occupied { timestamp, .. } => timestamp.0 <= max_timestamp.0,
         })?;
 
         for _ in 0..num_vacant {
