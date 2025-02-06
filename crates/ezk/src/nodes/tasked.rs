@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 /// - allows for the [`Source::next_event`] to be cancellation safe
 /// - [`Source::next_event`] is called more frequently due to having it's own task
 pub struct Tasked<S: Source> {
+    ready: bool,
     to_task: mpsc::Sender<SourceToTaskMsg<S::MediaType>>,
     from_task: mpsc::Receiver<Result<SourceEvent<S::MediaType>>>,
 }
@@ -22,7 +23,11 @@ impl<S: Source> Tasked<S> {
 
         tokio::spawn(task(source, from_source, to_source));
 
-        Self { from_task, to_task }
+        Self {
+            ready: false,
+            from_task,
+            to_task,
+        }
     }
 }
 
@@ -74,11 +79,11 @@ async fn task<S: Source>(
 
                     continue 'next_event;
                 }
-                negotiate = from_source.recv() => {
-                    let Some(negotiate) = negotiate else { return; };
+                msg = from_source.recv() => {
+                    let Some(msg) = msg else { return; };
 
                     // store for later until next_event has been polled to completion
-                    pending_msg = Some(negotiate);
+                    pending_msg = Some(msg);
                 }
             }
         }
@@ -110,10 +115,18 @@ impl<S: Source> Source for Tasked<S> {
             .await
             .map_err(|_| Error::msg("Tasked's from_task dropped"))?;
 
-        recv.await.map_err(|_| Error::msg("Tasked's ret dropped"))?
+        let res = recv.await.map_err(|_| Error::msg("Tasked's ret dropped"))?;
+
+        self.ready = true;
+
+        res
     }
 
     async fn next_event(&mut self) -> Result<SourceEvent<Self::MediaType>> {
+        if !self.ready {
+            return Ok(SourceEvent::RenegotiationNeeded);
+        }
+
         self.from_task
             .recv()
             .await
