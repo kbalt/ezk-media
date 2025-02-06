@@ -1,8 +1,11 @@
 use crate::{Sample, I24, U24};
 use byte_slice_cast::AsByteSlice;
 use ezk::ValueRange;
+use std::alloc::Layout;
+use std::any::TypeId;
 use std::collections::VecDeque;
 use std::fmt;
+use std::mem::take;
 
 impl Format {
     #[must_use]
@@ -96,16 +99,79 @@ macro_rules! sample_formats {
             }
 
             #[must_use]
-            pub fn from_bytes(format: Format, bytes: &[u8]) -> Self {
+            pub fn from_ne_bytes(format: Format, bytes: &[u8]) -> Self {
+                if cfg!(target_endian = "big") {
+                    Self::from_be_bytes(format, bytes)
+                } else {
+                    Self::from_le_bytes(format, bytes)
+                }
+            }
+
+            #[must_use]
+            pub fn from_be_bytes(format: Format, bytes: &[u8]) -> Self {
+                let bytes_per_sample = format.bytes_per_sample();
+                assert_eq!(bytes.len() % bytes_per_sample, 0);
+
                 match format {
                     $(Format::$variant => {
-                        let bytes_per_sample = format.bytes_per_sample();
-                        assert_eq!(bytes.len() % bytes_per_sample, 0);
-
-                        Self::$variant(Vec::from_iter(bytes.chunks_exact(bytes_per_sample).map(|chunk| {
-                            $T::from_ne_bytes(chunk.try_into().expect("from_ne_bytes must accept size_of::<Self> amount of bytes"))
-                        })))
+                        Self::$variant(
+                            bytes
+                                .chunks_exact(bytes_per_sample)
+                                .map(|chunk| {
+                                    $T::from_be_bytes(chunk.try_into().expect("from_be_bytes must accept size_of::<Self> amount of bytes"))
+                                })
+                                .collect()
+                        )
                     },)+
+                }
+            }
+
+            #[must_use]
+            pub fn from_le_bytes(format: Format, bytes: &[u8]) -> Self {
+                let bytes_per_sample = format.bytes_per_sample();
+                assert_eq!(bytes.len() % bytes_per_sample, 0);
+
+                match format {
+                    $(Format::$variant => {
+                        Self::$variant(
+                            bytes
+                                .chunks_exact(bytes_per_sample)
+                                .map(|chunk| {
+                                    $T::from_le_bytes(chunk.try_into().expect("from_le_bytes must accept size_of::<Self> amount of bytes"))
+                                })
+                                .collect()
+                        )
+                    },)+
+                }
+            }
+
+            /// Returns self in a vector of the provided sample type
+            #[must_use]
+            pub fn into_samples<S: Sample>(self) -> Vec<S> {
+                match self {
+                    $(
+                        Self::$variant(mut v) =>  {
+                            if TypeId::of::<$T>() == TypeId::of::<S>() {
+                                // Safety; Just checked that T and S are the same type
+                                unsafe { std::mem::transmute::<Vec<$T>, Vec<S>>(v) }
+                            } else if Layout::new::<$T>() == Layout::new::<S>() {
+                                // Safety: Just checked that the memory layout of $T and S are the same
+                                unsafe { convert_with_dst_and_src_type_inplace(&mut v) }
+                            } else {
+                                v.into_iter().map(|s| s.to_sample::<S>()).collect()
+                            }
+                        },
+                    )*
+                }
+            }
+
+            /// Creates a copy of the samples in the given format
+            #[must_use]
+            pub fn to_samples<S: Sample>(&self) -> Vec<S> {
+                match self {
+                    $(
+                        Self::$variant(v) => v.iter().map(|s| s.to_sample::<S>()).collect(),
+                    )*
                 }
             }
         }
@@ -358,4 +424,29 @@ macro_rules! substitute {
     ) => {
         $($processed)*
     };
+}
+
+/// Safety: Only valid if Src and Dst have the same Layout
+unsafe fn convert_with_dst_and_src_type_inplace<Src, Dst>(src: &mut Vec<Src>) -> Vec<Dst>
+where
+    Src: Sample,
+    Dst: Sample,
+{
+    let src = take(src);
+
+    let (ptr, len, cap) = vec_into_raw_parts(src);
+
+    for offset in 0..len {
+        let ptr = ptr.add(offset);
+        let src = ptr.read();
+        let ptr = ptr.cast::<Dst>();
+        ptr.write(src.to_sample());
+    }
+
+    Vec::from_raw_parts(ptr.cast::<Dst>(), len, cap)
+}
+
+fn vec_into_raw_parts<T>(vec: Vec<T>) -> (*mut T, usize, usize) {
+    let mut vec = std::mem::ManuallyDrop::new(vec);
+    (vec.as_mut_ptr(), vec.len(), vec.capacity())
 }

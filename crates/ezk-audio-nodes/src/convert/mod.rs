@@ -1,11 +1,9 @@
 use self::channels::ChannelMixer;
-use self::format::convert_sample_format;
 use self::rate::RateConverter;
-use ezk::{ConfigRange, NextEventIsCancelSafe, Result, Source, SourceEvent};
-use ezk_audio::{RawAudio, RawAudioConfig, RawAudioConfigRange};
+use ezk::{ConfigRange, Frame, NextEventIsCancelSafe, Result, Source, SourceEvent};
+use ezk_audio::{match_format, Format, RawAudio, RawAudioConfig, RawAudioConfigRange, Samples};
 
 mod channels;
-mod format;
 mod rate;
 
 /// Converts any [`RawAudio`] to match downstream's requirements
@@ -140,4 +138,21 @@ impl<S: Source<MediaType = RawAudio>> Source for AudioConvert<S> {
             }
         }
     }
+}
+
+pub(crate) fn convert_sample_format(src: Frame<RawAudio>, dst_format: Format) -> Frame<RawAudio> {
+    let src_format = src.data().samples.format();
+    if src_format == dst_format {
+        return src;
+    }
+
+    let timestamp = src.timestamp;
+    let mut data = src.into_data();
+
+    data.samples = match_format!(dst_format, {
+        let v = data.samples.into_samples::<#S>();
+        Samples::from(v)
+    });
+
+    Frame::new(data, timestamp)
 }
