@@ -15,3 +15,11 @@ ezk-audio-nodes = { version = "0.1", path = "crates/ezk-audio-nodes" }
 ezk-g711 = { version = "0.2", path = "crates/ezk-g711" }
 ezk-g722 = { version = "0.1", path = "crates/ezk-g722" }
 ezk-rtp = { version = "0.2", path = "crates/ezk-rtp" }
+
+ezk-session = { version = "0.1", path = "crates/ezk-session" }
+
+[patch.crates-io]
+srtp = { git = "https://github.com/kbalt/srtp.git", rev = "d74b29691370687ddffe41f59caadd0a7079cb0e" }
+srtp2-sys = { git = "https://github.com/kbalt/srtp2-sys.git", rev = "fb3d67b5ada52d242c2ab5a06e4e6e22db31d601" }
+openssl.git = "https://github.com/kbalt/rust-openssl.git"
+openssl-sys.git = "https://github.com/kbalt/rust-openssl.git"
