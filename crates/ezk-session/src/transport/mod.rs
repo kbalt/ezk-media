@@ -102,7 +102,7 @@ pub(crate) struct Transport {
     /// The receiving extension ids
     negotiated_extension_ids: RtpExtensionIds,
 
-    state: TransportConnectionState,
+    connection_state: TransportConnectionState,
     kind: TransportKind,
 
     events: VecDeque<TransportEvent>,
@@ -187,7 +187,7 @@ impl Transport {
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
                 negotiated_extension_ids: receive_extension_ids,
-                state: TransportConnectionState::New,
+                connection_state: TransportConnectionState::New,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
             },
@@ -203,7 +203,7 @@ impl Transport {
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
                     negotiated_extension_ids: receive_extension_ids,
-                    state: TransportConnectionState::New,
+                    connection_state: TransportConnectionState::New,
                     kind: TransportKind::SdesSrtp {
                         crypto,
                         inbound,
@@ -282,7 +282,7 @@ impl Transport {
             rtcp_mux: remote_media_desc.rtcp_mux,
             ice_agent,
             negotiated_extension_ids: receive_extension_ids,
-            state: TransportConnectionState::New,
+            connection_state: TransportConnectionState::New,
             kind: TransportKind::DtlsSrtp {
                 fingerprint: vec![state.dtls_fingerprint()],
                 setup: match setup {
@@ -376,7 +376,7 @@ impl Transport {
         }
 
         if matches!(
-            self.state,
+            self.connection_state,
             TransportConnectionState::Connecting | TransportConnectionState::Connected
         ) {
             if let TransportKind::DtlsSrtp { dtls, .. } = &mut self.kind {
@@ -585,15 +585,19 @@ impl Transport {
 
     // Set the a new connection state and emit an event if the state differs from the old one
     fn set_connection_state(&mut self, new: TransportConnectionState) {
-        if self.state != new {
+        if self.connection_state != new {
             self.events
                 .push_back(TransportEvent::TransportConnectionState {
-                    old: self.state,
+                    old: self.connection_state,
                     new,
                 });
 
-            self.state = new;
+            self.connection_state = new;
         }
+    }
+
+    pub(crate) fn connection_state(&self) -> TransportConnectionState {
+        self.connection_state
     }
 }
 

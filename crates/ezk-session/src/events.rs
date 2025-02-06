@@ -4,16 +4,6 @@ use ezk_rtp::RtpPacket;
 use sdp_types::Direction;
 use std::net::{IpAddr, SocketAddr};
 
-#[derive(Debug, Clone, Copy)]
-pub struct Stats {
-    /// Number of total bytes sent/received
-    bytes: u64,
-    /// Number of total bytes sent/received
-    packets: u64,
-    /// Packet loss as fraction
-    lost: Option<f32>,
-}
-
 /// New media line was added to the session
 #[derive(Debug)]
 pub struct MediaAdded {
@@ -77,12 +67,6 @@ pub enum Event {
     IceConnectionState(IceConnectionStateChanged),
     /// See [`TransportConnectionStateChanged`]
     TransportConnectionState(TransportConnectionStateChanged),
-
-    /// Outbound media statistics
-    SendStats { media_id: MediaId, stats: Stats },
-
-    /// Inbound media statistics
-    ReceiveStats { media_id: MediaId, stats: Stats },
 
     /// Send data
     SendData {

@@ -39,7 +39,7 @@ pub use codecs::{Codec, Codecs, NegotiatedCodec};
 pub use events::{Event, TransportConnectionState};
 pub use options::{BundlePolicy, Options, RtcpMuxPolicy, TransportType};
 pub use sdp::SdpAnswerState;
-pub use sdp_types::{Direction, MediaType, SessionDescription};
+pub use sdp_types::{Direction, MediaType, ParseSessionDescriptionError, SessionDescription};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MediaId(u32);
@@ -168,6 +168,7 @@ struct ActiveMedia {
     /// When to send the next RTCP report
     // TODO: do not start rtcp transmitting until transport is ready
     next_rtcp: Instant,
+    rtcp_interval: Duration,
 
     /// Optional mid, this is only Some if both offer and answer have the mid attribute set
     mid: Option<BytesStr>,
@@ -482,7 +483,7 @@ impl SdpSession {
         }
 
         for media in self.state.iter() {
-            timeout = opt_min(timeout, dbg!(media.rtp_session.pop_rtp_after(None)));
+            timeout = opt_min(timeout, media.rtp_session.pop_rtp_after(None));
 
             let rtcp_send_timeout = media
                 .next_rtcp
@@ -517,8 +518,15 @@ impl SdpSession {
 
             // TODO: only emit rtcp if the media's transport state is connected
             if media.next_rtcp <= now {
-                // send_rtcp_report(self.transports[media.transport].unwrap_mut(), media);
-                media.next_rtcp += Duration::from_secs(5);
+                let transport = self.transports[media.transport].unwrap_mut();
+
+                if transport.connection_state() != TransportConnectionState::Connected {
+                    continue;
+                }
+
+                media.next_rtcp += media.rtcp_interval;
+
+                send_rtcp_report(transport, media);
             }
         }
     }

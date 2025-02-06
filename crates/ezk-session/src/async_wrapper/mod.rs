@@ -181,19 +181,13 @@ impl AsyncSdpSession {
                     self.events.push_back(AsyncEvent::MediaChanged(event))
                 }
                 Event::MediaRemoved(id) => self.events.push_back(AsyncEvent::MediaRemoved(id)),
-                Event::IceGatheringState(event) => {}
+                Event::IceGatheringState(..) => {}
                 Event::IceConnectionState(event) => {
                     self.events.push_back(AsyncEvent::IceConnectionState(event))
                 }
                 Event::TransportConnectionState(event) => self
                     .events
                     .push_back(AsyncEvent::TransportConnectionState(event)),
-                Event::SendStats { media_id, stats } => {
-                    // println!("Send statistics of {media_id:?}: {stats:?}")
-                }
-                Event::ReceiveStats { media_id, stats } => {
-                    // println!("Receive statistics of {media_id:?}: {stats:?}")
-                }
                 Event::SendData {
                     transport_id,
                     component,

@@ -126,6 +126,7 @@ impl SdpSession {
                 rtp_session: RtpSession::new(Ssrc(rand::random()), codec.clock_rate),
                 avpf: is_avpf(&remote_media_desc.media.proto),
                 next_rtcp: Instant::now() + Duration::from_secs(5),
+                rtcp_interval: rtcp_interval(remote_media_desc.media.media_type),
                 mid: remote_media_desc.mid.clone(),
                 direction: negotiated_direction,
                 transport,
@@ -582,6 +583,7 @@ impl SdpSession {
                     rtp_session: RtpSession::new(Ssrc(rand::random()), codec.clock_rate),
                     avpf: pending_media.use_avpf,
                     next_rtcp: Instant::now() + Duration::from_secs(5),
+                    rtcp_interval: rtcp_interval(pending_media.media_type),
                     mid: remote_media_desc.mid.clone(),
                     direction,
                     transport: transport_id,
@@ -699,5 +701,12 @@ fn is_avpf(t: &TransportProtocol) -> bool {
         | TransportProtocol::RtpSavp
         | TransportProtocol::UdpTlsRtpSavp
         | TransportProtocol::Other(..) => false,
+    }
+}
+
+fn rtcp_interval(media_type: MediaType) -> Duration {
+    match media_type {
+        MediaType::Video => Duration::from_secs(1),
+        _ => Duration::from_secs(5),
     }
 }

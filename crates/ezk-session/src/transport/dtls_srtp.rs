@@ -92,6 +92,7 @@ impl DtlsSrtpSession {
         self.state
     }
 
+    // TODO: if event_timeout is ever merged, use it
     // #[cfg(openssl320)]
     // pub(crate) fn timeout(&self) -> Option<Duration> {
     //     self.stream.ssl().event_timeout().unwrap()

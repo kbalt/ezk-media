@@ -239,7 +239,7 @@ impl TransportBuilder {
                 rtcp_mux: remote_media_desc.rtcp_mux,
                 ice_agent,
                 negotiated_extension_ids: receive_extension_ids,
-                state: TransportConnectionState::New,
+                connection_state: TransportConnectionState::New,
                 kind: TransportKind::Rtp,
                 events: VecDeque::new(),
             },
@@ -254,7 +254,7 @@ impl TransportBuilder {
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
                     negotiated_extension_ids: receive_extension_ids,
-                    state: TransportConnectionState::New,
+                    connection_state: TransportConnectionState::New,
                     kind: TransportKind::SdesSrtp {
                         crypto: vec![crypto],
                         inbound,
@@ -289,7 +289,7 @@ impl TransportBuilder {
                     rtcp_mux: remote_media_desc.rtcp_mux,
                     ice_agent,
                     negotiated_extension_ids: receive_extension_ids,
-                    state: TransportConnectionState::New,
+                    connection_state: TransportConnectionState::New,
                     kind: TransportKind::DtlsSrtp {
                         fingerprint,
                         setup: match setup {
