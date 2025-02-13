@@ -48,7 +48,7 @@ impl<S> AccessHandle<S> {
     /// Send a function to access the source without waiting for it to complete
     ///
     /// Returns if the function was sent
-    pub async fn access_no_wait<F>(&self, f: F) -> bool
+    pub fn access_no_wait<F>(&self, f: F) -> bool
     where
         F: FnOnce(&mut S) + Send + 'static,
     {
