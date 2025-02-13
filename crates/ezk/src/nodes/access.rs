@@ -8,12 +8,12 @@ pub struct Access<S> {
     source: S,
 
     pending_access: Option<AccessFn<S>>,
-    rx: mpsc::Receiver<AccessFn<S>>,
+    rx: mpsc::UnboundedReceiver<AccessFn<S>>,
 }
 
 #[derive(Clone)]
 pub struct AccessHandle<S> {
-    tx: mpsc::Sender<AccessFn<S>>,
+    tx: mpsc::UnboundedSender<AccessFn<S>>,
 }
 
 impl<S> AccessHandle<S> {
@@ -26,7 +26,6 @@ impl<S> AccessHandle<S> {
 
         self.tx
             .send(Box::new(move |s| _ = ret_tx.send(f(s))))
-            .await
             .ok()?;
 
         ret_rx.await.ok()
@@ -40,16 +39,26 @@ impl<S> AccessHandle<S> {
         let (ret_tx, ret_rx) = oneshot::channel();
 
         self.tx
-            .blocking_send(Box::new(move |s| _ = ret_tx.send(f(s))))
+            .send(Box::new(move |s| _ = ret_tx.send(f(s))))
             .ok()?;
 
         ret_rx.blocking_recv().ok()
+    }
+
+    /// Send a function to access the source without waiting for it to complete
+    ///
+    /// Returns if the function was sent
+    pub async fn access_no_wait<F>(&self, f: F) -> bool
+    where
+        F: FnOnce(&mut S) + Send + 'static,
+    {
+        self.tx.send(Box::new(move |s| f(s))).is_ok()
     }
 }
 
 impl<S: Source> Access<S> {
     pub fn new(source: S) -> (Self, AccessHandle<S>) {
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::unbounded_channel();
 
         let this = Self {
             source,
