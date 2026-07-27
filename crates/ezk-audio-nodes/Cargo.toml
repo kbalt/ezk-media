@@ -10,11 +10,11 @@ license.workspace = true
 [dependencies]
 ezk.workspace = true
 ezk-audio.workspace = true
-rubato = "0.16"
+rubato = "4.0"
 futures-util = "0.3"
 tokio = { version = "1", features = ["time", "sync"] }
 
-nnnoiseless = { version = "0.5", optional = true }
+nnnoiseless = { version = "0.5", optional = true, default-features = false }
 
 [features]
 nnnoiseless = ["dep:nnnoiseless"]

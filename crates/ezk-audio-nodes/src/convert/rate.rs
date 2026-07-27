@@ -2,11 +2,12 @@ use ezk::Frame;
 use ezk_audio::{
     match_samples, Channels, Format, RawAudio, RawAudioFrame, Sample, SampleRate, Samples,
 };
-use rubato::{FftFixedIn, VecResampler};
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+use rubato::Resampler;
 use std::collections::VecDeque;
 
 pub(crate) struct RateConverter {
-    resampler: Box<dyn VecResampler<f32>>,
+    resampler: Box<rubato::Fft<f32>>,
     queue: VecDeque<f32>,
     format: Format,
     channels: Channels,
@@ -28,17 +29,18 @@ impl RateConverter {
 
         // TODO: make resampling algorithm selectable
         let resampler = Box::new(
-            FftFixedIn::<f32>::new(
+            rubato::Fft::<f32>::new(
                 src.0 as usize,
                 dst.0 as usize,
                 chunk_size as usize,
-                2,
                 channels.channel_count(),
+                rubato::FixedSync::Input,
             )
             .unwrap(),
         );
 
-        let output_buffers = resampler.output_buffer_allocate(true);
+        let output_buffers =
+            vec![vec![0.0; resampler.output_frames_max()]; channels.channel_count()];
 
         Self {
             resampler,
@@ -56,6 +58,7 @@ impl RateConverter {
 
         let channel_count = self.resampler.nbr_channels();
         let chunk_size = self.resampler.input_frames_next();
+        let output_frames_max = self.resampler.output_frames_max();
         let want_n_samples = chunk_size * channel_count;
 
         let mut samples_out = Samples::empty(self.format);
@@ -69,12 +72,21 @@ impl RateConverter {
                 out[channel][chunk_index] = sample;
             }
 
-            let (_, chunk_size) = self
-                .resampler
-                .process_into_buffer(&out, &mut self.output_buffers, None)
+            let (_, out_len) = {
+                let input = SequentialSliceOfVecs::new(&out, channel_count, chunk_size).unwrap();
+                let mut output = SequentialSliceOfVecs::new_mut(
+                    &mut self.output_buffers,
+                    channel_count,
+                    output_frames_max,
+                )
                 .unwrap();
 
-            match_samples!((&mut samples_out) => (samples_out) => convert_f32_to_samples::<#S>(samples_out, &self.output_buffers, chunk_size));
+                self.resampler
+                    .process_into_buffer(&input, &mut output, None)
+                    .unwrap()
+            };
+
+            match_samples!((&mut samples_out) => (samples_out) => convert_f32_to_samples::<#S>(samples_out, &self.output_buffers, out_len));
         }
 
         if samples_out.is_empty() {

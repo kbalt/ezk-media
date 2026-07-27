@@ -11,7 +11,7 @@ license.workspace = true
 ezk.workspace = true
 
 bytes = "1"
-rand = "0.8"
+rand = "0.10"
 time = "0.3"
 rtp-types = "0.1"
-rtcp-types = "0.1"
+rtcp-types = "0.3"

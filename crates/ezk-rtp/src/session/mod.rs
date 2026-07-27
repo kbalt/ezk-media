@@ -2,7 +2,7 @@ use crate::{ExtendedRtpTimestamp, ExtendedSequenceNumber, NtpTimestamp, RtpPacke
 use jitter_buffer::JitterBuffer;
 use rtcp_types::{
     CompoundBuilder, ReceiverReport, ReceiverReportBuilder, ReportBlock, RtcpPacketWriterExt,
-    RtcpWriteError, SdesBuilder, SdesChunkBuilder, SdesItemBuilder, SenderReport,
+    RtcpWriteError, SdesBuilder, SdesChunk, SdesChunkBuilder, SdesItem, SenderReport,
     SenderReportBuilder,
 };
 use std::{
@@ -330,10 +330,10 @@ impl RtpSession {
             return None;
         }
 
-        let mut chunk = SdesChunkBuilder::new(self.ssrc.0);
+        let mut chunk = SdesChunk::builder(self.ssrc.0);
 
         for (tag, prefix, value) in &self.source_description_items {
-            let mut item = SdesItemBuilder::new(*tag, value);
+            let mut item = SdesItem::builder(*tag, value);
 
             if let Some(prefix) = prefix {
                 item = item.prefix(prefix);

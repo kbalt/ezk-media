@@ -50,7 +50,7 @@ impl ReusableBox {
 }
 
 pub struct ReusedBoxFuture<'a, O> {
-    ptr_into_buffer: NonNull<(dyn Future<Output = O> + Send + 'a)>,
+    ptr_into_buffer: NonNull<dyn Future<Output = O> + Send + 'a>,
 }
 
 // SAFETY:
