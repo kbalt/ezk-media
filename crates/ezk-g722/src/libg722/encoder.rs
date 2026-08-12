@@ -120,6 +120,13 @@ fn g722_encode(s: &mut Encoder, amp: &[i16]) -> Vec<u8> {
 
     let mut out = vec![];
 
+    if !(s.itu_test_mode || s.eight_k) {
+        assert!(
+            amp.len().is_multiple_of(2),
+            "g722_encode requires an even number of samples"
+        );
+    }
+
     xhigh = 0;
     j = 0;
     while j < amp.len() {

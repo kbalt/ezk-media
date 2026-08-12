@@ -15,6 +15,8 @@ pub struct G722Encoder<S> {
 
 struct Stream {
     encoder: Encoder,
+    /// G.722 requires even amount of samples, carry odd samples to the next frame
+    carry: Option<i16>,
 }
 
 impl<S> NextEventIsCancelSafe for G722Encoder<S> where
@@ -73,6 +75,7 @@ where
 
         self.stream = Some(Stream {
             encoder: Encoder::new(Bitrate::Mode1_64000, false, false),
+            carry: None,
         });
 
         Ok(G722Config {})
@@ -85,13 +88,26 @@ where
 
         match self.source.next_event().await? {
             SourceEvent::Frame(frame) => {
-                let Samples::I16(samples) = &frame.data().samples else {
+                let timestamp = frame.timestamp;
+                let Samples::I16(mut samples) = frame.into_data().samples else {
                     unreachable!()
                 };
 
+                // put the carried odd samples in front
+                if let Some(carry) = stream.carry.take() {
+                    samples.insert(0, carry);
+                }
+
+                // if samples length is not a multiple of 2, remove last sample and carry it to the next frame
+                if !samples.len().is_multiple_of(2) {
+                    stream.carry = samples.pop();
+                }
+
+                let encoded = stream.encoder.encode(&samples);
+
                 Ok(SourceEvent::Frame(Frame::new(
-                    stream.encoder.encode(samples).into(),
-                    frame.timestamp / 2,
+                    encoded.into(),
+                    timestamp / 2,
                 )))
             }
             SourceEvent::EndOfData => Ok(SourceEvent::EndOfData),
