@@ -34,7 +34,7 @@ impl RateConverter {
                 dst.0 as usize,
                 chunk_size as usize,
                 channels.channel_count(),
-                rubato::FixedSync::Input,
+                rubato::FixedSync::Both,
             )
             .unwrap(),
         );
